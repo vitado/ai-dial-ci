@@ -1,0 +1,243 @@
+name: SCA scheduled scan
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        type: string
+        description: Image names without registry, one per line (e.g. epam/ai-dial-chat). Empty means source scan only
+        default: ""
+      registry:
+        type: string
+        description: Container registry the images are pulled from
+        default: "ghcr.io"
+      repository:
+        type: string
+        description: Repository (owner/name) whose code is scanned and whose releases are resolved. Defaults to the calling repository
+        default: ""
+      release-lines:
+        type: number
+        description: Number of latest stable release lines to scan
+        default: 1
+      java-version:
+        type: string
+        description: Java version to use to generate lockfiles (Gradle repositories only)
+        default: "21"
+      java-distribution:
+        type: string
+        description: Java distribution to use
+        default: "temurin"
+      trivy-version:
+        type: string
+        description: Trivy version to use (release tag, e.g. v0.75.0)
+        default: "v0.75.0"
+      retention-days:
+        type: number
+        description: Retention period (days) of the resulting `sca-report` artifact
+        default: 90
+      scan-source:
+        type: boolean
+        description: Scan the source code (default branch)
+        default: true
+      scan-images:
+        type: boolean
+        description: Scan the container images
+        default: true
+      runs-on:
+        type: string
+        description: Overrides jobs runs-on settings (json-encoded list)
+        default: '["ubuntu-24.04"]'
+
+jobs:
+  targets:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      commit-sha: ${{ steps.targets.outputs.commit-sha }}
+    steps:
+      - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
+        id: targets
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          registry: ${{ inputs.registry }}
+          images: ${{ inputs.images }}
+          release-lines: ${{ inputs.release-lines }}
+          scan-source: ${{ inputs.scan-source }}
+          scan-images: ${{ inputs.scan-images }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sca-part-targets
+          path: ${{ steps.targets.outputs.targets-file }}
+          retention-days: 1
+          if-no-files-found: error
+
+  trivy:
+    needs: targets
+    if: ${{ needs.targets.outputs.matrix != '[]' }}
+    name: Trivy ${{ matrix.target.id }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    env:
+      # Scan profile: exposure of the repository, not a gate, so nothing is ignored or filtered out.
+      # It is set via env rather than trivy-action inputs: the action exports an input to TRIVY_* only when it
+      # differs from the action's own default, so `ignore-unfixed: false` or the full severity list would not be
+      # exported and a repository's trivy.yaml would win. Environment variables take precedence over trivy.yaml.
+      # TRIVY_IGNOREFILE is /dev/null, not empty, because trivy treats an empty value as unset and reads .trivyignore
+      TRIVY_IGNOREFILE: /dev/null
+      TRIVY_IGNORE_UNFIXED: "false"
+      TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+      TRIVY_PKG_TYPES: os,library
+      TRIVY_SCANNERS: vuln
+      TRIVY_INCLUDE_DEV_DEPS: "true" # trivy skips dev dependencies by default; trivy-action has no input for it
+      TRIVY_EXIT_CODE: "0" # findings are the payload, not a failure
+      TRIVY_DISABLE_VEX_NOTICE: "true"
+      TARGET_ID: ${{ matrix.target.id }}
+    steps:
+      - name: Prepare output directory
+        run: mkdir -p "$RUNNER_TEMP/sca-out/trivy"
+      - name: Checkout
+        id: checkout
+        if: ${{ matrix.target.kind == 'fs' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          # The same snapshot for all targets
+          ref: ${{ needs.targets.outputs.commit-sha }}
+          persist-credentials: false
+          lfs: true
+      - name: Detect Gradle build
+        id: stack
+        if: ${{ matrix.target.kind == 'fs' }}
+        run: |
+          if [ -f gradlew ] && { [ -f build.gradle ] || [ -f build.gradle.kts ]; }; then
+            echo "java=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "java=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare Java
+        id: java
+        if: ${{ steps.stack.outputs.java == 'true' }}
+        uses: epam/ai-dial-ci/actions/java_prepare@4.12.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          java-distribution: ${{ inputs.java-distribution }}
+      - name: Generate Gradle lockfiles
+        id: lockfiles
+        if: ${{ steps.stack.outputs.java == 'true' }}
+        uses: epam/ai-dial-ci/actions/generate_gradle_lockfiles@4.12.0
+        with:
+          gpr-username: ${{ github.actor }}
+          gpr-password: ${{ secrets.GITHUB_TOKEN }}
+      # Images in other registries are expected to be public and are pulled anonymously
+      - name: Login to GitHub Container Registry
+        id: login
+        if: ${{ matrix.target.kind == 'image' && inputs.registry == 'ghcr.io' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Trivy scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: ${{ matrix.target.kind }}
+          scan-ref: .
+          image-ref: ${{ matrix.target.ref }}
+          format: json
+          output: ${{ runner.temp }}/sca-out/trivy/${{ matrix.target.id }}.json
+          # Outside the workspace, so that the cache is not scanned
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          version: ${{ inputs.trivy-version }}
+      - name: Generate Trivy report (Table)
+        if: ${{ steps.trivy.outcome == 'success' }}
+        run: |
+          trivy convert --format table --output "$RUNNER_TEMP/sca-out/trivy/$TARGET_ID.txt" "$RUNNER_TEMP/sca-out/trivy/$TARGET_ID.json"
+      # The status is written even if the scan failed: a failed target must not look like a clean one
+      - name: Write scan status
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          LOCKFILES_OUTCOME: ${{ steps.lockfiles.outcome }}
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          LOCKFILES: ${{ steps.lockfiles.outputs.lockfiles }}
+        run: |
+          out="$RUNNER_TEMP/sca-out/trivy"
+          status=ok
+          reason=
+          for step in "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
+            outcome="${step#*:}"
+            if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
+              status=failed
+              reason="${step%%:*} $outcome"
+              break
+            fi
+          done
+          if [ "$status" = "ok" ] && [ "$TRIVY_OUTCOME" != "success" ]; then
+            status=failed
+            reason="scan did not complete"
+          fi
+          if [ "$status" = "ok" ] && ! jq -e . "$out/$TARGET_ID.json" > /dev/null 2>&1; then
+            status=failed
+            reason="trivy output is missing or is not valid JSON"
+          fi
+          jq -n --arg id "$TARGET_ID" --arg status "$status" --arg reason "$reason" --arg lockfiles "$LOCKFILES" \
+            '{id: $id, status: $status, reason: (if $reason == "" then null else $reason end), lockfiles: (if $lockfiles == "" then null else ($lockfiles | tonumber) end)}' \
+            > "$out/$TARGET_ID.status.json"
+          cat "$out/$TARGET_ID.status.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: sca-part-trivy-${{ matrix.target.id }}
+          path: ${{ runner.temp }}/sca-out/
+          retention-days: 1
+          if-no-files-found: error
+
+  report:
+    needs: [targets, trivy]
+    # Without the targets result there is nothing to report on; the run is red anyway because the targets job failed
+    if: ${{ always() && needs.targets.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+    steps:
+      # The targets part is always there, so the download does not fail when no target was scanned
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sca-part-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/sca-parts
+      - uses: epam/ai-dial-ci/actions/sca_merge_results@4.12.0
+        id: merge
+        with:
+          targets-file: ${{ runner.temp }}/sca-parts/targets.json
+          parts-dir: ${{ runner.temp }}/sca-parts
+          output-dir: ${{ runner.temp }}/sca
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: sca-report
+          path: ${{ runner.temp }}/sca/
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+      # After the upload, so that the report is available even if some targets failed
+      - name: Fail on failed targets
+        if: ${{ steps.merge.outputs.failed-count != '0' }}
+        env:
+          FAILED_COUNT: ${{ steps.merge.outputs.failed-count }}
+          REPORT_DIR: ${{ steps.merge.outputs.report-dir }}
+        run: |
+          jq -r '.targets[] | select(.status == "failed") | "::error::Target \(.id) failed: \(.reason)"' "$REPORT_DIR/_report/scan_report.json"
+          echo "::error::$FAILED_COUNT target(s) failed to be scanned"
+          exit 1

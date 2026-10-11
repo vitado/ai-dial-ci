@@ -1,0 +1,23 @@
+// Generates gradle.lockfile files (for dependency scanners such as Trivy) without touching the repository's build files.
+// Usage: ./gradlew --init-script lockfiles.init.gradle resolveAndLockAllConfigurations --write-locks
+
+allprojects {
+    // Lock every configuration, so that all of them end up in the lockfile when resolved
+    dependencyLocking {
+        lockAllConfigurations()
+    }
+
+    tasks.register('resolveAndLockAllConfigurations') {
+        description = 'Resolves all resolvable configurations so that their dependencies are written to gradle.lockfile'
+        notCompatibleWithConfigurationCache('resolves configurations at execution time')
+
+        doFirst {
+            if (!gradle.startParameter.writeDependencyLocks) {
+                throw new GradleException('Lockfiles are only written with --write-locks; run the build with this option')
+            }
+        }
+        doLast {
+            configurations.matching { it.canBeResolved }.each { it.resolve() }
+        }
+    }
+}

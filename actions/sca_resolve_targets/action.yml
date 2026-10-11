@@ -1,0 +1,72 @@
+name: Resolve SCA scan targets
+description: Resolve the default-branch snapshot and the container images (development and latest releases) that an SCA scheduled scan should cover
+
+inputs:
+  repository:
+    description: Repository (owner/name) whose code is scanned and whose releases are resolved
+    required: true
+  registry:
+    description: Container registry the images are pulled from
+    default: ghcr.io
+  images:
+    description: Image names without registry, one per line (e.g. epam/ai-dial-chat). Empty means source scan only
+    default: ""
+  release-lines:
+    description: Number of latest stable release lines to scan
+    default: "1"
+  scan-source:
+    description: Whether to include the source (filesystem) target
+    default: "true"
+  scan-images:
+    description: Whether to include the image targets
+    default: "true"
+  github-token:
+    description: Token for the GitHub API and for authenticating to ghcr.io
+    default: ${{ github.token }}
+  output-dir:
+    description: Directory where targets.json is written
+    default: ${{ runner.temp }}/sca
+
+outputs:
+  matrix:
+    description: Compact JSON array of the pending targets (may be "[]")
+    value: ${{ steps.targets.outputs.matrix }}
+  commit-sha:
+    description: Commit SHA of the default branch the scan is pinned to
+    value: ${{ steps.targets.outputs.commit-sha }}
+  default-branch:
+    description: Default branch of the scanned repository
+    value: ${{ steps.targets.outputs.default-branch }}
+  targets-file:
+    description: Path to targets.json with all targets and their statuses
+    value: ${{ steps.targets.outputs.targets-file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    - name: Resolve targets
+      id: targets
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGES: ${{ inputs.images }}
+        RELEASE_LINES: ${{ inputs.release-lines }}
+        SCAN_SOURCE: ${{ inputs.scan-source }}
+        SCAN_IMAGES: ${{ inputs.scan-images }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: >-
+        python "$ACTION_PATH/resolve_targets.py"
+        --repository "$REPOSITORY"
+        --registry "$REGISTRY"
+        --images "$IMAGES"
+        --release-lines "$RELEASE_LINES"
+        --scan-source "$SCAN_SOURCE"
+        --scan-images "$SCAN_IMAGES"
+        --output-dir "$OUTPUT_DIR"

@@ -1,0 +1,47 @@
+name: Merge SCA scan results
+description: Merge the per-target results of an SCA scheduled scan into a deduplicated report (summary, CSV, JSON)
+
+inputs:
+  targets-file:
+    description: Path to targets.json produced by the sca_resolve_targets action
+    required: true
+  parts-dir:
+    description: Directory with the per-scanner scan parts (<scanner>/<id>.json, <scanner>/<id>.status.json, optional <scanner>/<id>.txt; trivy is the only scanner today)
+    required: true
+  output-dir:
+    description: Directory to write the report into (summary.md, summary.csv, _report/, _native/trivy/)
+    required: true
+  step-summary:
+    description: Whether to append summary.md to the job summary
+    default: "true"
+
+outputs:
+  failed-count:
+    description: Number of targets whose scan failed (the workflow decides whether to fail the run)
+    value: ${{ steps.merge.outputs.failed-count }}
+  report-dir:
+    description: Directory with the generated report
+    value: ${{ steps.merge.outputs.report-dir }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    - name: Merge scan results
+      id: merge
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TARGETS_FILE: ${{ inputs.targets-file }}
+        PARTS_DIR: ${{ inputs.parts-dir }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        STEP_SUMMARY: ${{ inputs.step-summary }}
+      run: |
+        python "$ACTION_PATH/merge_results.py" \
+          --targets-file "$TARGETS_FILE" \
+          --parts-dir "$PARTS_DIR" \
+          --output-dir "$OUTPUT_DIR" \
+          --step-summary "$STEP_SUMMARY"

@@ -1,0 +1,37 @@
+name: Generate Gradle lockfiles
+description: Resolve all dependencies of a Gradle build and write them to gradle.lockfile files (build files are not modified), so that dependency scanners such as Trivy can scan them. Requires Java and Gradle to be set up beforehand (see java_prepare)
+inputs:
+  working-directory:
+    description: Directory of the Gradle build (where gradlew is located)
+    default: "."
+  gpr-username:
+    description: GitHub Package Registry username (for pulling packages the build depends on)
+    default: ${{ github.actor }}
+  gpr-password:
+    description: GitHub Package Registry password/token (for pulling packages the build depends on)
+    default: ""
+outputs:
+  lockfiles:
+    description: Number of generated gradle.lockfile files
+    value: ${{ steps.generate.outputs.lockfiles }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate lockfiles
+      id: generate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GPR_USERNAME: ${{ inputs.gpr-username }}
+        GPR_PASSWORD: ${{ inputs.gpr-password }}
+      run: |
+        ./gradlew --no-daemon --init-script "$GITHUB_ACTION_PATH/lockfiles.init.gradle" resolveAndLockAllConfigurations --write-locks \
+          || { echo "::error::Gradle failed to resolve dependencies"; exit 1; }
+        count=$(find . -name gradle.lockfile -type f | wc -l)
+        echo "Generated lockfiles: $count"
+        if [ "$count" -eq 0 ]; then
+          echo "::error::No gradle.lockfile files were generated"
+          exit 1
+        fi
+        echo "lockfiles=$count" >> "$GITHUB_OUTPUT"

@@ -44,6 +44,7 @@
       - [Cleanup untagged images in GHCR](#cleanup-untagged-images-in-ghcr)
       - [Trigger deployment of development environment in GitLab](#trigger-deployment-of-development-environment-in-gitlab)
       - [Trivy additional configuration](#trivy-additional-configuration)
+      - [SCA scheduled scan](#sca-scheduled-scan)
       - [Dependabot](#dependabot)
         - [Dependabot Pull Requests Automation](#dependabot-pull-requests-automation)
       - [ORT](#ort)
@@ -1235,6 +1236,59 @@ db:
     - ghcr.io/aquasecurity/trivy-java-db:1
 misconfiguration:
   checks-bundle-repository: mirror.gcr.io/aquasec/trivy-checks:1
+```
+
+#### SCA scheduled scan
+
+`sca_scheduled.yml` runs Software Composition Analysis of a repository on a schedule: it looks for known vulnerabilities in what the repository publishes. Today the scanner is [Trivy](https://trivy.dev/), which scans the source code of the default branch (`trivy fs`) and the published container images (`development` tag and the latest stable release). Unlike the PR checks, it is not a gate: the profile reports everything the repository is exposed to (no `.trivyignore`, unfixed vulnerabilities and all severities included, dev dependencies included), and findings never fail the run. The run fails only if a target could not be scanned. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root), `gradle.lockfile` files are generated on the fly, the repository files are not modified.
+
+| Input                 | Type    | Default           | Description                                                                                                  |
+| --------------------- | ------- | ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| `images`              | string  | `""`              | Image names without registry, one per line (e.g. `epam/ai-dial-chat`). Empty means source scan only         |
+| `registry`            | string  | `ghcr.io`         | Registry the images are pulled from. Login with `GITHUB_TOKEN` is done for `ghcr.io` only                    |
+| `repository`          | string  | calling repo      | Repository (`owner/name`) whose code is scanned and whose releases are resolved. Set it when running in a fork |
+| `release-lines`       | number  | `1`               | Number of latest stable release lines to scan                                                                |
+| `java-version`        | string  | `21`              | Java version to generate lockfiles (Gradle repositories only)                                                |
+| `java-distribution`   | string  | `temurin`         | Java distribution                                                                                            |
+| `trivy-version`       | string  | `v0.75.0`         | Trivy version                                                                                                |
+| `retention-days`      | number  | `90`              | Retention period of the `sca-report` artifact                                                                 |
+| `scan-source`         | boolean | `true`            | Scan the source code                                                                                         |
+| `scan-images`         | boolean | `true`            | Scan the container images                                                                                    |
+| `runs-on`             | string  | `["ubuntu-24.04"]` | Overrides jobs runs-on settings (json-encoded list)                                                          |
+
+The result is the `sca-report` artifact, which is the contract for consumers: `summary.md` and `summary.csv` (human-readable), `_report/scan_report.json` (targets with their scanner and status `ok` / `failed` / `not_applicable`, commit and run metadata), `_report/vulnerabilities.json` (deduplicated findings; each finding lists the `scan_targets` it was found in, its `locations` within them and the `scanners` that reported it) and `_native/<scanner>/` (native reports of each target, `_native/trivy/` today). Both JSON files carry a `schema_version`. Intermediate results travel between the jobs as short-lived `sca-part-*` artifacts (`sca-part-targets` with `targets.json`, and one `sca-part-<scanner>-<id>` per scanned target with `<scanner>/<id>.*` files), so that parts of different scanners cannot collide. The summary is also shown on the run page. No secrets are needed and nothing is uploaded to code scanning.
+
+> [!important]
+> The calling workflow must grant `contents: read` and `packages: read` permissions. The reusable workflow has no `concurrency` settings, set them in the calling workflow so that scans of the same repository do not overlap.
+
+> [!note]
+> `schedule` and `workflow_dispatch` triggers are registered from the default branch only, so the calling workflow must be there. GitHub disables scheduled workflows in public repositories after 60 days without repository activity.
+
+`scheduled.yml`
+
+```yml
+name: Scheduled Workflow
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sca-scheduled
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  sca:
+    uses: epam/ai-dial-ci/.github/workflows/sca_scheduled.yml@main
+    with:
+      images: |
+        epam/ai-dial-chat
+        epam/ai-dial-chat-bff
 ```
 
 #### Dependabot

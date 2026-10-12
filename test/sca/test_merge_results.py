@@ -2161,3 +2161,298 @@ def test_lockfile_project_dir_and_graph_project_dir_are_comparable() -> None:
     assert mr.normalize_project_dir("./app") == "app"
     data = graph_file(":", ".", {"g:a:1.0": []}, ["g:a:1.0"])
     assert mr.parse_project_graph(data)[0] == "."
+
+
+# ---------------------------------------------------------------- release sources
+
+RELEASE_SOURCE = {
+    "id": "source-1.0.0",
+    "kind": "fs",
+    "image": None,
+    "tag": "1.0.0",
+    "ref": None,
+    "git_ref": "1.0.0",
+    "commit_sha": "0011223344556677889900112233445566778899",
+}
+OLDER_RELEASE_SOURCE = {
+    **RELEASE_SOURCE,
+    "id": "source-0.9.0",
+    "tag": "0.9.0",
+    "git_ref": "0.9.0",
+    "commit_sha": "99aabbccddeeff00112233445566778899aabbcc",
+}
+
+
+def test_target_class_of_release_source() -> None:
+    assert mr.target_class(RELEASE_SOURCE) == "release_source"
+    assert mr.target_class(SOURCE) == "source"
+    assert mr.release_class(True) == "release"
+    assert mr.release_class(False) == "release_source"
+
+
+@pytest.mark.parametrize(
+    ("classes", "expected"),
+    [
+        # a finding seen in an image keeps the classification of the images, the
+        # source of a release tag changes nothing
+        ({"release", "release_source"}, "release_only"),
+        ({"release", "release_source", "source"}, "release_and_development"),
+        ({"release", "development", "release_source"}, "release_and_development"),
+        ({"development", "release_source"}, "development_only"),
+        ({"development", "source", "release_source"}, "development_only"),
+        ({"release", "source"}, "release_and_development"),
+        # seen only in sources: never above source_only
+        ({"release_source"}, "source_only"),
+        ({"release_source", "source"}, "source_only"),
+        ({"source"}, "source_only"),
+    ],
+)
+def test_classify_exposure_with_images_and_release_sources(
+    classes: set[str], expected: str
+) -> None:
+    assert mr.classify_exposure(classes, True) == expected
+
+
+@pytest.mark.parametrize(
+    ("classes", "expected"),
+    [
+        ({"release_source", "source"}, "release_and_development"),
+        ({"release_source"}, "release_only"),
+        ({"source"}, "development_only"),
+    ],
+)
+def test_classify_exposure_without_images_is_decided_by_the_sources(
+    classes: set[str], expected: str
+) -> None:
+    assert mr.classify_exposure(classes, False) == expected
+
+
+def release_source_workspace(
+    tmp_path: Path, *targets: dict[str, Any], image_pkg: bool = True
+) -> Workspace:
+    """An image with urllib3 and PyJWT as installed packages (no graph) and the
+    poetry.lock of a release tag with the graph of both: the image finding must get
+    the paths from the lockfile.
+    """
+    packages = [
+        pkg("pyjwt", "direct", ("urllib3",), version="2.7.0"),
+        pkg("urllib3", "indirect", (), version="2.7.0"),
+        pkg("requests", "direct", ("urllib3",), version="2.7.0"),
+    ]
+    packages[1]["ID"] = "urllib3@2.7.0"
+    packages[0]["DependsOn"] = ["urllib3@2.7.0"]
+    packages[2]["DependsOn"] = ["urllib3@2.7.0"]
+    lock = native_with(
+        vuln("CVE-9", "2.8.0", PkgName="urllib3", PkgID="urllib3@2.7.0"),
+        packages=packages,
+    )
+    image = {
+        "Results": [
+            {
+                "Target": "Python",
+                "Class": "lang-pkgs",
+                "Type": "python-pkg",
+                "Packages": [{"Name": "urllib3", "Version": "2.7.0"}],
+                "Vulnerabilities": [vuln("CVE-9", "2.8.0", PkgName="urllib3")],
+            }
+        ]
+    }
+    ws = Workspace(tmp_path, make_targets_doc(*targets))
+    for target in targets:
+        native = image if target["kind"] == "image" and image_pkg else lock
+        ws.add_part(target["id"], None)
+        (ws.trivy_parts / f"{target['id']}.json").write_text(
+            json.dumps(native), encoding="utf-8"
+        )
+    return ws
+
+
+def test_release_image_finding_gets_dependency_paths_from_the_release_source(
+    tmp_path: Path,
+) -> None:
+    ws = release_source_workspace(tmp_path, SOURCE, RELEASE_SOURCE, DEV, REL)
+    ws.run()
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scan_targets"] == [
+        "source-development",
+        "source-1.0.0",
+        "app-development",
+        "app-1.0.0",
+    ]
+    assert record["relationship"] == ["indirect"]
+    assert record["introduced_via"] == ["pyjwt", "requests"]
+    assert record["dependency_paths"] == [
+        ["pyjwt", "urllib3"],
+        ["requests", "urllib3"],
+    ]
+    # the same lockfile seen in the development source and in the tag counts once
+    assert record["dependency_paths_total"] == 2
+    assert record["exposure"] == "release_and_development"
+    assert record["locations"] == ["Python", "poetry.lock"]
+
+
+def test_release_only_finding_gets_paths_and_the_lockfile_of_its_tag(
+    tmp_path: Path,
+) -> None:
+    ws = release_source_workspace(tmp_path, SOURCE, RELEASE_SOURCE, REL)
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps({"Results": []}), encoding="utf-8"
+    )
+    ws.run()
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scan_targets"] == ["source-1.0.0", "app-1.0.0"]
+    assert record["exposure"] == "release_only"
+    assert record["dependency_paths"] == [
+        ["pyjwt", "urllib3"],
+        ["requests", "urllib3"],
+    ]
+    assert record["dependency_paths_total"] == 2
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> **Released 1.0.0 — exposed: 1 HIGH**, all fixed in development" in md
+    assert (
+        "| 1 | urllib3 · python, indirect | 2.7.0 → 2.8.0 | 1 HIGH "
+        "| Released 1.0.0 only "
+        "| Release a patch from release-1.0 (already fixed in development) "
+        "via pyjwt › urllib3 (+1 more path) "
+        "| image :1.0.0 · source @ 1.0.0 poetry.lock |" in md
+    )
+    assert "<summary>Dependency paths (1)</summary>" in md
+
+
+def test_finding_only_in_release_sources_is_source_only_when_there_are_images(
+    tmp_path: Path,
+) -> None:
+    ws = release_source_workspace(tmp_path, SOURCE, RELEASE_SOURCE, DEV, REL)
+    for tid in ("source-development", "app-development", "app-1.0.0"):
+        (ws.trivy_parts / f"{tid}.json").write_text(
+            json.dumps({"Results": []}), encoding="utf-8"
+        )
+    ws.run()
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scan_targets"] == ["source-1.0.0"]
+    assert record["exposure"] == "source_only"
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    # a release source does not make a release verdict: the image decides
+    assert "> **Released 1.0.0 — no known vulnerabilities**" in md
+    assert "| Source only · not in images |" in md
+    assert "source @ 1.0.0 poetry.lock" in md
+    # the default branch is clear of it, so there is nothing to upgrade there
+    assert "| Already fixed in development — not in published images |" in md
+    # and it is not a development source finding either
+    assert "development — image: clean; source: clean" in md
+
+
+def test_run_without_images_is_classified_and_headlined_by_the_sources(
+    tmp_path: Path,
+) -> None:
+    ws = release_source_workspace(
+        tmp_path, SOURCE, RELEASE_SOURCE, OLDER_RELEASE_SOURCE
+    )
+    # fixed in development, still in both releases; one more CVE only in development
+    fresh = native_with(
+        vuln("CVE-DEV", None, PkgName="left-pad", InstalledVersion="1.0.0"),
+        packages=[pkg("left-pad", "direct", ())],
+    )
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps(fresh), encoding="utf-8"
+    )
+    ws.run()
+    recs = records_by_cve(ws)
+    assert recs["CVE-9"]["scan_targets"] == ["source-1.0.0", "source-0.9.0"]
+    assert recs["CVE-9"]["exposure"] == "release_only"
+    assert recs["CVE-DEV"]["exposure"] == "development_only"
+    totals = ws.json("_report/scan_report.json")["totals"]["findings"]
+    assert totals["by_exposure"] == {
+        "release_and_development": 0,
+        "release_only": 1,
+        "development_only": 1,
+        "source_only": 0,
+    }
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "> **Released 1.0.0 — exposed: 1 HIGH**, all fixed in development\n>\n"
+        "> **Released 0.9.0 — exposed: 1 HIGH**, all fixed in development\n>\n"
+        "> **development — source: 1 HIGH**\n>\n> 2 findings" in md
+    )
+    assert "Released 1.0.0, 0.9.0 only" in md
+    assert "release-1.0, release-0.9" in md
+    assert "source @ 1.0.0 poetry.lock, source @ 0.9.0 poetry.lock" not in md
+    assert "source @ 1.0.0 poetry.lock · source @ 0.9.0 poetry.lock" in md
+
+
+def test_run_without_images_finding_in_tag_and_development_is_open_in_both(
+    tmp_path: Path,
+) -> None:
+    ws = release_source_workspace(tmp_path, SOURCE, RELEASE_SOURCE)
+    ws.run()
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["exposure"] == "release_and_development"
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> **Released 1.0.0 — exposed: 1 HIGH**, 1 also open in development" in md
+    assert "| Released 1.0.0 + development |" in md
+    assert (
+        "| Upgrade in development via pyjwt › urllib3 (+1 more path), "
+        "backport to release-1.0 | source poetry.lock · source @ 1.0.0 poetry.lock |"
+        in md
+    )
+
+
+def test_release_source_has_its_own_coverage_label(tmp_path: Path) -> None:
+    ws = release_source_workspace(tmp_path, SOURCE, RELEASE_SOURCE, DEV)
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "| source @ development fedcba9 | ok |" in md
+    assert "| source @ 1.0.0 0011223 | ok |" in md
+    target = ws.targets["source-1.0.0"]
+    assert (target["kind"], target["tag"], target["git_ref"]) == (
+        "fs",
+        "1.0.0",
+        "1.0.0",
+    )
+    assert target["commit_sha"] == RELEASE_SOURCE["commit_sha"]
+
+
+def test_failed_release_source_is_incomplete_but_does_not_hide_the_rest(
+    tmp_path: Path,
+) -> None:
+    failed = {**RELEASE_SOURCE, "commit_sha": None}
+    ws = release_source_workspace(tmp_path, SOURCE, DEV, REL, image_pkg=True)
+    doc = json.loads(ws.targets_file.read_text(encoding="utf-8"))
+    doc["targets"].append(
+        {"status": "failed", "reason": "cannot resolve release tag 1.0.0", **failed}
+    )
+    ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
+    assert ws.run() == 1
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "**Incomplete: 1 target(s) failed** — source-1.0.0" in md
+    assert "Released 1.0.0 — exposed: 1 HIGH" in md
+
+
+def test_release_tags_of_uses_release_sources_only_without_images() -> None:
+    record = {"scan_targets": ["source-1.0.0", "source-0.9.0", "app-1.0.0"]}
+    sources = [SOURCE, RELEASE_SOURCE, OLDER_RELEASE_SOURCE]
+    assert mr.release_tags_of([record], sources) == ["1.0.0", "0.9.0"]
+    with_images = [*sources, DEV, REL]
+    assert mr.release_tags_of([record], with_images) == ["1.0.0"]
+
+
+def test_without_release_sources_the_report_is_as_before(full: Workspace) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "source @ development" in md
+    assert "source @ 1.0.0" not in md
+    assert all(r["exposure"] != "release_source" for r in records_by_cve(full).values())
+
+
+def test_source_only_action_when_the_default_branch_is_clear() -> None:
+    assert mr.action_text("source_only", True, [], "a › b", False) == (
+        "Already fixed in development — dev dependency, not shipped"
+    )
+    assert mr.action_text("source_only", None, [], "", False) == (
+        "Already fixed in development — not in published images"
+    )
+    other = {"scan_targets": ["source-1.0.0"]}
+    both = {"scan_targets": ["source-1.0.0", "source-development"]}
+    targets = [SOURCE, RELEASE_SOURCE, DEV]
+    assert not mr.found_in_default_source([other], targets)
+    assert mr.found_in_default_source([other, both], targets)

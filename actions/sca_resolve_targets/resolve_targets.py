@@ -39,6 +39,8 @@ GHCR_HOST = "ghcr.io"
 
 TAGS_PAGE_SIZE = 1000
 MAX_TAG_PAGES = 100
+GITHUB_TAGS_PAGE_SIZE = 100
+MAX_TAG_PEEL_DEPTH = 5  # tag objects pointing at tag objects, before a commit
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
@@ -189,6 +191,42 @@ class GitHubClient:
                 f"returned HTTP {response.status}"
             )
         return str(response.json()["tag_name"])
+
+    def repository_tags(self, repo: str) -> list[str]:
+        """Names of all git tags of the repository (paginated)."""
+        names: list[str] = []
+        for page in range(1, MAX_TAG_PAGES + 1):
+            batch = self._get_json(
+                f"/repos/{repo}/tags?per_page={GITHUB_TAGS_PAGE_SIZE}&page={page}"
+            )
+            names.extend(str(tag["name"]) for tag in batch)
+            if len(batch) < GITHUB_TAGS_PAGE_SIZE:
+                return names
+        raise ResolveError(
+            f"tag list of {repo} exceeds {MAX_TAG_PAGES * GITHUB_TAGS_PAGE_SIZE} tags"
+        )
+
+    def tag_commit_sha(self, repo: str, tag: str) -> str:
+        """Commit a git tag points to; an annotated tag is peeled to its commit."""
+        quoted = urllib.parse.quote(tag, safe="/")
+        try:
+            target = self._get_json(f"/repos/{repo}/git/ref/tags/{quoted}")["object"]
+            for _ in range(MAX_TAG_PEEL_DEPTH):
+                if target["type"] == "commit":
+                    return str(target["sha"])
+                if target["type"] != "tag":
+                    raise ResolveError(
+                        f"tag {tag} of {repo} points to a {target['type']}, "
+                        "not a commit"
+                    )
+                target = self._get_json(f"/repos/{repo}/git/tags/{target['sha']}")[
+                    "object"
+                ]
+        except (KeyError, TypeError) as err:
+            raise ResolveError(
+                f"unexpected GitHub API response for tag {tag} of {repo}: {err!r}"
+            ) from err
+        raise ResolveError(f"tag {tag} of {repo} is nested deeper than expected")
 
 
 class RegistryClient:
@@ -391,6 +429,30 @@ def make_source_target(git_ref: str, commit_sha: str) -> dict[str, Any]:
     }
 
 
+def make_release_source_target(
+    tag: str | None,
+    commit_sha: str | None,
+    status: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """A filesystem target of a release: the repository at its git ``tag``.
+
+    ``tag`` is what tells a release source from the development one. Without a
+    known tag the id is ``source-release``.
+    """
+    return {
+        "id": source_target_id(tag or "release"),
+        "kind": "fs",
+        "image": None,
+        "tag": tag,
+        "ref": None,
+        "git_ref": tag,
+        "commit_sha": commit_sha,
+        "status": status,
+        "reason": reason,
+    }
+
+
 def parse_images(raw: str) -> list[str]:
     images: list[str] = []
     for line in raw.splitlines():
@@ -463,6 +525,47 @@ def resolve_image_targets(
     return targets
 
 
+def resolve_release_source_targets(
+    github: GitHubClient,
+    repository: str,
+    latest_release: str | None,
+    release_lines: int,
+    release_error: str | None = None,
+) -> list[dict[str, Any]]:
+    """Source targets of the releases, newest first: the repository at each tag.
+
+    The releases are those of the image targets (the latest GitHub release for one
+    line, else the newest stable ``X.Y.Z`` tag of each line), but taken from the git
+    tags of the repository, so that repositories without images have them too.
+    ``latest_release`` is the tag of the latest GitHub release (only looked up when
+    ``release_lines == 1``); ``release_error`` is set if that lookup failed.
+    """
+    if release_error is not None:
+        return [make_release_source_target(None, None, "failed", release_error)]
+    if latest_release is not None:
+        tags = [latest_release]
+    else:
+        try:
+            tags = latest_release_lines(
+                github.repository_tags(repository), release_lines
+            )
+        except ResolveError as err:
+            return [make_release_source_target(None, None, "failed", str(err))]
+        if not tags:
+            reason = "no stable release tag in the repository"
+            return [make_release_source_target(None, None, "not_applicable", reason)]
+    targets = []
+    for tag in tags:
+        try:
+            sha = github.tag_commit_sha(repository, tag)
+        except ResolveError as err:
+            reason = f"cannot resolve release tag {tag}: {err}"
+            targets.append(make_release_source_target(tag, None, "failed", reason))
+        else:
+            targets.append(make_release_source_target(tag, sha, "pending"))
+    return targets
+
+
 def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
     seen: set[str] = set()
     for target in targets:
@@ -479,26 +582,40 @@ def resolve_targets(
     release_lines: int,
     scan_source: bool,
     scan_images: bool,
+    scan_release_source: bool,
     github: GitHubClient,
     registry: RegistryClient,
     environ: Mapping[str, str],
     now: datetime,
 ) -> dict[str, Any]:
-    """Build the targets.json document. Raises ResolveError without a snapshot."""
+    """Build the targets.json document. Raises ResolveError without a snapshot.
+
+    Order: the development source, the release sources (newest first), then the
+    images of each image in ``images`` order.
+    """
     default_branch = github.default_branch(repository)
     commit_sha = github.commit_sha(repository, default_branch)
+
+    with_images = scan_images and bool(images)
+    with_release_source = scan_source and scan_release_source
+    latest_release: str | None = None
+    release_error: str | None = None
+    if (with_images or with_release_source) and release_lines == 1:
+        try:
+            latest_release = github.latest_release_tag(repository)
+        except ResolveError as err:
+            release_error = str(err)
 
     targets: list[dict[str, Any]] = []
     if scan_source:
         targets.append(make_source_target(default_branch, commit_sha))
-    if scan_images and images:
-        latest_release: str | None = None
-        release_error: str | None = None
-        if release_lines == 1:
-            try:
-                latest_release = github.latest_release_tag(repository)
-            except ResolveError as err:
-                release_error = str(err)
+    if with_release_source:
+        targets.extend(
+            resolve_release_source_targets(
+                github, repository, latest_release, release_lines, release_error
+            )
+        )
+    if with_images:
         for image in images:
             targets.extend(
                 resolve_image_targets(
@@ -597,6 +714,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scan-images", default="true", help="true/false (default: %(default)s)"
     )
     parser.add_argument(
+        "--scan-release-source",
+        default="true",
+        help="true/false (default: %(default)s)",
+    )
+    parser.add_argument(
         "--output-dir", required=True, type=Path, help="directory for targets.json"
     )
     parser.add_argument(
@@ -621,6 +743,7 @@ def run(
     images = parse_images(args.images)
     scan_source = parse_bool(args.scan_source, "scan-source")
     scan_images = parse_bool(args.scan_images, "scan-images")
+    scan_release_source = parse_bool(args.scan_release_source, "scan-release-source")
     token = args.github_token or environ.get("GITHUB_TOKEN") or None
 
     http = HttpClient(transport)
@@ -635,6 +758,7 @@ def run(
         release_lines=release_lines,
         scan_source=scan_source,
         scan_images=scan_images,
+        scan_release_source=scan_release_source,
         github=github,
         registry=registry,
         environ=environ,

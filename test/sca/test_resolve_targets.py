@@ -87,6 +87,31 @@ def github_routes(
         transport.add(latest, ok({"tag_name": release}))
 
 
+def tag_routes(
+    transport: FakeTransport,
+    tag: str,
+    sha: str,
+    annotated_as: str | None = None,
+) -> None:
+    """A git tag at ``sha``, annotated (via tag object ``annotated_as``) or not."""
+    ref = f"{API}/repos/{REPOSITORY}/git/ref/tags/{tag}"
+    if annotated_as is None:
+        transport.add(ref, ok({"object": {"type": "commit", "sha": sha}}))
+        return
+    transport.add(ref, ok({"object": {"type": "tag", "sha": annotated_as}}))
+    transport.add(
+        f"{API}/repos/{REPOSITORY}/git/tags/{annotated_as}",
+        ok({"object": {"type": "commit", "sha": sha}}),
+    )
+
+
+def git_tags_route(transport: FakeTransport, names: list[str], page: int = 1) -> None:
+    transport.add(
+        f"{API}/repos/{REPOSITORY}/tags?per_page=100&page={page}",
+        ok([{"name": name} for name in names]),
+    )
+
+
 def no_sleep_http(transport: FakeTransport) -> Any:
     return rt.HttpClient(transport, sleep=lambda _: None)
 
@@ -97,6 +122,7 @@ def run_resolve_targets(
     release_lines: int = 1,
     scan_source: bool = True,
     scan_images: bool = True,
+    scan_release_source: bool = False,
     token: str | None = "tkn",
 ) -> dict[str, Any]:
     http = no_sleep_http(transport)
@@ -107,6 +133,7 @@ def run_resolve_targets(
         release_lines=release_lines,
         scan_source=scan_source,
         scan_images=scan_images,
+        scan_release_source=scan_release_source,
         github=rt.GitHubClient(http, token, API),
         registry=rt.RegistryClient(http, "ghcr.io", token),
         environ=ENV,
@@ -696,6 +723,7 @@ def test_run_writes_resolve_json_and_outputs(
 ) -> None:
     t = FakeTransport()
     github_routes(t, release="1.1.14")
+    tag_routes(t, "1.1.14", "b" * 40)
     t.add(tags_url("example/x"), ok({"tags": ["development"]}))
     output_file = tmp_path / "github_output"
     env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
@@ -714,6 +742,7 @@ def test_run_writes_resolve_json_and_outputs(
     )
     assert [x["id"] for x in targets_doc["targets"]] == [
         "source-development",
+        "source-1.1.14",
         "x-development",
         "x-1.1.14",
     ]
@@ -724,6 +753,7 @@ def test_run_writes_resolve_json_and_outputs(
     assert " " not in outputs["matrix"]
     assert [m["id"] for m in json.loads(outputs["matrix"])] == [
         "source-development",
+        "source-1.1.14",
         "x-development",
     ]
     console = capsys.readouterr().out
@@ -801,3 +831,207 @@ def test_render_table_and_annotations() -> None:
         "::warning title=Scan target x-1 failed to resolve::boom",
         "::notice title=Scan target x-2 skipped::nope",
     ]
+
+
+# --- release sources ----------------------------------------------------------
+
+
+def test_release_source_target_of_latest_release() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    tag_routes(t, "0.12.0", "c" * 40)
+    t.add(tags_url("example/app"), ok({"tags": ["development", "0.12.0"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], scan_release_source=True)
+    assert [x["id"] for x in targets_doc["targets"]] == [
+        "source-development",
+        "source-0.12.0",
+        "app-development",
+        "app-0.12.0",
+    ]
+    assert by_id(targets_doc)["source-0.12.0"] == {
+        "id": "source-0.12.0",
+        "kind": "fs",
+        "image": None,
+        "tag": "0.12.0",
+        "ref": None,
+        "git_ref": "0.12.0",
+        "commit_sha": "c" * 40,
+        "status": "pending",
+        "reason": None,
+    }
+    # the development source is not a release one
+    assert by_id(targets_doc)["source-development"]["tag"] is None
+    matrix = rt.build_matrix(targets_doc)
+    assert all(set(m) == TARGET_KEYS for m in matrix)
+    assert [m["id"] for m in matrix][:2] == ["source-development", "source-0.12.0"]
+    # one line needs no git tag listing
+    assert not any("/tags?" in url for url, _ in t.calls)
+
+
+def test_release_source_peels_annotated_tag() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    tag_routes(t, "0.12.0", "d" * 40, annotated_as="e" * 40)
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert targets["source-0.12.0"]["commit_sha"] == "d" * 40
+    assert targets["source-0.12.0"]["status"] == "pending"
+
+
+def test_release_source_tag_pointing_at_a_tree_fails() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    t.add(
+        f"{API}/repos/{REPOSITORY}/git/ref/tags/0.12.0",
+        ok({"object": {"type": "tree", "sha": "f" * 40}}),
+    )
+    target = by_id(run_resolve_targets(t, [], scan_release_source=True))[
+        "source-0.12.0"
+    ]
+    assert target["status"] == "failed"
+    assert "not a commit" in target["reason"]
+    assert target["commit_sha"] is None
+
+
+def test_release_source_tag_that_cannot_be_resolved_is_a_failed_target() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    t.add(f"{API}/repos/{REPOSITORY}/git/ref/tags/0.12.0", rt.Response(404))
+    targets_doc = run_resolve_targets(t, [], scan_release_source=True)
+    failed = by_id(targets_doc)["source-0.12.0"]
+    assert failed["status"] == "failed"
+    assert "cannot resolve release tag 0.12.0" in failed["reason"]
+    assert "HTTP 404" in failed["reason"]
+    assert (failed["kind"], failed["tag"], failed["git_ref"]) == (
+        "fs",
+        "0.12.0",
+        "0.12.0",
+    )
+    assert [m["id"] for m in rt.build_matrix(targets_doc)] == ["source-development"]
+    assert any(
+        "source-0.12.0 failed to resolve" in line
+        for line in rt.annotations(targets_doc["targets"])
+    )
+
+
+def test_release_source_latest_release_lookup_failure_is_a_failed_target() -> None:
+    t = FakeTransport()
+    github_routes(t, release_status=500)
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert targets["source-development"]["status"] == "pending"
+    assert targets["source-release"]["status"] == "failed"
+    assert "HTTP 500" in targets["source-release"]["reason"]
+    assert targets["source-release"]["git_ref"] is None
+
+
+def test_release_source_without_images_python_package() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.2.3")
+    tag_routes(t, "1.2.3", "a1" * 20)
+    targets_doc = run_resolve_targets(t, [], scan_release_source=True)
+    assert [x["id"] for x in targets_doc["targets"]] == [
+        "source-development",
+        "source-1.2.3",
+    ]
+    assert not any("/v2/" in url for url, _ in t.calls)
+
+
+def test_release_source_falls_back_to_git_tags_without_github_release() -> None:
+    t = FakeTransport()
+    github_routes(t, release=None)
+    git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
+    tag_routes(t, "0.12.0", "b" * 40)
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert list(targets) == ["source-development", "source-0.12.0"]
+
+
+def test_release_source_lines_from_git_tags_newest_first() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    git_tags_route(t, ["0.9.1", "0.10.0", "0.12.0", "0.12.1", "0.11.4", "0.13.0-rc.1"])
+    for tag in ("0.12.1", "0.11.4", "0.10.0"):
+        tag_routes(t, tag, "b" * 40)
+    targets_doc = run_resolve_targets(t, [], release_lines=3, scan_release_source=True)
+    assert [x["id"] for x in targets_doc["targets"]] == [
+        "source-development",
+        "source-0.12.1",
+        "source-0.11.4",
+        "source-0.10.0",
+    ]
+    # several lines: the git tags decide, not the latest GitHub release
+    assert not any(url.endswith("/releases/latest") for url, _ in t.calls)
+
+
+def test_release_source_git_tag_listing_is_paginated() -> None:
+    t = FakeTransport()
+    github_routes(t, release=None)
+    git_tags_route(t, [f"0.1.{i}" for i in range(100)], page=1)
+    git_tags_route(t, ["0.2.0"], page=2)
+    tag_routes(t, "0.2.0", "b" * 40)
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert "source-0.2.0" in targets
+
+
+def test_release_source_no_stable_tag_is_not_applicable() -> None:
+    t = FakeTransport()
+    github_routes(t, release=None)
+    git_tags_route(t, ["0.1.0-rc.1", "nightly"])
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert targets["source-release"]["status"] == "not_applicable"
+    assert "no stable release tag" in targets["source-release"]["reason"]
+
+
+def test_release_source_git_tag_listing_failure_is_a_failed_target() -> None:
+    t = FakeTransport()
+    github_routes(t, release=None)
+    t.add(f"{API}/repos/{REPOSITORY}/tags?per_page=100&page=1", rt.Response(403))
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert targets["source-release"]["status"] == "failed"
+    assert "HTTP 403" in targets["source-release"]["reason"]
+
+
+def test_scan_source_false_disables_release_sources_too() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    t.add(tags_url("example/x"), ok({"tags": ["development", "0.12.0"]}))
+    targets = by_id(
+        run_resolve_targets(
+            t, ["example/x"], scan_source=False, scan_release_source=True
+        )
+    )
+    assert list(targets) == ["x-development", "x-0.12.0"]
+    assert not any("/git/" in url for url, _ in t.calls)
+
+
+def test_release_source_off_makes_no_extra_requests() -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    t.add(tags_url("example/x"), ok({"tags": ["development", "0.12.0"]}))
+    run_resolve_targets(t, ["example/x"], scan_release_source=False)
+    assert not any("/git/" in url or "/tags?" in url for url, _ in t.calls)
+
+
+def test_release_source_id_sanitized() -> None:
+    t = FakeTransport()
+    github_routes(t, release="rel/1.0")
+    tag_routes(t, "rel/1.0", "b" * 40)
+    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
+    assert targets["source-rel-1.0"]["git_ref"] == "rel/1.0"
+
+
+def test_run_scan_release_source_flag(tmp_path: Path) -> None:
+    t = FakeTransport()
+    github_routes(t, release="0.12.0")
+    tag_routes(t, "0.12.0", "b" * 40)
+    base = ["--repository", REPOSITORY, "--output-dir", str(tmp_path)]
+    assert rt.run(rt.parse_args(base), t, ENV, NOW) == 0  # on by default
+    targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
+    assert [x["id"] for x in targets_doc["targets"]] == [
+        "source-development",
+        "source-0.12.0",
+    ]
+    off = [*base, "--scan-release-source", "false"]
+    assert rt.run(rt.parse_args(off), t, ENV, NOW) == 0
+    targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
+    assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
+    with pytest.raises(rt.ResolveError, match="scan-release-source"):
+        rt.run(rt.parse_args([*base, "--scan-release-source", "maybe"]), t, ENV, NOW)

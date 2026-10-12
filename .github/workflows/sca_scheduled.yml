@@ -51,6 +51,10 @@ on:
         type: boolean
         description: Scan the container images
         default: true
+      scan-release-source:
+        type: boolean
+        description: Scan the source code of the latest releases (git tags), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
+        default: true
       runs-on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
@@ -74,6 +78,7 @@ jobs:
           release-lines: ${{ inputs.release-lines }}
           scan-source: ${{ inputs.scan-source }}
           scan-images: ${{ inputs.scan-images }}
+          scan-release-source: ${{ inputs.scan-release-source }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets

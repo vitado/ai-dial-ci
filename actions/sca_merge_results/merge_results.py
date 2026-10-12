@@ -30,6 +30,13 @@ Result carry neither ``Relationship`` nor ``DependsOn``. They are filled in from
 the Gradle graph of the project (in memory only, ``_native/`` stays as trivy
 wrote it), before the dependency chains are built.
 
+A target is an image, the source of the default branch or - an fs target with a
+``tag`` - the source of a release tag. A release source gives the findings of a
+release image their dependency chains (the same package version in the lockfile of
+the tag; an image has no graph) and, in a run without images, stands for the
+release in the exposure and in the headline. With images it never raises a
+finding above ``source_only``: see ``classify_exposure``.
+
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
 decides about failing the run after the artifact has been uploaded.
@@ -84,7 +91,9 @@ DEVELOPMENT_TAG = "development"
 # Where a finding was seen: what kind of artifact a scan target is.
 CLASS_RELEASE = "release"  # an image with a tag other than "development"
 CLASS_DEVELOPMENT = "development"  # the "development" image
-CLASS_SOURCE = "source"  # the source code (trivy fs)
+CLASS_SOURCE = "source"  # the source code of the default branch (trivy fs)
+# the source code at a release tag (trivy fs); an fs target is one if it has a tag
+CLASS_RELEASE_SOURCE = "release_source"
 
 # Exposure of a finding, most urgent first.
 EXPOSURE_RELEASE_AND_DEVELOPMENT = "release_and_development"
@@ -989,9 +998,11 @@ def merge_records(
 
 
 def target_class(target: Mapping[str, Any]) -> str | None:
-    """What a scan target is: release image, development image or source code."""
+    """What a scan target is: an image (release or development) or source code
+    (of the default branch or of a release tag).
+    """
     if target.get("kind") == KIND_FS:
-        return CLASS_SOURCE
+        return CLASS_RELEASE_SOURCE if target.get("tag") else CLASS_SOURCE
     if target.get("kind") == KIND_IMAGE:
         return (
             CLASS_DEVELOPMENT if target.get("tag") == DEVELOPMENT_TAG else CLASS_RELEASE
@@ -999,22 +1010,36 @@ def target_class(target: Mapping[str, Any]) -> str | None:
     return None
 
 
+def release_class(has_images: bool) -> str:
+    """Kind of target that stands for a release: its image, else its source."""
+    return CLASS_RELEASE if has_images else CLASS_RELEASE_SOURCE
+
+
 def classify_exposure(classes: Collection[str], has_images: bool) -> str:
     """Exposure of a finding by the kinds of targets it was found in.
 
-    A run without image targets (e.g. a Python package) ships its source, so a
-    finding there counts as a development one.
+    With images, the images decide: a finding seen in any image is classified by
+    the release and development images (the source of the default branch counts as
+    development), and one seen only in sources is ``source_only``. The source of a
+    release tag is never counted as release or development there, since a lockfile
+    also lists build and test dependencies that are not shipped.
+
+    Without images (e.g. a Python package) the sources are the subject: a finding
+    in the source of a release tag is a release one, in the source of the default
+    branch a development one.
     """
-    in_release = CLASS_RELEASE in classes
-    in_development = CLASS_DEVELOPMENT in classes or CLASS_SOURCE in classes
+    if has_images:
+        if not classes & {CLASS_RELEASE, CLASS_DEVELOPMENT}:
+            return EXPOSURE_SOURCE_ONLY
+        in_release = CLASS_RELEASE in classes
+        in_development = CLASS_DEVELOPMENT in classes or CLASS_SOURCE in classes
+    else:
+        in_release = CLASS_RELEASE_SOURCE in classes
+        in_development = CLASS_SOURCE in classes
     if in_release and in_development:
         return EXPOSURE_RELEASE_AND_DEVELOPMENT
     if in_release:
         return EXPOSURE_RELEASE_ONLY
-    if CLASS_DEVELOPMENT in classes:
-        return EXPOSURE_DEVELOPMENT_ONLY
-    if has_images:
-        return EXPOSURE_SOURCE_ONLY
     return EXPOSURE_DEVELOPMENT_ONLY
 
 
@@ -1314,7 +1339,9 @@ def has_several_images(targets: Iterable[Mapping[str, Any]]) -> bool:
 
 
 def target_label(target: Mapping[str, Any], several_images: bool) -> str:
-    """Short name: ``source @ development 3d0c8a3``, ``image :1.0``, ``app :1.0``."""
+    """Short name: ``source @ development 3d0c8a3``, ``source @ 1.0 3d0c8a3``,
+    ``image :1.0``, ``app :1.0``.
+    """
     if target.get("kind") == KIND_FS:
         parts = ["source @", target.get("git_ref") or "?"]
         if target.get("commit_sha"):
@@ -1435,8 +1462,10 @@ def headline_lines(report: Mapping[str, Any], records: Sequence[Record]) -> list
     sources = by_class.get(CLASS_SOURCE)
     development_scanned = bool(development_images or sources)
 
+    # the verdict of a release is the one of its images; without images, of its source
+    has_images = any(t.get("kind") == KIND_IMAGE for t in targets)
     release_tags: dict[str, set[str]] = {}
-    for target in by_class.get(CLASS_RELEASE, []):
+    for target in by_class.get(release_class(has_images), []):
         release_tags.setdefault(target["tag"], set()).add(target["id"])
     for tag, tids in release_tags.items():
         lines.append(
@@ -1575,11 +1604,14 @@ def resolves_cell(group: Sequence[Record]) -> str:
 def release_tags_of(
     group: Iterable[Record], targets: Sequence[Mapping[str, Any]]
 ) -> list[str]:
-    """Release tags (in targets order) of the images a group was found in."""
+    """Release tags (in targets order) of the images a group was found in, or of
+    the release sources if the run has no images.
+    """
     found = {tid for r in group for tid in r["scan_targets"]}
+    kind = release_class(any(t.get("kind") == KIND_IMAGE for t in targets))
     tags: list[str] = []
     for target in targets:
-        if target["id"] in found and target_class(target) == CLASS_RELEASE:
+        if target["id"] in found and target_class(target) == kind:
             _append_unique(tags, target["tag"])
     return tags
 
@@ -1611,10 +1643,26 @@ def exposure_label(
     return "development only" if has_images else "development (source)"
 
 
+def found_in_default_source(
+    group: Iterable[Record], targets: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Whether a group was found in the source of the default branch."""
+    found = {tid for r in group for tid in r["scan_targets"]}
+    return any(t["id"] in found and target_class(t) == CLASS_SOURCE for t in targets)
+
+
 def action_text(
-    exposure: str, dev: bool | None, tags: Sequence[str], via: str = ""
+    exposure: str,
+    dev: bool | None,
+    tags: Sequence[str],
+    via: str = "",
+    open_in_development: bool = True,
 ) -> str:
-    """What to do, verb first; ``via`` is the dependency chain to upgrade through."""
+    """What to do, verb first; ``via`` is the dependency chain to upgrade through.
+
+    ``open_in_development`` is False for a finding that sits only in the source of
+    a release tag: the default branch is clear of it, so there is nothing to upgrade.
+    """
     lines = ", ".join(release_lines(tags))
     via_text = f" via {via}" if via else ""
     if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
@@ -1623,6 +1671,8 @@ def action_text(
         return f"Release a patch from {lines} (already fixed in development){via_text}"
     if exposure == EXPOSURE_SOURCE_ONLY:
         note = "dev dependency, not shipped" if dev else "not in published images"
+        if not open_in_development:
+            return f"Already fixed in development — {note}"
         return f"Upgrade in development{via_text} — {note}"
     return f"Upgrade in development{via_text} before the next release"
 
@@ -1632,28 +1682,31 @@ def where_cell(
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Where a group was found: tags per image, then the source lockfiles.
+    """Where a group was found: tags per image, then the lockfiles of the source
+    of the default branch and of each release tag.
 
     ``statgpt-chat :development, :0.17.7 · statgpt-admin :development · source
-    poetry.lock``; a run with one image calls it ``image``.
+    poetry.lock · source @ 0.17.7 poetry.lock``; a run with one image calls it
+    ``image``.
     """
     several = has_several_images(targets)
     tags: dict[str, list[str]] = {}
-    locations: list[str] = []
+    sources: dict[str, list[str]] = {}  # "source" / "source @ <tag>" -> lockfiles
     for target in targets:
         for record in group:
             seen = sightings.get((record["cve"], record["pkg"], record["version"]), {})
             if target["id"] not in seen:
                 continue
             if target.get("kind") == KIND_FS:
-                locations.extend(seen[target["id"]])
+                name = f"source @ {target['tag']}" if target.get("tag") else "source"
+                sources.setdefault(name, []).extend(seen[target["id"]])
             else:
                 name = image_short_name(target) if several else "image"
                 _append_unique(tags.setdefault(name, []), f":{target.get('tag')}")
     parts = [f"{name} {', '.join(names)}" for name, names in tags.items()]
-    if locations:
+    for name, locations in sources.items():
         shown = sorted(set(locations))
-        text = "source " + ", ".join(shown[:MAX_LISTED_LOCATIONS])
+        text = f"{name} " + ", ".join(shown[:MAX_LISTED_LOCATIONS])
         if len(shown) > MAX_LISTED_LOCATIONS:
             text += f" +{len(shown) - MAX_LISTED_LOCATIONS} more"
         parts.append(text)
@@ -1697,6 +1750,7 @@ def render_what_to_fix(
                     shortest_path_text(group)
                     if group_relationship(group) == "indirect"
                     else "",
+                    found_in_default_source(group, targets),
                 ),
                 where_cell(fixable, sightings, targets),
             ]

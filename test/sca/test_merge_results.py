@@ -2500,9 +2500,12 @@ def test_source_only_action_when_the_default_branch_is_clear() -> None:
 
 @pytest.fixture
 def with_osv(tmp_path: Path) -> Workspace:
-    """fs + two images (Trivy, all ok) and the OSV twin of the fs target (ok)."""
+    """fs + two images (Trivy, all ok) and the OSV twin of the fs target (ok).
+
+    The Trivy fs result lists the packages that OSV was asked about.
+    """
     ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV, REL, OSV_SOURCE))
-    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("source-development", "source-osv", lockfiles=3)
     ws.add_part("app-development", "app-development")
     ws.add_part("app-1.0.0", "app-1.0.0")
     ws.add_osv_part("source-development", "osv-source")
@@ -2513,7 +2516,7 @@ def trivy_only_twin(tmp_path: Path) -> Workspace:
     """The `with_osv` run without its OSV target: the Trivy parts alone."""
     (tmp_path / "trivy-only").mkdir()
     ws = Workspace(tmp_path / "trivy-only", make_targets_doc(SOURCE, DEV, REL))
-    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("source-development", "source-osv", lockfiles=3)
     ws.add_part("app-development", "app-development")
     ws.add_part("app-1.0.0", "app-1.0.0")
     return ws
@@ -2588,42 +2591,40 @@ def test_osv_metadata_with_unknown_api_url(tmp_path: Path) -> None:
     assert ws.json("_report/scan_report.json")["osv"] == {"api_url": None}
 
 
-def test_osv_contributes_no_records(with_osv: Workspace) -> None:
+def test_osv_findings_are_records_next_to_the_trivy_ones(
+    with_osv: Workspace,
+) -> None:
     with_osv.run()
-    records = with_osv.json("_report/vulnerabilities.json")["records"]
-    assert records
-    assert all(r["scanners"] == ["trivy"] for r in records)
-    assert all("osv" not in r["scan_targets"] for r in records)
-    assert not any(r["cve"].startswith(("GHSA", "PYSEC")) for r in records)
+    records = records_by_cve(with_osv)
+    scanners = {cve: r["scanners"] for cve, r in records.items()}
+    # CVE-2000-0001 and CVE-2000-0003 are alias-matched Trivy records, CVE-2000-0002
+    # is Trivy's alone, the rest are the OSV-only ones (one OSV id each here)
+    assert scanners == {
+        "CVE-2000-0001": ["osv", "trivy"],
+        "CVE-2000-0002": ["trivy"],
+        "CVE-2000-0003": ["osv", "trivy"],
+        "CVE-2000-0010": ["trivy"],
+        "CVE-2000-0011": ["trivy"],
+        "CVE-2030-0002": ["osv"],
+        "CVE-2030-0003": ["osv"],
+        "CVE-2030-0004": ["osv"],
+    }
+    assert records["CVE-2000-0001"]["aliases"] == ["GHSA-aaaa-aaaa-0001"]
+    assert records["CVE-2030-0004"]["aliases"] == ["PYSEC-2030-1"]
 
 
-def test_trivy_output_is_unchanged_by_osv_targets(
+def test_osv_target_findings_in_the_report_stay_the_osv_counts(
     with_osv: Workspace, tmp_path: Path
 ) -> None:
+    # the per-target counts are what each scanner said, not what was merged
     full = trivy_only_twin(tmp_path)
     with_osv.run()
     full.run()
-    assert with_osv.json("_report/vulnerabilities.json") == full.json(
-        "_report/vulnerabilities.json"
-    )
     assert with_osv.targets == full.targets
-    keep = ("trivy_version", "trivy_db", "commit_sha", "run_id")
-    for key in keep:
-        assert (
-            with_osv.json("_report/scan_report.json")[key]
-            == full.json("_report/scan_report.json")[key]
-        )
-    # the findings sections of summary.md do not move either
-    with_osv_md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
-    full_md = (full.out / "summary.md").read_text(encoding="utf-8")
-    assert with_osv_md.split("<details>\n<summary>Scan coverage")[0].replace(
-        "3/3 targets scanned", "4/4 targets scanned"
-    ) == full_md.split("<details>\n<summary>Scan coverage")[0].replace(
-        "3/3 targets scanned", "4/4 targets scanned"
-    )
+    assert with_osv.osv_targets["source-development"]["findings"]["total"] == 5
 
 
-def test_totals_count_osv_targets_but_findings_stay_trivy_records(
+def test_totals_count_the_merged_records_including_osv_only_ones(
     with_osv: Workspace, tmp_path: Path
 ) -> None:
     full = trivy_only_twin(tmp_path)
@@ -2637,7 +2638,52 @@ def test_totals_count_osv_targets_but_findings_stay_trivy_records(
         "failed": 0,
         "not_applicable": 0,
     }
-    assert totals["findings"] == reference["findings"]
+    # three records only OSV knows: CVE-2030-0002 (LOW), -0003 (HIGH), -0004 (UNKNOWN)
+    assert reference["findings"]["total"] == 5
+    assert totals["findings"]["total"] == 8
+    assert totals["findings"]["fixable"] == reference["findings"]["fixable"] + 2
+    assert totals["findings"]["by_severity"] == {
+        "CRITICAL": 1,
+        "HIGH": 2,
+        "MEDIUM": 2,
+        "LOW": 2,
+        "UNKNOWN": 1,
+    }
+    assert sum(totals["findings"]["by_exposure"].values()) == 8
+
+
+def test_trivy_output_is_unchanged_when_osv_finds_nothing(tmp_path: Path) -> None:
+    def build(name: str, osv: bool) -> Workspace:
+        (tmp_path / name).mkdir()
+        targets = (SOURCE, DEV, REL, *([OSV_SOURCE] if osv else []))
+        ws = Workspace(tmp_path / name, make_targets_doc(*targets))
+        ws.add_part("source-development", "source-osv", lockfiles=3)
+        ws.add_part("app-development", "app-development")
+        ws.add_part("app-1.0.0", "app-1.0.0")
+        if osv:
+            write_osv_native(
+                ws,
+                osv_native(packages={"pkg:npm/lodash@4.17.0": []}, vulnerabilities={}),
+            )
+        ws.run()
+        return ws
+
+    without, clean = build("without", False), build("clean", True)
+    assert (clean.out / "_report" / "vulnerabilities.json").read_bytes() == (
+        without.out / "_report" / "vulnerabilities.json"
+    ).read_bytes()
+    assert clean.targets == without.targets
+    # no marker and no OSV-only count in the summary
+    md = (clean.out / "summary.md").read_text(encoding="utf-8")
+    assert "OSV only" not in md
+    assert "found only by OSV" not in md
+    # the findings part of summary.md does not move either
+    split = "<details>\n<summary>Scan coverage"
+    reference = (without.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        md.split(split)[0].replace("4/4 targets scanned", "3/3 targets scanned")
+        == reference.split(split)[0]
+    )
 
 
 def test_osv_natives_are_copied_next_to_the_trivy_ones(with_osv: Workspace) -> None:
@@ -2650,7 +2696,7 @@ def test_osv_natives_are_copied_next_to_the_trivy_ones(with_osv: Workspace) -> N
     ).read_bytes()
     # the Trivy native of the same id is another file
     assert (native / "trivy" / "source-development.json").read_bytes() == (
-        FIXTURES / "source.json"
+        FIXTURES / "source-osv.json"
     ).read_bytes()
 
 
@@ -2838,7 +2884,7 @@ def test_summary_coverage_has_a_scanner_column_and_osv_rows(
     with_osv.run()
     md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
     assert "| Target | Scanner | Status | Packages | C | H | M | L | Note |" in md
-    assert "| source @ development fedcba9 | trivy | ok | 0 | 1 | 1 | 1 | 0 | - |" in md
+    assert "| source @ development fedcba9 | trivy | ok | 7 | 1 | 1 | 1 | 0 | - |" in md
     assert "| source @ development fedcba9 | osv | ok | 5 | 1 | 1 | 1 | 1 | - |" in md
 
 
@@ -2850,16 +2896,15 @@ def test_summary_coverage_is_as_before_without_osv(full: Workspace) -> None:
     assert "OSV" not in md
 
 
-def test_summary_footer_has_the_osv_scope_and_the_no_merge_note(
+def test_summary_footer_has_the_osv_scope_and_the_query_time(
     with_osv: Workspace,
 ) -> None:
     with_osv.run()
     md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
     assert md.rstrip().endswith("</sub>")
     footer = md.rstrip().splitlines()[-1]
-    assert footer == (
-        "<sub>OSV: language packages only; findings counted, "
-        "not yet merged into the findings above</sub>"
+    assert (
+        footer == "<sub>OSV: language packages only · queried 2030-01-01 00:10Z</sub>"
     )
 
 
@@ -2867,7 +2912,9 @@ def test_summary_headline_without_trivy_scan_but_with_an_osv_one(
     tmp_path: Path,
 ) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
-    ws.add_osv_part("source-development", "osv-source")
+    write_osv_native(
+        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
+    )
     assert ws.run() == 1  # the Trivy part is missing
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "> No Trivy target was scanned" in md
@@ -2886,7 +2933,9 @@ def test_osv_target_does_not_change_the_no_findings_headline(tmp_path: Path) -> 
     (ws.trivy_parts / "source-development.json").write_text(
         json.dumps({"Results": []}), encoding="utf-8"
     )
-    ws.add_osv_part("source-development", "osv-source")
+    write_osv_native(
+        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
+    )
     assert ws.run() == 0
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "> No known vulnerabilities · 0 packages in 1 targets" in md
@@ -3128,3 +3177,1299 @@ def test_osv_findings_count_a_repeated_id_once() -> None:
     native = osv_native()
     native["packages"]["pkg:npm/lodash@4.17.0"] = ["GHSA-aaaa-aaaa-0001"] * 2
     assert len(mr.osv_findings(native)) == 4
+
+
+# ---- OSV: findings as records
+
+GHSA_DB = {"severity": "HIGH"}
+VECTOR_HIGH = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"  # 7.5
+VECTOR_CRITICAL = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"  # 9.8
+VECTOR_V4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+
+
+def lang_package(
+    name: str,
+    version: str,
+    purl: str,
+    relationship: str | None = None,
+    depends_on: tuple[str, ...] = (),
+    dev: bool = False,
+) -> dict[str, Any]:
+    """A Trivy package of a language result; its ID is ``name@version``."""
+    package: dict[str, Any] = {
+        "ID": f"{name}@{version}",
+        "Name": name,
+        "Version": version,
+        "Identifier": {"PURL": purl},
+    }
+    if relationship:
+        package["Relationship"] = relationship
+    if depends_on:
+        package["DependsOn"] = list(depends_on)
+    if dev:
+        package["Dev"] = True
+    return package
+
+
+def trivy_vuln(
+    cve: str, name: str, version: str, severity: str = "MEDIUM", **extra: Any
+) -> dict[str, Any]:
+    return {
+        "VulnerabilityID": cve,
+        "PkgName": name,
+        "InstalledVersion": version,
+        "Severity": severity,
+        "Status": "affected",
+        "Title": f"Trivy title of {cve}",
+        **extra,
+    }
+
+
+def lang_result(
+    result_type: str,
+    target: str,
+    packages: list[dict[str, Any]],
+    vulns: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "Target": target,
+        "Class": "lang-pkgs",
+        "Type": result_type,
+        "Packages": packages,
+    }
+    if vulns:
+        result["Vulnerabilities"] = vulns
+    return result
+
+
+def affected_range(
+    ecosystem: str, name: str, *events: dict[str, str], kind: str = "ECOSYSTEM"
+) -> dict[str, Any]:
+    return {
+        "package": {"ecosystem": ecosystem, "name": name},
+        "ranges": [{"type": kind, "events": [{"introduced": "0"}, *events]}],
+    }
+
+
+def osv_record(vuln_id: str, **fields: Any) -> dict[str, Any]:
+    return {"id": vuln_id, **fields}
+
+
+def osv_part(
+    packages: dict[str, list[str]], *records: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "queried_at": "2030-01-01T00:10:00Z",
+        "api_url": "https://api.osv.dev",
+        "packages": packages,
+        "vulnerabilities": {r["id"]: r for r in records},
+    }
+
+
+def merge_scan(
+    tmp_path: Path,
+    trivy: dict[str, dict[str, Any]],
+    osv: dict[str, dict[str, Any]],
+    *targets: dict[str, Any],
+) -> Workspace:
+    """Merge natives written as parts: ``trivy`` and ``osv`` by target id."""
+    doc = make_targets_doc(
+        *targets, *({**t, "scanner": "osv"} for t in targets if t["id"] in osv)
+    )
+    ws = Workspace(tmp_path, doc)
+    for tid, native in trivy.items():
+        ws.add_part(tid, None)
+        (ws.trivy_parts / f"{tid}.json").write_text(json.dumps(native), "utf-8")
+    for tid, native in osv.items():
+        write_osv_native(ws, native, tid)
+    ws.run()
+    return ws
+
+
+def source_with(*results: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {"source-development": {"Results": list(results)}}
+
+
+def test_osv_joins_the_trivy_record_by_a_cve_alias(tmp_path: Path) -> None:
+    lib = lang_package("lib", "1.0", "pkg:npm/lib@1.0", "direct")
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lib],
+            [
+                trivy_vuln(
+                    "CVE-2030-1",
+                    "lib",
+                    "1.0",
+                    "HIGH",
+                    PrimaryURL="https://example.invalid/CVE-2030-1",
+                    CweIDs=["CWE-1"],
+                )
+            ],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record(
+                "GHSA-aaaa-aaaa-aaaa",
+                aliases=["CVE-2030-1"],
+                summary="OSV title",
+                database_specific={"severity": "CRITICAL", "cwe_ids": ["CWE-2"]},
+                affected=[affected_range("npm", "lib", {"fixed": "1.5"})],
+            ),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    records = records_by_cve(ws)
+    assert list(records) == ["CVE-2030-1"]
+    record = records["CVE-2030-1"]
+    assert record["scanners"] == ["osv", "trivy"]
+    assert record["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]
+    assert record["scan_targets"] == ["source-development"]
+    # what Trivy said wins: severity, title, URL, CWE; its (missing) fix is not
+    # filled in from OSV
+    assert record["severity"] == "HIGH"
+    assert record["title"] == "Trivy title of CVE-2030-1"
+    assert record["primary_url"] == "https://example.invalid/CVE-2030-1"
+    assert record["cwe"] == ["CWE-1"]
+    assert (record["status"], record["fix_available"]) == ("affected", False)
+    assert record["fixed_versions"] == []
+
+
+def test_osv_joins_a_trivy_record_by_an_id_in_its_aliases(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+            [trivy_vuln("CVE-2030-1", "lib", "1.0", VendorIDs=["GHSA-aaaa-aaaa-aaaa"])],
+        )
+    )
+    # the GHSA record does not list the CVE; Trivy lists the GHSA as its vendor id
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa"),
+        )
+    }
+    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    assert list(records) == ["CVE-2030-1"]
+    assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
+    assert records["CVE-2030-1"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]
+
+
+def test_an_alias_group_is_one_vulnerability_matching_by_any_of_its_ids(
+    tmp_path: Path,
+) -> None:
+    trivy = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("lib", "1.0", "pkg:pypi/lib@1.0")],
+            [trivy_vuln("CVE-2030-1", "lib", "1.0")],
+        )
+    )
+    # PYSEC and GHSA both alias the CVE: one record, joined with Trivy's
+    osv = {
+        "source-development": osv_part(
+            {"pkg:pypi/lib@1.0": ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]},
+            osv_record("PYSEC-2030-1", aliases=["CVE-2030-1"]),
+            osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
+        )
+    }
+    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    assert list(records) == ["CVE-2030-1"]
+    assert records["CVE-2030-1"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]
+    assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
+
+
+def test_a_vulnerability_matches_every_record_it_shares_an_id_with(
+    tmp_path: Path,
+) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+            [
+                trivy_vuln("CVE-2030-1", "lib", "1.0"),
+                trivy_vuln("CVE-2030-2", "lib", "1.0"),
+            ],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1", "CVE-2030-2"]),
+        )
+    }
+    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    assert len(records) == 2
+    # each is joined, and the CVE of the other is not an alias of it
+    assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
+    assert records["CVE-2030-1"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]
+    assert records["CVE-2030-2"]["scanners"] == ["osv", "trivy"]
+    assert records["CVE-2030-2"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]
+
+
+def test_only_the_same_package_version_matches(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [
+                lang_package("lib", "1.0", "pkg:npm/lib@1.0"),
+                lang_package("lib", "2.0", "pkg:npm/lib@2.0"),
+                lang_package("other", "1.0", "pkg:npm/other@1.0"),
+            ],
+            [
+                trivy_vuln("CVE-2030-1", "lib", "2.0"),
+                trivy_vuln("CVE-2030-1", "other", "1.0"),
+            ],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    found = {
+        (r["pkg"], r["version"]): r["scanners"]
+        for r in ws.json("_report/vulnerabilities.json")["records"]
+    }
+    # lib 1.0 is a new OSV-only record; lib 2.0 and other 1.0 stay Trivy's
+    assert found == {
+        ("lib", "1.0"): ["osv"],
+        ("lib", "2.0"): ["trivy"],
+        ("other", "1.0"): ["trivy"],
+    }
+
+
+def test_osv_related_does_not_join_vulnerabilities(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa", "GHSA-bbbb-bbbb-bbbb"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", related=["GHSA-bbbb-bbbb-bbbb"]),
+            osv_record("GHSA-bbbb-bbbb-bbbb", related=["GHSA-aaaa-aaaa-aaaa"]),
+        )
+    }
+    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    assert sorted(records) == ["GHSA-aaaa-aaaa-aaaa", "GHSA-bbbb-bbbb-bbbb"]
+
+
+# ---- OSV-only records
+
+
+def vulnerabilities(*records: dict[str, Any]) -> list[Any]:
+    return mr.osv_vulnerabilities(
+        {r["id"]: r for r in records}, [r["id"] for r in records]
+    )
+
+
+def test_osv_vulnerabilities_group_ids_linked_by_aliases() -> None:
+    groups = vulnerabilities(
+        osv_record("PYSEC-1", aliases=["CVE-1"]),
+        osv_record("GHSA-b", aliases=["CVE-1", "OTHER-9"]),
+        osv_record("GHSA-c"),
+        osv_record("RUSTSEC-d", aliases=["GHSA-c"]),
+        osv_record("GHSA-e", aliases=[7, None]),
+    )
+    assert [(g.ids, sorted(g.names)) for g in groups] == [
+        (("GHSA-b", "PYSEC-1"), ["CVE-1", "GHSA-b", "OTHER-9", "PYSEC-1"]),
+        (("GHSA-c", "RUSTSEC-d"), ["GHSA-c", "RUSTSEC-d"]),
+        (("GHSA-e",), ["GHSA-e"]),
+    ]
+    # GHSA records come first, then by id
+    assert [r["id"] for r in groups[0].records] == ["GHSA-b", "PYSEC-1"]
+    assert [r["id"] for r in groups[1].records] == ["GHSA-c", "RUSTSEC-d"]
+
+
+@pytest.mark.parametrize(
+    ("records", "expected"),
+    [
+        # the only CVE
+        ([osv_record("PYSEC-1", aliases=["CVE-2030-5"])], "CVE-2030-5"),
+        # several CVEs: the first in string order
+        (
+            [osv_record("GHSA-a", aliases=["CVE-2030-9", "CVE-2030-12", "CVE-2029-3"])],
+            "CVE-2029-3",
+        ),
+        # no CVE: the first GHSA, even if it is only an alias
+        ([osv_record("PYSEC-1", aliases=["GHSA-z", "GHSA-b"])], "GHSA-b"),
+        ([osv_record("GHSA-m"), osv_record("GHSA-k", aliases=["GHSA-m"])], "GHSA-k"),
+        # neither: the first id OSV reported
+        ([osv_record("RUSTSEC-2", aliases=["PYSEC-1"])], "RUSTSEC-2"),
+        ([osv_record("PYSEC-2"), osv_record("OSV-1", aliases=["PYSEC-2"])], "OSV-1"),
+    ],
+)
+def test_osv_primary_id(records: list[dict[str, Any]], expected: str) -> None:
+    (group,) = vulnerabilities(*records)
+    assert mr.osv_primary_id(group) == expected
+
+
+def test_osv_only_record_fields_from_the_osv_records(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("Foo_Bar", "1.0", "pkg:pypi/foo-bar@1.0", "direct")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:pypi/foo-bar@1.0": ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]},
+            osv_record(
+                "PYSEC-2030-1",
+                aliases=["CVE-2030-1", "GHSA-aaaa-aaaa-aaaa"],
+                published="2030-01-05T00:00:00Z",
+                details="long text",
+                references=[
+                    {"type": "WEB", "url": "https://example.invalid/web"},
+                    {"type": "ADVISORY", "url": "https://example.invalid/pysec"},
+                ],
+                affected=[affected_range("PyPI", "foo-bar", {"fixed": "1.2"})],
+            ),
+            osv_record(
+                "GHSA-aaaa-aaaa-aaaa",
+                aliases=["CVE-2030-1"],
+                summary=" The GHSA summary ",
+                published="2030-01-03T00:00:00Z",
+                database_specific={
+                    "severity": "MODERATE",
+                    "cwe_ids": ["CWE-79", "CWE-20"],
+                },
+                severity=[{"type": "CVSS_V3", "score": VECTOR_CRITICAL}],
+                references=[
+                    {"type": "ADVISORY", "url": "https://example.invalid/ghsa"}
+                ],
+                affected=[affected_range("PyPI", "foo-bar", {"fixed": "1.1"})],
+            ),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    records = ws.json("_report/vulnerabilities.json")["records"]
+    assert len(records) == 1
+    record = records[0]
+    # the package context is the Trivy package's: its name, not the purl's
+    assert (record["repo"], record["pkg"], record["version"]) == (
+        "example/app",
+        "Foo_Bar",
+        "1.0",
+    )
+    assert record["cve"] == "CVE-2030-1"
+    assert record["aliases"] == ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]
+    assert record["scanners"] == ["osv"]
+    assert record["scan_targets"] == ["source-development"]
+    assert record["locations"] == ["poetry.lock"]
+    assert record["ecosystem"] == ["poetry"]
+    assert record["pkg_type"] == "library"
+    assert record["relationship"] == ["direct"]
+    # GHSA first: its database rating (MODERATE is MEDIUM) wins over the vector
+    assert (record["severity"], record["severity_source"]) == ("MEDIUM", "osv")
+    assert record["cvss"] == {
+        "score": 9.8,
+        "vector": VECTOR_CRITICAL,
+        "version": "3.1",
+        "source": "osv",
+    }
+    assert (record["status"], record["fix_available"]) == ("fixed", True)
+    assert record["fixed_versions"] == ["1.1", "1.2"]
+    # the databases name two fixes: the lower one is the minimal upgrade
+    assert record["upgrade_to"] == "1.1"
+    assert record["title"] == "The GHSA summary"
+    assert record["published"] == "2030-01-03T00:00:00Z"
+    assert record["primary_url"] == "https://example.invalid/ghsa"
+    assert record["cwe"] == ["CWE-20", "CWE-79"]
+    assert record["pkg_paths"] == []
+    assert record["exposure"] == "development_only"
+
+
+def test_osv_only_record_without_optional_fields(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["PYSEC-2030-1"]}, osv_record("PYSEC-2030-1")
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["cve"] == "PYSEC-2030-1"
+    assert record["aliases"] == []
+    assert (record["severity"], record["severity_source"]) == ("UNKNOWN", None)
+    assert record["cvss"] is None
+    assert (record["status"], record["fix_available"]) == ("affected", False)
+    assert record["fixed_versions"] == []
+    assert record["title"] is None
+    assert record["published"] is None
+    assert record["cwe"] is None
+    assert record["primary_url"] == "https://osv.dev/vulnerability/PYSEC-2030-1"
+
+
+def test_osv_only_record_has_the_keys_of_a_trivy_record(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+            [trivy_vuln("CVE-2030-9", "lib", "1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["PYSEC-2030-1"]}, osv_record("PYSEC-2030-1")
+        )
+    }
+    records = merge_scan(tmp_path, trivy, osv, SOURCE).json(
+        "_report/vulnerabilities.json"
+    )["records"]
+    assert len(records) == 2
+    assert len({tuple(r) for r in records}) == 1
+
+
+def severity_of(tmp_path: Path, **fields: Any) -> dict[str, Any]:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", **fields),
+        )
+    }
+    (record,) = merge_scan(tmp_path, trivy, osv, SOURCE).json(
+        "_report/vulnerabilities.json"
+    )["records"]
+    return record
+
+
+def test_osv_only_severity_from_the_ghsa_database_rating(tmp_path: Path) -> None:
+    record = severity_of(
+        tmp_path,
+        database_specific=GHSA_DB,
+        severity=[{"type": "CVSS_V3", "score": VECTOR_CRITICAL}],
+    )
+    assert (record["severity"], record["severity_source"]) == ("HIGH", "osv")
+    # the CVSS block is the vector's, whatever decided the severity
+    assert record["cvss"]["score"] == 9.8
+
+
+def test_osv_only_severity_from_the_cvss3_vector(tmp_path: Path) -> None:
+    record = severity_of(
+        tmp_path,
+        severity=[
+            {"type": "CVSS_V3", "score": VECTOR_HIGH},
+            {"type": "CVSS_V3", "score": VECTOR_CRITICAL},
+        ],
+    )
+    assert (record["severity"], record["severity_source"]) == ("CRITICAL", "osv")
+    assert record["cvss"] == {
+        "score": 9.8,
+        "vector": VECTOR_CRITICAL,
+        "version": "3.1",
+        "source": "osv",
+    }
+
+
+def test_osv_only_cvss4_vector_alone_is_unknown_and_kept_without_a_score(
+    tmp_path: Path,
+) -> None:
+    record = severity_of(
+        tmp_path,
+        severity=[
+            {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"},
+            {"type": "CVSS_V4", "score": VECTOR_V4},
+        ],
+    )
+    assert (record["severity"], record["severity_source"]) == ("UNKNOWN", None)
+    assert record["cvss"] == {
+        "score": None,
+        "vector": VECTOR_V4,
+        "version": "4.0",
+        "source": "osv",
+    }
+
+
+def test_osv_only_cvss3_vector_is_preferred_to_a_cvss4_one(tmp_path: Path) -> None:
+    record = severity_of(
+        tmp_path,
+        severity=[
+            {"type": "CVSS_V4", "score": VECTOR_V4},
+            {"type": "CVSS_V3", "score": VECTOR_HIGH},
+        ],
+    )
+    assert (record["severity"], record["cvss"]["score"]) == ("HIGH", 7.5)
+
+
+def test_osv_only_cvss2_vector_alone_gives_no_severity_and_no_cvss(
+    tmp_path: Path,
+) -> None:
+    record = severity_of(
+        tmp_path, severity=[{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"}]
+    )
+    assert (record["severity"], record["cvss"]) == ("UNKNOWN", None)
+
+
+def test_osv_group_severity_takes_the_database_rating_before_the_vectors() -> None:
+    ghsa = osv_record("GHSA-a", database_specific={"severity": "LOW"})
+    pysec = osv_record(
+        "PYSEC-1", severity=[{"type": "CVSS_V3", "score": VECTOR_CRITICAL}]
+    )
+    assert mr.osv_group_severity([ghsa, pysec]) == "LOW"
+    assert mr.osv_group_severity([pysec]) == "CRITICAL"
+    assert mr.osv_group_severity([]) == "UNKNOWN"
+    other = osv_record("GHSA-b", database_specific={"severity": "HIGH"})
+    assert mr.osv_group_severity([ghsa, other]) == "HIGH"
+
+
+def fix_of(tmp_path: Path, version: str, *affected: dict[str, Any]) -> dict[str, Any]:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", version, f"pkg:npm/lib@{version}")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {f"pkg:npm/lib@{version}": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", affected=list(affected)),
+        )
+    }
+    (record,) = merge_scan(tmp_path, trivy, osv, SOURCE).json(
+        "_report/vulnerabilities.json"
+    )["records"]
+    return record
+
+
+def test_osv_only_fixed_event_is_a_fix(tmp_path: Path) -> None:
+    record = fix_of(
+        tmp_path, "1.0", affected_range("npm", "lib", {"fixed": "1.4"}, kind="SEMVER")
+    )
+    assert (record["status"], record["fix_available"]) == ("fixed", True)
+    assert (record["fixed_versions"], record["upgrade_to"]) == (["1.4"], "1.4")
+
+
+def test_osv_only_last_affected_without_fixed_is_affected(tmp_path: Path) -> None:
+    record = fix_of(
+        tmp_path, "1.0", affected_range("npm", "lib", {"last_affected": "1.9"})
+    )
+    assert (record["status"], record["fix_available"]) == ("affected", False)
+    assert (record["fixed_versions"], record["upgrade_to"]) == ([], None)
+
+
+def test_osv_only_fixes_of_other_packages_and_git_ranges_do_not_count(
+    tmp_path: Path,
+) -> None:
+    record = fix_of(
+        tmp_path,
+        "1.0",
+        affected_range("npm", "other", {"fixed": "9.0"}),
+        affected_range("npm", "lib", {"fixed": "abc123"}, kind="GIT"),
+    )
+    assert (record["status"], record["fix_available"]) == ("affected", False)
+
+
+def test_osv_only_fixes_of_another_branch_are_left_out(tmp_path: Path) -> None:
+    # fixed in 1.5 for 1.x and in 0.9 for the old 0.x branch: 1.5 is the fix of 1.2
+    record = fix_of(
+        tmp_path,
+        "1.2",
+        affected_range("npm", "lib", {"fixed": "0.9"}, {"fixed": "1.5"}),
+    )
+    assert record["fixed_versions"] == ["1.5"]
+    assert record["upgrade_to"] == "1.5"
+
+
+def test_osv_only_fixes_all_below_the_installed_version_mean_no_fix(
+    tmp_path: Path,
+) -> None:
+    record = fix_of(tmp_path, "1.2", affected_range("npm", "lib", {"fixed": "0.9"}))
+    assert (record["status"], record["fix_available"]) == ("affected", False)
+
+
+def test_osv_group_fixes_keeps_incomparable_versions() -> None:
+    record = osv_record(
+        "GHSA-a", affected=[affected_range("npm", "lib", {"fixed": "next"})]
+    )
+    assert mr.osv_group_fixes([record], "pkg:npm/lib@1.0", "1.0") == ["next"]
+    assert mr.osv_group_fixes([record], "pkg:npm/lib@1.0", None) == ["next"]
+
+
+# ---- OSV-only records: package context
+
+
+def image_native(*results: dict[str, Any]) -> dict[str, Any]:
+    return {"Metadata": {"RepoDigests": []}, "Results": list(results)}
+
+
+def test_osv_only_on_an_image_python_package(tmp_path: Path) -> None:
+    image = image_native(
+        lang_result(
+            "python-pkg",
+            "Python",
+            [lang_package("Mako", "1.3.0", "pkg:pypi/mako@1.3.0")],
+        )
+    )
+    osv = {
+        "app-development": osv_part(
+            {"pkg:pypi/mako@1.3.0": ["PYSEC-2030-1"]},
+            osv_record(
+                "PYSEC-2030-1",
+                aliases=["CVE-2030-1"],
+                affected=[affected_range("PyPI", "mako", {"fixed": "1.3.1"})],
+            ),
+        )
+    }
+    ws = merge_scan(tmp_path, {"app-development": image}, osv, DEV)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert (record["cve"], record["pkg"], record["version"]) == (
+        "CVE-2030-1",
+        "Mako",
+        "1.3.0",
+    )
+    assert record["scanners"] == ["osv"]
+    assert record["scan_targets"] == ["app-development"]
+    assert record["ecosystem"] == ["python-pkg"]
+    assert record["locations"] == ["Python"]
+    assert record["exposure"] == "development_only"
+    assert record["relationship"] == []
+    assert record["dependency_paths"] == []
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> **development — image: 1 UNKNOWN**" in md
+    assert "found only by OSV" in md
+    assert "| Mako · python | 1.3.0 → 1.3.1 |" in md
+
+
+def test_osv_only_on_a_poetry_package_has_the_dependency_paths(
+    tmp_path: Path,
+) -> None:
+    packages = [
+        lang_package("web", "1.0", "pkg:pypi/web@1.0", "direct", ("http@2.0",)),
+        lang_package("http", "2.0", "pkg:pypi/http@2.0", "indirect", ("Leaf_Pkg@3.0",)),
+        lang_package("Leaf_Pkg", "3.0", "pkg:pypi/leaf-pkg@3.0", "indirect"),
+    ]
+    trivy = source_with(lang_result("poetry", "poetry.lock", packages))
+    osv = {
+        "source-development": osv_part(
+            {"pkg:pypi/leaf-pkg@3.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record(
+                "GHSA-aaaa-aaaa-aaaa",
+                aliases=["CVE-2030-1"],
+                database_specific={"severity": "HIGH"},
+                affected=[affected_range("PyPI", "leaf-pkg", {"fixed": "3.1"})],
+            ),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["pkg"] == "Leaf_Pkg"
+    assert record["relationship"] == ["indirect"]
+    assert record["introduced_via"] == ["web"]
+    assert record["dependency_paths"] == [["web", "http", "Leaf_Pkg"]]
+    assert record["dependency_paths_total"] == 1
+    assert record["dev"] is False
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "Upgrade in development via web › http › Leaf_Pkg" in md
+    assert "<summary>Dependency paths (1)</summary>" in md
+    assert "  - web › http › Leaf_Pkg" in md
+
+
+def test_osv_only_dev_dependency_is_flagged(tmp_path: Path) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0", "direct", dev=True)],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa"),
+        )
+    }
+    (record,) = merge_scan(tmp_path, trivy, osv, SOURCE).json(
+        "_report/vulnerabilities.json"
+    )["records"]
+    assert record["dev"] is True
+
+
+def test_the_same_vulnerability_in_two_osv_targets_is_one_record(
+    tmp_path: Path,
+) -> None:
+    source = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("mako", "1.3.0", "pkg:pypi/mako@1.3.0")],
+        )
+    )["source-development"]
+    image = image_native(
+        lang_result(
+            "python-pkg",
+            "Python",
+            [lang_package("Mako", "1.3.0", "pkg:pypi/mako@1.3.0")],
+        )
+    )
+    vuln = osv_part(
+        {"pkg:pypi/mako@1.3.0": ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]},
+        osv_record("PYSEC-2030-1", aliases=["CVE-2030-1"]),
+        osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
+    )
+    ws = merge_scan(
+        tmp_path,
+        {"source-development": source, "app-development": image},
+        {"source-development": vuln, "app-development": vuln},
+        SOURCE,
+        DEV,
+    )
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv"]
+    assert record["scan_targets"] == ["source-development", "app-development"]
+    assert record["exposure"] == "development_only"
+    # the image shows the package under its own spelling
+    assert record["pkg"] == "Mako"
+    assert record["ecosystem"] == ["poetry", "python-pkg"]
+
+
+def test_osv_adds_a_target_to_the_record_trivy_found_elsewhere(
+    tmp_path: Path,
+) -> None:
+    source = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("mako", "1.3.0", "pkg:pypi/mako@1.3.0")],
+        )
+    )["source-development"]
+    image = image_native(
+        lang_result(
+            "python-pkg",
+            "Python",
+            [lang_package("Mako", "1.3.0", "pkg:pypi/mako@1.3.0")],
+            [trivy_vuln("CVE-2030-1", "Mako", "1.3.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:pypi/mako@1.3.0": ["PYSEC-2030-1"]},
+            osv_record("PYSEC-2030-1", aliases=["CVE-2030-1"]),
+        )
+    }
+    ws = merge_scan(
+        tmp_path,
+        {"source-development": source, "app-development": image},
+        osv,
+        SOURCE,
+        DEV,
+    )
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv", "trivy"]
+    # Trivy saw it in the image, OSV in the source: the record is in both
+    assert record["scan_targets"] == ["source-development", "app-development"]
+    assert record["locations"] == ["Python", "poetry.lock"]
+    assert record["relationship"] == []
+
+
+def test_a_package_in_two_lockfiles_is_one_osv_record_with_both_locations(
+    tmp_path: Path,
+) -> None:
+    lib = lang_package(
+        "org.example:lib", "1.0", "pkg:maven/org.example/lib@1.0", "direct"
+    )
+    trivy = source_with(
+        lang_result("gradle", "app/gradle.lockfile", [lib]),
+        lang_result("gradle", "core/gradle.lockfile", [lib]),
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:maven/org.example/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record(
+                "GHSA-aaaa-aaaa-aaaa",
+                affected=[affected_range("Maven", "org.example:lib", {"fixed": "1.1"})],
+            ),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["locations"] == ["app/gradle.lockfile", "core/gradle.lockfile"]
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "source app/gradle.lockfile, core/gradle.lockfile" in md
+
+
+def test_merge_records_without_osv_scans_is_the_trivy_merge() -> None:
+    native = {
+        "Results": [
+            lang_result(
+                "npm",
+                "package-lock.json",
+                [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+                [trivy_vuln("CVE-2030-1", "lib", "1.0")],
+            )
+        ]
+    }
+    scans = [("source-development", "trivy", native)]
+    assert mr.merge_records("example/app", scans) == mr.merge_records(
+        "example/app", scans, (), ()
+    )
+
+
+# ---- OSV results that do not fit the Trivy result
+
+
+def test_osv_package_missing_in_the_trivy_result_fails_the_osv_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+            [trivy_vuln("CVE-2030-1", "lib", "1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {
+                "pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"],
+                "pkg:npm/gone@2.0": ["GHSA-b"],
+            },
+            osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
+            osv_record("GHSA-b"),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    entry = ws.osv_targets["source-development"]
+    assert entry["status"] == "failed"
+    assert entry["reason"] == (
+        "osv result does not fit trivy's: 1 package(s) with findings are not in the "
+        "trivy result of this target, first: pkg:npm/gone@2.0"
+    )
+    assert entry["findings"] is None
+    # nothing of the broken result is merged, the native stays for audit
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["trivy"]
+    assert (ws.out / "_native" / "osv" / "source-development.json").is_file()
+    assert "Incomplete: 1 target(s) failed" in (ws.out / "summary.md").read_text(
+        "utf-8"
+    )
+    assert "::error title=Scan target failed::source-development (osv)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_osv_findings_without_a_trivy_result_fail_the_osv_target(
+    tmp_path: Path,
+) -> None:
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa"),
+        )
+    }
+    ws = merge_scan(tmp_path, {}, osv, SOURCE)
+    entry = ws.osv_targets["source-development"]
+    assert entry["status"] == "failed"
+    assert "there is no trivy result of this target" in entry["reason"]
+
+
+def test_osv_packages_are_taken_from_language_results_only(tmp_path: Path) -> None:
+    os_result = {
+        "Target": "alpine",
+        "Class": "os-pkgs",
+        "Type": "alpine",
+        "Packages": [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+    }
+    ws = merge_scan(
+        tmp_path,
+        {"app-development": image_native(os_result)},
+        {
+            "app-development": osv_part(
+                {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
+                osv_record("GHSA-aaaa-aaaa-aaaa"),
+            )
+        },
+        DEV,
+    )
+    assert ws.osv_targets["app-development"]["status"] == "failed"
+
+
+def test_osv_results_without_findings_need_no_trivy_packages(tmp_path: Path) -> None:
+    ws = merge_scan(
+        tmp_path,
+        source_with(),
+        {"source-development": osv_part({"pkg:npm/lib@1.0": []})},
+        SOURCE,
+    )
+    assert ws.osv_targets["source-development"]["status"] == "ok"
+
+
+# ---- OSV-only in summary.md
+
+
+def test_summary_marks_the_osv_only_vulnerability_and_counts_them(
+    with_osv: Workspace,
+) -> None:
+    with_osv.run()
+    md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "[CVE-2030-0002](https://osv.dev/vulnerability/GHSA-aaaa-aaaa-0002) · OSV only"
+        in md
+    )
+    assert (
+        "[CVE-2030-0004](https://osv.dev/vulnerability/PYSEC-2030-1) · OSV only" in md
+    )
+    # a record Trivy has too is not marked
+    assert "[CVE-2000-0001](https://example.invalid/CVE-2000-0001) |" in md
+    assert md.count("OSV only") == 3
+    assert "> 8 findings (5 fixable) · 4/4 targets scanned · 3 found only by OSV" in md
+    # OSV-only findings take part in the sections of the Trivy ones
+    assert "| 3 | @scope/pkg · npm | 1.0.0 → 1.0.1 | 1 HIGH |" in md
+    assert (
+        "| 3 | lodash 4.17.0 · npm | 1 LOW | runtime, indirect | express › lodash |"
+        in md
+    )
+    assert "7.5 (osv)" in md
+
+
+def test_summary_osv_only_pysec_id_is_shown_when_there_is_no_cve(
+    tmp_path: Path,
+) -> None:
+    trivy = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("torch", "2.10.0", "pkg:pypi/torch@2.10.0", "direct")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:pypi/torch@2.10.0": ["PYSEC-2026-139"]},
+            osv_record("PYSEC-2026-139", summary="Torch issue"),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "| [PYSEC-2026-139](https://osv.dev/vulnerability/PYSEC-2026-139) · OSV only |"
+        in md
+    )
+    assert "Torch issue" in md
+    assert "· 1 found only by OSV" in md
+
+
+def test_osv_only_cvss4_vector_is_shown_without_a_score(tmp_path: Path) -> None:
+    record = severity_of(tmp_path, severity=[{"type": "CVSS_V4", "score": VECTOR_V4}])
+    assert mr.cvss_cell(record) == "v4.0 (osv)"
+    assert mr.max_cvss_score([record]) is None
+    higher = {**record, "cvss": {**record["cvss"], "score": 5.0}}
+    assert mr.max_cvss_score([record, higher]) == 5.0
+    assert mr.cvss_cell({**record, "cvss": None}) is None
+
+
+def test_footer_names_the_osv_scope_without_a_query_time_when_none_was_queried(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", "source")
+    ws.run()
+    footer = (
+        (ws.out / "summary.md").read_text(encoding="utf-8").rstrip().splitlines()[-1]
+    )
+    assert footer == "<sub>OSV: language packages only</sub>"
+
+
+def test_merge_with_osv_is_deterministic(tmp_path: Path) -> None:
+    def build(name: str) -> dict[str, bytes]:
+        (tmp_path / name).mkdir()
+        ws = Workspace(tmp_path / name, make_targets_doc(SOURCE, DEV, REL, OSV_SOURCE))
+        ws.add_part("source-development", "source-osv", lockfiles=3)
+        ws.add_part("app-development", "app-development")
+        ws.add_part("app-1.0.0", "app-1.0.0")
+        ws.add_osv_part("source-development", "osv-source")
+        ws.run()
+        return {
+            p.relative_to(ws.out).as_posix(): p.read_bytes()
+            for p in sorted(ws.out.rglob("*"))
+            if p.is_file()
+        }
+
+    assert build("a") == build("b")
+
+
+def test_osv_only_title_falls_back_to_the_first_line_of_details(
+    tmp_path: Path,
+) -> None:
+    long_line = "A very long first line of a PYSEC advisory. " * 4
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.0": ["PYSEC-2030-1"]},
+            osv_record("PYSEC-2030-1", details=f"\n  {long_line}\nsecond line\n"),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    # the record keeps the full line, the summary truncates it
+    assert record["title"] == long_line.strip()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert long_line.strip() not in md
+    assert long_line[: mr.TITLE_MAX_LENGTH - 2] in md
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"summary": "  "}, {"details": " \n "}, {"details": 5}, {"summary": 3}],
+)
+def test_osv_title_is_empty_without_a_summary_or_details(
+    fields: dict[str, Any],
+) -> None:
+    assert mr.osv_title(osv_record("GHSA-a", **fields)) == ""
+
+
+def test_osv_title_prefers_the_summary_to_the_details() -> None:
+    record = osv_record("GHSA-a", summary=" Short ", details="Long\ntext")
+    assert mr.osv_title(record) == "Short"
+
+
+@pytest.mark.parametrize(
+    ("purl", "version"),
+    [
+        ("pkg:npm/lodash@4.17.0", "4.17.0"),
+        ("pkg:npm/%40scope/pkg@1.0.0?x=y#sub", "1.0.0"),
+        ("pkg:maven/org.example/lib@1.0%2Bbuild", "1.0+build"),
+        ("pkg:npm/lodash", None),
+        ("pkg:npm/%40scope/pkg", None),
+    ],
+)
+def test_purl_version(purl: str, version: str | None) -> None:
+    assert mr.purl_version(purl) == version
+
+
+def test_target_count_and_record_agree_on_what_a_fix_is(tmp_path: Path) -> None:
+    # fixed in 0.9 (another branch, below the installed 1.2) and nowhere else
+    record = osv_record(
+        "GHSA-aaaa-aaaa-aaaa",
+        affected=[affected_range("npm", "lib", {"fixed": "0.9"})],
+    )
+    native = osv_part({"pkg:npm/lib@1.2": ["GHSA-aaaa-aaaa-aaaa"]}, record)
+    assert (
+        mr.osv_findings(native)[("pkg:npm/lib@1.2", "GHSA-aaaa-aaaa-aaaa")][1] is False
+    )
+    # the same record at 0.5 has that fix above it
+    native = osv_part({"pkg:npm/lib@0.5": ["GHSA-aaaa-aaaa-aaaa"]}, record)
+    assert (
+        mr.osv_findings(native)[("pkg:npm/lib@0.5", "GHSA-aaaa-aaaa-aaaa")][1] is True
+    )
+
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.2", "pkg:npm/lib@1.2")],
+        )
+    )
+    osv = {
+        "source-development": osv_part(
+            {"pkg:npm/lib@1.2": ["GHSA-aaaa-aaaa-aaaa"]}, record
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE)
+    (rec,) = ws.json("_report/vulnerabilities.json")["records"]
+    entry = ws.osv_targets["source-development"]
+    assert rec["fix_available"] is False
+    assert entry["findings"]["fixable"] == 0
+
+
+# ------------------------------------------------- OSV with the other additions
+# Gradle graph (P1) and release sources (P2) apply to OSV-only records as to Trivy's
+
+
+def test_osv_only_gradle_finding_gets_the_paths_of_the_gradle_graph(
+    tmp_path: Path,
+) -> None:
+    purl = "pkg:maven/org.example/vuln@1.0"
+    ws = gradle_workspace(tmp_path)
+    native_path = ws.trivy_parts / "source-development.json"
+    native = json.loads(native_path.read_text(encoding="utf-8"))
+    for result in native["Results"]:
+        result.pop("Vulnerabilities")  # Trivy knows nothing, OSV does
+        for package in result["Packages"]:
+            package["Identifier"]["PURL"] = purl.replace("vuln", package["Name"][12:])
+    native_path.write_text(json.dumps(native), encoding="utf-8")
+    original = native_path.read_bytes()
+    doc = json.loads(ws.targets_file.read_text(encoding="utf-8"))
+    doc["targets"].append({**doc["targets"][0], "scanner": "osv"})
+    ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
+    write_osv_native(
+        ws,
+        osv_part(
+            {purl: ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record(
+                "GHSA-aaaa-aaaa-aaaa",
+                aliases=["CVE-2030-1"],
+                database_specific={"severity": "HIGH"},
+                affected=[
+                    affected_range("Maven", "org.example:vuln", {"fixed": "1.1"})
+                ],
+            ),
+        ),
+    )
+    assert ws.run() == 0
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv"]
+    # the same relationship and chains as a Trivy finding of the module would get
+    assert record["relationship"] == ["direct", "indirect"]
+    assert record["dependency_paths"] == [
+        ["org.example:vuln"],
+        ["org.example:util", "org.example:vuln"],
+        ["org.example:web", "org.example:core", "org.example:vuln"],
+    ]
+    assert record["introduced_via"] == ["org.example:util", "org.example:web"]
+    # the enrichment is in memory: the native copy stays as Trivy wrote it
+    assert (ws.out / "_native" / "trivy" / "source-development.json").read_bytes() == (
+        original
+    )
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "· OSV only" in md
+
+
+def release_osv_workspace(
+    tmp_path: Path, trivy_ids: tuple[str, ...], osv_ids: tuple[str, ...], *targets
+) -> Workspace:
+    """Targets without findings of their own, a poetry package ``leaf`` in the
+    lockfile of every id of ``trivy_ids`` and an OSV finding of it in every id of
+    ``osv_ids`` (the OSV twins of the same targets).
+    """
+    purl = "pkg:pypi/leaf@1.0"
+    lock = source_with(
+        lang_result(
+            "poetry",
+            "poetry.lock",
+            [lang_package("leaf", "1.0", purl, "direct")],
+        )
+    )["source-development"]
+    trivy = {
+        t["id"]: lock if t["id"] in trivy_ids else {"Results": []} for t in targets
+    }
+    finding = osv_part(
+        {purl: ["GHSA-aaaa-aaaa-aaaa"]},
+        osv_record(
+            "GHSA-aaaa-aaaa-aaaa",
+            aliases=["CVE-2030-1"],
+            database_specific={"severity": "HIGH"},
+            affected=[affected_range("PyPI", "leaf", {"fixed": "1.1"})],
+        ),
+    )
+    osv = {tid: finding for tid in osv_ids}
+    return merge_scan(tmp_path, trivy, osv, *targets)
+
+
+def test_osv_only_finding_in_a_release_source_is_source_only_with_images(
+    tmp_path: Path,
+) -> None:
+    ws = release_osv_workspace(
+        tmp_path,
+        ("source-1.0.0",),
+        ("source-1.0.0",),
+        SOURCE,
+        RELEASE_SOURCE,
+        DEV,
+        REL,
+    )
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv"]
+    assert record["scan_targets"] == ["source-1.0.0"]
+    # P2 rules: the images decide, a release source never makes a release finding
+    assert record["exposure"] == "source_only"
+    assert record["dependency_paths"] == [["leaf"]]
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> **Released 1.0.0 — no known vulnerabilities**" in md
+    assert "OSV only" in md
+    assert "source @ 1.0.0 poetry.lock" in md
+    assert "| Already fixed in development — not in published images |" in md
+    # the OSV twin of the release source is a row of its own in the coverage
+    assert "source @ 1.0.0 0011223" in md
+
+
+@pytest.mark.parametrize(
+    ("osv_ids", "exposure"),
+    [
+        (("source-1.0.0",), "release_only"),
+        (("source-development", "source-1.0.0"), "release_and_development"),
+        (("source-development",), "development_only"),
+    ],
+)
+def test_osv_only_finding_without_images_is_classified_by_the_sources(
+    tmp_path: Path, osv_ids: tuple[str, ...], exposure: str
+) -> None:
+    ws = release_osv_workspace(tmp_path, osv_ids, osv_ids, SOURCE, RELEASE_SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv"]
+    assert record["scan_targets"] == list(reversed(osv_ids)) or record[
+        "scan_targets"
+    ] == list(osv_ids)
+    assert record["exposure"] == exposure
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    if "source-1.0.0" in osv_ids:
+        assert "> **Released 1.0.0 — exposed: 1 HIGH**" in md
+        assert "source @ 1.0.0 poetry.lock" in md
+    else:
+        assert "> **Released 1.0.0 — no known vulnerabilities**" in md
+
+
+def test_osv_and_trivy_findings_of_a_release_source_are_one_record(
+    tmp_path: Path,
+) -> None:
+    purl = "pkg:pypi/leaf@1.0"
+    package = lang_package("leaf", "1.0", purl, "direct")
+    result = lang_result(
+        "poetry",
+        "poetry.lock",
+        [package],
+        [vuln("CVE-2030-1", "1.1", PkgName="leaf", InstalledVersion="1.0")],
+    )
+    trivy = {
+        "source-development": {"Results": []},
+        "source-1.0.0": {"Results": [result]},
+    }
+    osv = {
+        "source-1.0.0": osv_part(
+            {purl: ["GHSA-aaaa-aaaa-aaaa"]},
+            osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
+        )
+    }
+    ws = merge_scan(tmp_path, trivy, osv, SOURCE, RELEASE_SOURCE)
+    (record,) = ws.json("_report/vulnerabilities.json")["records"]
+    assert record["scanners"] == ["osv", "trivy"]
+    assert record["scan_targets"] == ["source-1.0.0"]
+    assert record["exposure"] == "release_only"
+    assert record["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]

@@ -12,7 +12,7 @@
   "vulnerabilities": {
     "GHSA-aaaa-aaaa-0001": {
       "id": "GHSA-aaaa-aaaa-0001",
-      "aliases": ["CVE-2030-0001"],
+      "aliases": ["CVE-2000-0001"],
       "database_specific": {"severity": "CRITICAL"},
       "affected": [
         {
@@ -80,7 +80,7 @@
     },
     "GHSA-dddd-dddd-0001": {
       "id": "GHSA-dddd-dddd-0001",
-      "aliases": ["CVE-2030-0005"],
+      "aliases": ["CVE-2000-0003"],
       "database_specific": {"severity": "MODERATE"},
       "affected": [
         {

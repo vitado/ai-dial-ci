@@ -41,7 +41,7 @@ on:
         default: "mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
       osv-enabled:
         type: boolean
-        description: Also check the language packages found by Trivy against OSV (osv.dev). Its findings are counted in the report but not merged into the findings yet
+        description: Also check the language packages found by Trivy against OSV (osv.dev). Its findings are merged into the report
         default: true
       retention-days:
         type: number
@@ -292,8 +292,8 @@ jobs:
           if-no-files-found: error
 
   # OSV is asked about the language packages Trivy found (OS packages are not queried), so it runs after the Trivy
-  # matrix. A broken query is a failed target like a failed Trivy scan, but its findings are not merged into the
-  # records yet (see sca_merge_results). Nothing to query, and so no job, if no Trivy target was scanned
+  # matrix. A broken query is a failed target like a failed Trivy scan; its findings are merged into the records by
+  # sca_merge_results. Nothing to query, and so no job, if no Trivy target was scanned
   osv:
     needs: [targets, trivy]
     if: ${{ !cancelled() && needs.targets.result == 'success' && inputs.osv-enabled && needs.targets.outputs.matrix != '[]' }}

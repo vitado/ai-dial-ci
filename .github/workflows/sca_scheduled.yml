@@ -204,6 +204,8 @@ jobs:
         with:
           gpr-username: ${{ github.actor }}
           gpr-password: ${{ secrets.GITHUB_TOKEN }}
+          # Lockfiles have no dependency graph: it travels in the part of the target for the merge, outside the workspace
+          graph-dir: ${{ runner.temp }}/sca-out/trivy/${{ matrix.target.id }}.gradle-graph
       # Images in other registries are expected to be public and are pulled anonymously
       - name: Login to GitHub Container Registry
         id: login

@@ -4,8 +4,10 @@
 Inputs:
   * targets.json written by sca_resolve_targets (the list of targets);
   * a parts directory with one subdirectory per scanner (``trivy/``) holding,
-    per scanned target id, ``<id>.json`` (native JSON), ``<id>.status.json``
-    and an optional ``<id>.txt`` (table).
+    per scanned target id, ``<id>.json`` (native JSON), ``<id>.status.json``,
+    an optional ``<id>.txt`` (table) and, for a Gradle build, ``<id>.gradle-graph/``
+    (the resolved dependency graph, one JSON file per Gradle project, written by
+    the generate_gradle_lockfiles action).
 
 Outputs (in the output directory):
   * ``_report/vulnerabilities.json`` - the findings only: canonical deduplicated
@@ -23,6 +25,11 @@ Outputs (in the output directory):
 Trivy is the only scanner today; the report schema names the scanner wherever
 another one could contribute (``scanners``, ``scanner``, ``_native/<scanner>/``).
 
+A Gradle lockfile has no dependency graph, so the packages of a trivy ``gradle``
+Result carry neither ``Relationship`` nor ``DependsOn``. They are filled in from
+the Gradle graph of the project (in memory only, ``_native/`` stays as trivy
+wrote it), before the dependency chains are built.
+
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
 decides about failing the run after the artifact has been uploaded.
@@ -38,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -57,6 +65,11 @@ MERGE_KEY = (
     "(repo, CVE x package x installed-version), merged across scan_targets and scanners"
 )
 TARGET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+GRADLE_RESULT_TYPE = "gradle"
+GRADLE_GRAPH_SUFFIX = ".gradle-graph"  # <id>.gradle-graph/ next to <id>.json
+GRADLE_GRAPH_SCHEMA_VERSION = 1
+ROOT_PROJECT_DIR = "."
 
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
@@ -223,6 +236,153 @@ def load_target_result(
 
     state.update(status=STATUS_OK, reason=None)
     return state, native
+
+
+# --------------------------------------------------------------------------
+# Gradle dependency graph
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ProjectGraph:
+    """The resolved dependencies of one Gradle project, over all its configurations.
+
+    ``direct`` are the modules the project depends on (see lockfiles.init.gradle:
+    other projects of the build are transparent) and ``edges`` maps every module
+    to the modules it depends on; modules are ``group:artifact:version`` as in
+    ``gradle.lockfile``, which is also the trivy package ID.
+    """
+
+    direct: set[str] = field(default_factory=set)
+    edges: dict[str, set[str]] = field(default_factory=dict)
+
+    def knows(self, module: str) -> bool:
+        return module in self.direct or module in self.edges
+
+
+def normalize_project_dir(directory: str) -> str:
+    """A project directory as a relative POSIX path, ``.`` for the build root."""
+    return posixpath.normpath(directory) if directory else ROOT_PROJECT_DIR
+
+
+def lockfile_project_dir(target: str | None) -> str:
+    """The project directory of a trivy Result Target (``server/gradle.lockfile``)."""
+    return normalize_project_dir(posixpath.dirname(target or ""))
+
+
+def _string_list(value: Any, what: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{what} is not a list of strings")
+    return value
+
+
+def parse_project_graph(data: Any) -> tuple[str, ProjectGraph]:
+    """Validate one graph file; returns ``(project directory, graph)``.
+
+    Raises ValueError if the file is not a graph of a supported schema version.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    if data.get("schema_version") != GRADLE_GRAPH_SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema_version {data.get('schema_version')!r}")
+    project_dir = data.get("project_dir")
+    configurations = data.get("configurations")
+    if not isinstance(project_dir, str) or not isinstance(configurations, dict):
+        raise ValueError("no project_dir or configurations")
+    graph = ProjectGraph()
+    for name, configuration in configurations.items():
+        what = f"configuration {name!r}"
+        if not isinstance(configuration, dict) or not isinstance(
+            configuration.get("modules"), dict
+        ):
+            raise ValueError(f"{what} has no modules")
+        graph.direct.update(_string_list(configuration.get("direct"), f"{what} direct"))
+        for module, dependencies in configuration["modules"].items():
+            graph.edges.setdefault(module, set()).update(
+                _string_list(dependencies, f"{what} dependencies of {module}")
+            )
+    return normalize_project_dir(project_dir), graph
+
+
+def load_gradle_graphs(
+    graph_dir: Path,
+) -> tuple[dict[str, ProjectGraph], list[str]]:
+    """Read the graph files of a target: ``(project directory -> graph, problems)``.
+
+    A missing directory is no graph at all. A file that cannot be used is
+    reported in the problems and skipped; files of one project directory are
+    united.
+    """
+    graphs: dict[str, ProjectGraph] = {}
+    problems: list[str] = []
+    if not graph_dir.is_dir():
+        return graphs, problems
+    for path in sorted(graph_dir.glob("*.json")):
+        try:
+            project_dir, graph = parse_project_graph(read_json(path))
+        except (OSError, ValueError) as e:
+            problems.append(f"{path.name}: {e}")
+            continue
+        merged = graphs.setdefault(project_dir, ProjectGraph())
+        merged.direct.update(graph.direct)
+        for module, dependencies in graph.edges.items():
+            merged.edges.setdefault(module, set()).update(dependencies)
+    return graphs, problems
+
+
+def enrich_gradle_results(
+    native: Mapping[str, Any], graphs: Mapping[str, ProjectGraph]
+) -> list[str]:
+    """Fill ``Relationship`` and ``DependsOn`` of the packages of every gradle
+    Result from the graph of its project, in place.
+
+    ``DependsOn`` holds the IDs of the packages of the same Result: edges to
+    modules that are not in the lockfile are dropped. A package the graph does
+    not know is left as it is. Returns the Targets of the Results whose project
+    has no graph.
+    """
+    without_graph: list[str] = []
+    for result in native.get("Results") or []:
+        if result.get("Type") != GRADLE_RESULT_TYPE:
+            continue
+        graph = graphs.get(lockfile_project_dir(result.get("Target")))
+        if graph is None:
+            without_graph.append(result.get("Target") or "")
+            continue
+        packages = result.get("Packages") or []
+        ids = {p["ID"] for p in packages if p.get("ID")}
+        for package in packages:
+            module = package.get("ID")
+            if not module or not graph.knows(module):
+                continue
+            package["Relationship"] = "direct" if module in graph.direct else "indirect"
+            package["DependsOn"] = sorted(
+                (graph.edges.get(module, set()) & ids) - {module}
+            )
+    return without_graph
+
+
+def apply_gradle_graph(
+    target_id: str, native: Mapping[str, Any], graph_dir: Path
+) -> None:
+    """Enrich the gradle Results of an fs scan with the graph of ``graph_dir``;
+    without a graph (an older part, a project the build did not resolve) the
+    Results stay as trivy reported them, which is a warning.
+    """
+    if not any(
+        r.get("Type") == GRADLE_RESULT_TYPE for r in native.get("Results") or []
+    ):
+        return
+    graphs, problems = load_gradle_graphs(graph_dir)
+    for problem in problems:
+        print(
+            f"::warning title=Gradle dependency graph ignored::{target_id}: {problem}"
+        )
+    for lockfile in enrich_gradle_results(native, graphs):
+        print(
+            f"::warning title=No Gradle dependency graph::{target_id}: {lockfile} "
+            "has no dependency graph, so its findings have no dependency paths"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1787,6 +1947,12 @@ def run_merge(
     results = []
     for target in targets_doc["targets"]:
         state, native = load_target_result(target, scanner_parts_dir)
+        if native is not None and target.get("kind") == KIND_FS:
+            apply_gradle_graph(
+                target["id"],
+                native,
+                scanner_parts_dir / f"{target['id']}{GRADLE_GRAPH_SUFFIX}",
+            )
         results.append((target, state, native))
         copy_native(scanner_parts_dir, target["id"], native_dir)
 

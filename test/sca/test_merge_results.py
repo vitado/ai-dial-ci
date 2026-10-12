@@ -1915,3 +1915,249 @@ def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
     )
     assert "No fix available — watch (1)" in md  # collapsed: only a MEDIUM
     assert "| 1 | urllib3 2.7.0 · python | 1 MEDIUM |" in md
+
+
+# ---------------------------------------------------------------- gradle graph
+
+
+def gradle_pkg(name: str, version: str = "1.0") -> dict[str, Any]:
+    """A package of a gradle lockfile: no Relationship, no DependsOn."""
+    return {
+        "ID": f"{name}:{version}",
+        "Name": name,
+        "Version": version,
+        "Identifier": {"UID": f"uid-{name}-{version}"},
+        "AnalyzedBy": "gradle-lockfile",
+    }
+
+
+def gradle_result(target: str, *names: str, vulns: tuple[str, ...] = ()) -> dict:
+    """A gradle Result of the given lockfile with a finding in the package
+    ``org.example:vuln`` (a different CVE per lockfile) when ``vulns`` are given.
+    """
+    return {
+        "Target": target,
+        "Class": "lang-pkgs",
+        "Type": "gradle",
+        "Packages": [gradle_pkg(name) for name in names],
+        "Vulnerabilities": [
+            vuln(
+                cve,
+                None,
+                PkgName="org.example:vuln",
+                InstalledVersion="1.0",
+                PkgID="org.example:vuln:1.0",
+            )
+            for cve in vulns
+        ],
+    }
+
+
+def graph_file(
+    project: str, project_dir: str, modules: dict[str, list[str]], direct: list[str]
+) -> dict[str, Any]:
+    """A graph file of schema 1 with one configuration."""
+    return {
+        "schema_version": 1,
+        "project": project,
+        "project_dir": project_dir,
+        "configurations": {
+            "runtimeClasspath": {
+                "direct": direct,
+                "modules": {k: modules[k] for k in sorted(modules)},
+            }
+        },
+    }
+
+
+def write_graph(ws: Workspace, tid: str, *files: dict[str, Any]) -> Path:
+    graph_dir = ws.trivy_parts / f"{tid}{mr.GRADLE_GRAPH_SUFFIX}"
+    graph_dir.mkdir()
+    for index, body in enumerate(files):
+        (graph_dir / f"graph-{index}.json").write_text(
+            json.dumps(body), encoding="utf-8"
+        )
+    return graph_dir
+
+
+def gradle_workspace(tmp_path: Path, with_graph: bool = True) -> Workspace:
+    """A source target with three lockfiles: ``app`` and ``lib`` (graphs given by
+    ``with_graph``) and ``other`` (never has a graph).
+
+    In ``app`` the vulnerable module comes in through ``web > core`` and through
+    ``util``; in ``lib`` it is a direct dependency.
+    """
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE))
+    ws.add_part("source-development", None, lockfiles=3)
+    native = {
+        "Results": [
+            gradle_result(
+                "app/gradle.lockfile",
+                "org.example:web",
+                "org.example:core",
+                "org.example:util",
+                "org.example:vuln",
+                vulns=("CVE-1",),
+            ),
+            gradle_result("lib/gradle.lockfile", "org.example:vuln", vulns=("CVE-1",)),
+            gradle_result(
+                "other/gradle.lockfile", "org.example:vuln", vulns=("CVE-2",)
+            ),
+        ]
+    }
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps(native), encoding="utf-8"
+    )
+    if with_graph:
+        # app depends on lib (a project, transparent): the modules of lib are
+        # direct dependencies of app as well
+        write_graph(
+            ws,
+            "source-development",
+            graph_file(
+                ":app",
+                "app",
+                {
+                    "org.example:web:1.0": ["org.example:core:1.0"],
+                    "org.example:core:1.0": [
+                        "org.example:vuln:1.0",
+                        "org.example:phantom:1.0",  # not in the lockfile
+                    ],
+                    "org.example:util:1.0": ["org.example:vuln:1.0"],
+                    "org.example:vuln:1.0": [],
+                },
+                ["org.example:web:1.0", "org.example:util:1.0"],
+            ),
+            graph_file(
+                ":lib",
+                "lib",
+                {"org.example:vuln:1.0": []},
+                ["org.example:vuln:1.0"],
+            ),
+        )
+    return ws
+
+
+def test_gradle_graph_gives_relationship_and_chains(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = gradle_workspace(tmp_path)
+    ws.run()
+    rec = records_by_cve(ws)["CVE-1"]
+    # direct in lib, indirect in app: both, as for any lockfile pair
+    assert rec["relationship"] == ["direct", "indirect"]
+    # shortest first, through the direct dependency of lib and both routes of app
+    assert rec["dependency_paths"] == [
+        ["org.example:vuln"],
+        ["org.example:util", "org.example:vuln"],
+        ["org.example:web", "org.example:core", "org.example:vuln"],
+    ]
+    assert rec["dependency_paths_total"] == 3
+    # a direct dependency introduces itself (lib), so only app names its roots
+    assert rec["introduced_via"] == ["org.example:util", "org.example:web"]
+    # the lockfile without a graph is as before: unknown relationship, no chains
+    other = records_by_cve(ws)["CVE-2"]
+    assert other["relationship"] == []
+    assert other["dependency_paths"] == []
+    out = capsys.readouterr().out
+    assert out.count("::warning title=No Gradle dependency graph::") == 1
+    assert "source-development: other/gradle.lockfile" in out
+
+
+def test_gradle_graph_keeps_the_native_copy_unchanged(tmp_path: Path) -> None:
+    ws = gradle_workspace(tmp_path)
+    original = (ws.trivy_parts / "source-development.json").read_bytes()
+    ws.run()
+    assert (ws.out / "_native" / "trivy" / "source-development.json").read_bytes() == (
+        original
+    )
+    assert not (
+        ws.out / "_native" / "trivy" / "source-development.gradle-graph"
+    ).exists()
+
+
+def test_gradle_without_graph_warns_per_lockfile_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = gradle_workspace(tmp_path, with_graph=False)
+    assert ws.run() == 0
+    recs = records_by_cve(ws)
+    assert recs["CVE-1"]["relationship"] == []
+    assert recs["CVE-1"]["dependency_paths"] == []
+    assert recs["CVE-1"]["introduced_via"] == []
+    out = capsys.readouterr().out
+    assert out.count("::warning title=No Gradle dependency graph::") == 3
+    for lockfile in ("app", "lib", "other"):
+        assert f"source-development: {lockfile}/gradle.lockfile" in out
+
+
+def test_gradle_graph_file_that_cannot_be_used_is_skipped_with_a_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = gradle_workspace(tmp_path)
+    graph_dir = ws.trivy_parts / "source-development.gradle-graph"
+    (graph_dir / "graph-2.json").write_text("{not json", encoding="utf-8")
+    (graph_dir / "graph-3.json").write_text(
+        json.dumps({"schema_version": 2}), encoding="utf-8"
+    )
+    assert ws.run() == 0  # the graph is an enrichment: the target stays ok
+    assert records_by_cve(ws)["CVE-1"]["relationship"] == ["direct", "indirect"]
+    out = capsys.readouterr().out
+    assert out.count("::warning title=Gradle dependency graph ignored::") == 2
+    assert "graph-2.json" in out
+    assert "unsupported schema_version 2" in out
+
+
+def test_gradle_graph_is_not_applied_to_images_or_other_ecosystems(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(DEV))
+    ws.add_part("app-development", None)
+    native = native_with(vuln("CVE-1", None))
+    native["Results"].append(gradle_result("app.jar", "org.example:vuln"))
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps(native), encoding="utf-8"
+    )
+    ws.run()
+    assert "No Gradle dependency graph" not in capsys.readouterr().out
+
+
+def test_enrich_gradle_results_marks_direct_and_drops_foreign_edges() -> None:
+    native = {
+        "Results": [
+            gradle_result("gradle.lockfile", "g:a", "g:b"),
+            {"Target": "package-lock.json", "Type": "npm", "Packages": [pkg("x")]},
+        ]
+    }
+    graphs, problems = mr.load_gradle_graphs(Path("does-not-exist"))
+    assert (graphs, problems) == ({}, [])
+    graph = mr.ProjectGraph(
+        direct={"g:a:1.0"},
+        edges={"g:a:1.0": {"g:b:1.0", "g:gone:1.0"}, "g:b:1.0": {"g:a:1.0"}},
+    )
+    assert mr.enrich_gradle_results(native, {".": graph}) == []
+    by_name = {p["Name"]: p for p in native["Results"][0]["Packages"]}
+    assert by_name["g:a"]["Relationship"] == "direct"
+    assert by_name["g:a"]["DependsOn"] == ["g:b:1.0"]
+    assert by_name["g:b"]["Relationship"] == "indirect"
+    assert by_name["g:b"]["DependsOn"] == ["g:a:1.0"]
+    # not a gradle Result: untouched
+    assert "Relationship" in native["Results"][1]["Packages"][0]
+    assert native["Results"][1]["Packages"][0]["DependsOn"] == []
+
+
+def test_enrich_gradle_results_leaves_packages_unknown_to_the_graph() -> None:
+    native = {"Results": [gradle_result("server/gradle.lockfile", "g:a", "g:b")]}
+    graph = mr.ProjectGraph(direct={"g:a:1.0"}, edges={"g:a:1.0": set()})
+    assert mr.enrich_gradle_results(native, {"server": graph}) == []
+    unknown = native["Results"][0]["Packages"][1]
+    assert "Relationship" not in unknown and "DependsOn" not in unknown
+
+
+def test_lockfile_project_dir_and_graph_project_dir_are_comparable() -> None:
+    assert mr.lockfile_project_dir("gradle.lockfile") == "."
+    assert mr.lockfile_project_dir("nested/util/gradle.lockfile") == "nested/util"
+    assert mr.normalize_project_dir("") == "."
+    assert mr.normalize_project_dir("./app") == "app"
+    data = graph_file(":", ".", {"g:a:1.0": []}, ["g:a:1.0"])
+    assert mr.parse_project_graph(data)[0] == "."

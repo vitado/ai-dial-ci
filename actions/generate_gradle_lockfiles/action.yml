@@ -1,5 +1,5 @@
 name: Generate Gradle lockfiles
-description: Resolve all dependencies of a Gradle build and write them to gradle.lockfile files (build files are not modified), so that dependency scanners such as Trivy can scan them. Requires Java and Gradle to be set up beforehand (see java_prepare)
+description: Resolve all dependencies of a Gradle build and write them to gradle.lockfile files, together with the resolved dependency graph of every project as JSON files (build files are not modified), so that dependency scanners such as Trivy can scan them and trace findings to the dependencies that brought them in. Requires Java and Gradle to be set up beforehand (see java_prepare)
 inputs:
   working-directory:
     description: Directory of the Gradle build (where gradlew is located)
@@ -10,10 +10,16 @@ inputs:
   gpr-password:
     description: GitHub Package Registry password/token (for pulling packages the build depends on)
     default: ""
+  graph-dir:
+    description: Directory to write the dependency graph files (graph-<project path>.json, one per Gradle project) to. Must be empty or missing and, to stay out of scanners' way, outside the scanned directory. Defaults to gradle-graph under runner.temp
+    default: ""
 outputs:
   lockfiles:
     description: Number of generated gradle.lockfile files
     value: ${{ steps.generate.outputs.lockfiles }}
+  graph-dir:
+    description: Directory with the dependency graph files (one JSON file per Gradle project, see lockfiles.init.gradle for the format)
+    value: ${{ steps.generate.outputs.graph-dir }}
 
 runs:
   using: "composite"
@@ -25,8 +31,15 @@ runs:
       env:
         GPR_USERNAME: ${{ inputs.gpr-username }}
         GPR_PASSWORD: ${{ inputs.gpr-password }}
+        GRAPH_DIR: ${{ inputs.graph-dir || format('{0}/gradle-graph', runner.temp) }}
       run: |
-        ./gradlew --no-daemon --init-script "$GITHUB_ACTION_PATH/lockfiles.init.gradle" resolveAndLockAllConfigurations --write-locks \
+        # The graph files of an earlier run would be mixed up with the new ones
+        if [ -d "$GRAPH_DIR" ] && [ -n "$(ls -A "$GRAPH_DIR")" ]; then
+          echo "::error::Graph directory $GRAPH_DIR is not empty"
+          exit 1
+        fi
+        mkdir -p "$GRAPH_DIR"
+        ./gradlew --no-daemon --init-script "$GITHUB_ACTION_PATH/lockfiles.init.gradle" -Pai.dial.sca.graphDir="$GRAPH_DIR" resolveAndLockAllConfigurations --write-locks \
           || { echo "::error::Gradle failed to resolve dependencies"; exit 1; }
         count=$(find . -name gradle.lockfile -type f | wc -l)
         echo "Generated lockfiles: $count"
@@ -34,4 +47,13 @@ runs:
           echo "::error::No gradle.lockfile files were generated"
           exit 1
         fi
-        echo "lockfiles=$count" >> "$GITHUB_OUTPUT"
+        graphs=$(find "$GRAPH_DIR" -name '*.json' -type f | wc -l)
+        echo "Generated dependency graphs: $graphs"
+        if [ "$graphs" -eq 0 ]; then
+          echo "::error::No dependency graph files were generated"
+          exit 1
+        fi
+        {
+          echo "lockfiles=$count"
+          echo "graph-dir=$GRAPH_DIR"
+        } >> "$GITHUB_OUTPUT"

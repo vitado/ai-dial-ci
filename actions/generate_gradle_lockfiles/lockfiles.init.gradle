@@ -1,5 +1,53 @@
-// Generates gradle.lockfile files (for dependency scanners such as Trivy) without touching the repository's build files.
-// Usage: ./gradlew --init-script lockfiles.init.gradle resolveAndLockAllConfigurations --write-locks
+// Generates what dependency scanners such as Trivy need to know about a Gradle build, without touching the repository's
+// build files:
+//   * gradle.lockfile files, written by Gradle itself (modules only, the format has no dependency graph);
+//   * with -Pai.dial.sca.graphDir=<dir>, the resolved dependency graph, one JSON file per project in <dir>, so that a
+//     scanner's findings can be traced to the dependency that brought them in.
+// Usage: ./gradlew --init-script lockfiles.init.gradle -Pai.dial.sca.graphDir=<dir> resolveAndLockAllConfigurations --write-locks
+//
+// Graph file graph-<URL-encoded project path>.json, one per project:
+//   {
+//     "schema_version": 1,
+//     "project": ":server",                  // Gradle project path
+//     "project_dir": "server",               // project directory relative to the build root, "/" separated, "." for the root
+//     "configurations": {                    // every resolved configuration that has modules
+//       "runtimeClasspath": {
+//         "direct": ["group:artifact:1.0"],  // modules the project depends on, see below
+//         "modules": {"group:artifact:1.0": ["other:lib:2.0"]}  // every module and the modules it depends on
+//       }
+//     }
+//   }
+// A module is group:artifact:version of the SELECTED component, as recorded in gradle.lockfile. Constraints are not
+// dependencies and are left out, so are unresolved dependencies (they fail the build anyway). Project components (other
+// projects of the build) are transparent: they never appear themselves, and the modules they depend on count as
+// dependencies of whoever depends on the project. So a module is "direct" if the project, or a project it depends on
+// (transitively), declares it.
+//
+// Works with Gradle 7.x and newer (providers.gradleProperty, ResolutionResult#getAllComponents, DependencyResult#isConstraint).
+
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedComponentResult
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+
+// The modules a component depends on, looking through project components (visitedProjects guards against cycles)
+static Set<String> dependentModules(ResolvedComponentResult component, Set<ResolvedComponentResult> visitedProjects) {
+    Set<String> modules = new TreeSet<>()
+    component.dependencies.each { dependency ->
+        if (!(dependency instanceof ResolvedDependencyResult) || dependency.constraint) {
+            return
+        }
+        def selected = dependency.selected
+        def id = selected.id
+        if (id instanceof ModuleComponentIdentifier) {
+            modules.add("${id.group}:${id.module}:${id.version}".toString())
+        } else if (id instanceof ProjectComponentIdentifier && visitedProjects.add(selected)) {
+            modules.addAll(dependentModules(selected, visitedProjects))
+        }
+    }
+    return modules
+}
 
 allprojects {
     // Lock every configuration, so that all of them end up in the lockfile when resolved
@@ -8,7 +56,7 @@ allprojects {
     }
 
     tasks.register('resolveAndLockAllConfigurations') {
-        description = 'Resolves all resolvable configurations so that their dependencies are written to gradle.lockfile'
+        description = 'Resolves all resolvable configurations so that their dependencies are written to gradle.lockfile, and the graph to ai.dial.sca.graphDir if set'
         notCompatibleWithConfigurationCache('resolves configurations at execution time')
 
         doFirst {
@@ -17,7 +65,41 @@ allprojects {
             }
         }
         doLast {
-            configurations.matching { it.canBeResolved }.each { it.resolve() }
+            def graphDir = project.providers.gradleProperty('ai.dial.sca.graphDir').orNull
+            def graphs = new TreeMap<String, Object>()
+            configurations.matching { it.canBeResolved }.each { configuration ->
+                configuration.resolve()
+                if (!graphDir) {
+                    return
+                }
+                def resolution = configuration.incoming.resolutionResult
+                def modules = new TreeMap<String, Object>()
+                resolution.allComponents.each { component ->
+                    def id = component.id
+                    if (id instanceof ModuleComponentIdentifier) {
+                        modules.put("${id.group}:${id.module}:${id.version}".toString(),
+                                dependentModules(component, [component] as Set).toList())
+                    }
+                }
+                if (!modules.isEmpty()) {
+                    graphs.put(configuration.name, [
+                            direct : dependentModules(resolution.root, [resolution.root] as Set).toList(),
+                            modules: modules,
+                    ])
+                }
+            }
+            if (graphDir) {
+                def relativeDir = project.rootProject.projectDir.toPath().relativize(project.projectDir.toPath()).toString().replace(File.separator, '/')
+                def file = new File(project.rootProject.file(graphDir), "graph-${URLEncoder.encode(project.path, 'UTF-8')}.json")
+                file.parentFile.mkdirs()
+                file.setText(JsonOutput.toJson([
+                        schema_version: 1,
+                        project       : project.path,
+                        project_dir   : relativeDir.isEmpty() ? '.' : relativeDir,
+                        configurations: graphs,
+                ]), 'UTF-8')
+                logger.lifecycle("Dependency graph of ${project.path}: ${graphs.size()} configuration(s) written to ${file}")
+            }
         }
     }
 }

@@ -1276,10 +1276,12 @@ Each finding of `vulnerabilities.json` is deduplicated by CVE, package and insta
 > [!note]
 > `schedule` and `workflow_dispatch` triggers are registered from the default branch only, so the calling workflow must be there. GitHub disables scheduled workflows in public repositories after 60 days without repository activity.
 
-`scheduled.yml`
+Call it from a dedicated workflow file named `sca-scan.yml`, not from a shared scheduled workflow: the schedule, run status, summary and run history belong to a workflow file, and consumers of the `sca-report` artifact look up the latest run of `sca-scan.yml` in each repository.
+
+`sca-scan.yml`
 
 ```yml
-name: Scheduled Workflow
+name: SCA Scan
 
 on:
   schedule:
@@ -1287,7 +1289,7 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: sca-scheduled
+  group: sca-scan
   cancel-in-progress: false
 
 permissions:

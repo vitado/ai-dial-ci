@@ -1,0 +1,38 @@
+name: Build the CVE index of the SCA early warning
+description: Build the index of the CVE records of the last days and of the reputation of their CNAs from the cvelistV5 releases and the OSV exports, on top of the previous index if there is one. Writes the files; publishing them is up to the caller
+
+inputs:
+  output-dir:
+    description: Directory to write the index into (cves.jsonl.gz, reputation.json, evidence.jsonl.gz, metadata.json)
+    required: true
+  previous-dir:
+    description: Directory with the previous index. Empty means none, and the build starts from the whole CVE list
+    default: ""
+  window-days:
+    description: Index the CVE records published or updated in this many days
+    default: "180"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    - name: Build the index
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        PREVIOUS_DIR: ${{ inputs.previous-dir }}
+        WINDOW_DAYS: ${{ inputs.window-days }}
+        WORK_DIR: ${{ runner.temp }}/sca-cve-index-work
+      run: |
+        args=(--output-dir "$OUTPUT_DIR" --work-dir "$WORK_DIR" --window-days "$WINDOW_DAYS")
+        if [[ -n "$PREVIOUS_DIR" ]]; then
+          args+=(--previous-dir "$PREVIOUS_DIR")
+        fi
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          args+=(--summary-file "$GITHUB_STEP_SUMMARY")
+        fi
+        python "$ACTION_PATH/build_cve_index.py" "${args[@]}"

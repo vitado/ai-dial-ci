@@ -26,13 +26,23 @@ def _load_merge_results():
 
 mr = _load_merge_results()
 
-SOURCE = {"id": "source", "kind": "fs", "image": None, "tag": None, "ref": None}
+SOURCE = {
+    "id": "source-development",
+    "kind": "fs",
+    "image": None,
+    "tag": None,
+    "ref": None,
+    "git_ref": "development",
+    "commit_sha": "fedcba9876543210fedcba9876543210fedcba98",
+}
 DEV = {
     "id": "app-development",
     "kind": "image",
     "image": "example/app",
     "tag": "development",
     "ref": "ghcr.io/example/app:development",
+    "git_ref": None,
+    "commit_sha": None,
 }
 REL = {
     "id": "app-1.0.0",
@@ -40,6 +50,8 @@ REL = {
     "image": "example/app",
     "tag": "1.0.0",
     "ref": "ghcr.io/example/app:1.0.0",
+    "git_ref": None,
+    "commit_sha": None,
 }
 
 
@@ -95,7 +107,7 @@ class Workspace:
 def full(tmp_path: Path) -> Workspace:
     """fs + two images, all ok."""
     ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV, REL))
-    ws.add_part("source", "source", lockfiles=3)
+    ws.add_part("source-development", "source", lockfiles=3)
     ws.add_part("app-development", "app-development")
     ws.add_part("app-1.0.0", "app-1.0.0")
     return ws
@@ -110,12 +122,12 @@ def records_by_cve(ws: Workspace) -> dict[str, dict[str, Any]]:
 
 def test_dedup_across_lockfiles_within_one_target(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", "source", lockfiles=3)
+    ws.add_part("source-development", "source", lockfiles=3)
     ws.run()
     rec = records_by_cve(ws)["CVE-2000-0003"]
     assert rec["locations"] == ["app/gradle.lockfile", "core/gradle.lockfile"]
-    assert rec["scan_targets"] == ["source"]
-    entry = ws.targets["source"]
+    assert rec["scan_targets"] == ["source-development"]
+    entry = ws.targets["source-development"]
     # 4 raw rows (the gradle finding appears in two lockfiles), 3 unique
     assert (entry["findings_raw"], entry["findings_unique"]) == (4, 3)
     assert entry["vulnerable_package_versions"] == 3
@@ -133,10 +145,13 @@ def test_fixed_version_backfilled_from_other_copy(full: Workspace) -> None:
 def test_merge_across_fs_and_images_keeps_targets_file_order(full: Workspace) -> None:
     full.run()
     recs = records_by_cve(full)
-    assert recs["CVE-2000-0001"]["scan_targets"] == ["source", "app-development"]
+    assert recs["CVE-2000-0001"]["scan_targets"] == [
+        "source-development",
+        "app-development",
+    ]
     assert recs["CVE-2000-0001"]["locations"] == ["Node.js", "package-lock.json"]
     assert recs["CVE-2000-0010"]["scan_targets"] == ["app-development", "app-1.0.0"]
-    assert recs["CVE-2000-0002"]["scan_targets"] == ["source"]
+    assert recs["CVE-2000-0002"]["scan_targets"] == ["source-development"]
 
 
 def test_record_fields_and_ordering(full: Workspace) -> None:
@@ -201,7 +216,7 @@ def test_counts_and_per_target(full: Workspace) -> None:
     }
     assert list(counts["by_severity"]) == ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     assert vulns["per_target"] == {
-        "source": {"records": 3, "only_in_target": 2},
+        "source-development": {"records": 3, "only_in_target": 2},
         "app-development": {"records": 2, "only_in_target": 0},
         "app-1.0.0": {"records": 2, "only_in_target": 1},
     }
@@ -210,7 +225,7 @@ def test_counts_and_per_target(full: Workspace) -> None:
 def test_image_digest_and_trivy_version(full: Workspace) -> None:
     full.run()
     targets = full.targets
-    assert targets["source"]["image_digest"] is None
+    assert targets["source-development"]["image_digest"] is None
     assert (
         targets["app-development"]["image_digest"]
         == "ghcr.io/example/app@sha256:" + "a" * 64
@@ -244,7 +259,7 @@ def test_targets_file_failed_and_not_applicable_are_carried_through(
     targets_doc["targets"][1].update(status="not_applicable", reason="tag not found")
     targets_doc["targets"][2].update(status="failed", reason="registry unreachable")
     ws = Workspace(tmp_path, targets_doc)
-    ws.add_part("source", "source")
+    ws.add_part("source-development", "source")
     # stray parts of non-pending targets must not resurrect them
     ws.add_part("app-1.0.0", "app-1.0.0")
     assert ws.run() == 1
@@ -261,13 +276,15 @@ def test_targets_file_failed_and_not_applicable_are_carried_through(
         "registry unreachable",
     )
     assert targets["app-1.0.0"]["findings_unique"] is None
-    assert set(ws.json("_report/vulnerabilities.json")["per_target"]) == {"source"}
+    assert set(ws.json("_report/vulnerabilities.json")["per_target"]) == {
+        "source-development"
+    }
 
 
 def test_pending_without_status_file_is_failed(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
     assert ws.run() == 1
-    entry = ws.targets["source"]
+    entry = ws.targets["source-development"]
     assert entry["status"] == "failed"
     assert entry["reason"] == "scan job produced no result"
     assert entry["vulnerable_package_versions"] is None
@@ -275,41 +292,49 @@ def test_pending_without_status_file_is_failed(tmp_path: Path) -> None:
 
 def test_status_failed_uses_its_reason(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", None, status="failed", reason="gradle exploded", lockfiles=0)
+    ws.add_part(
+        "source-development",
+        None,
+        status="failed",
+        reason="gradle exploded",
+        lockfiles=0,
+    )
     assert ws.run() == 1
-    assert ws.targets["source"]["status"] == "failed"
-    assert ws.targets["source"]["reason"] == "gradle exploded"
+    assert ws.targets["source-development"]["status"] == "failed"
+    assert ws.targets["source-development"]["reason"] == "gradle exploded"
 
 
 def test_status_ok_with_missing_json_is_failed(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", None)
+    ws.add_part("source-development", None)
     assert ws.run() == 1
-    assert ws.targets["source"]["status"] == "failed"
-    assert "missing" in ws.targets["source"]["reason"]
+    assert ws.targets["source-development"]["status"] == "failed"
+    assert "missing" in ws.targets["source-development"]["reason"]
 
 
 @pytest.mark.parametrize("content", ["", "{not json", "[1, 2]"])
 def test_status_ok_with_invalid_json_is_failed(tmp_path: Path, content: str) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", None)
-    (ws.trivy_parts / "source.json").write_text(content, encoding="utf-8")
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(content, encoding="utf-8")
     assert ws.run() == 1
-    assert ws.targets["source"]["status"] == "failed"
-    assert "trivy result" in ws.targets["source"]["reason"]
+    assert ws.targets["source-development"]["status"] == "failed"
+    assert "trivy result" in ws.targets["source-development"]["reason"]
 
 
 def test_unreadable_status_file_is_failed(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    (ws.trivy_parts / "source.status.json").write_text("oops", encoding="utf-8")
+    (ws.trivy_parts / "source-development.status.json").write_text(
+        "oops", encoding="utf-8"
+    )
     assert ws.run() == 1
-    assert "unreadable status file" in ws.targets["source"]["reason"]
+    assert "unreadable status file" in ws.targets["source-development"]["reason"]
 
 
 def test_failed_target_does_not_hide_the_others(full: Workspace) -> None:
     (full.trivy_parts / "app-1.0.0.json").write_text("{broken", encoding="utf-8")
     assert full.run() == 1
-    assert full.targets["source"]["status"] == "ok"
+    assert full.targets["source-development"]["status"] == "ok"
     assert full.targets["app-1.0.0"]["status"] == "failed"
     assert "CVE-2000-0011" not in records_by_cve(full)
     assert "failed" in (full.out / "summary.md").read_text(encoding="utf-8")
@@ -317,10 +342,12 @@ def test_failed_target_does_not_hide_the_others(full: Workspace) -> None:
 
 def test_clean_target_is_ok_with_zero_findings(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", None)
-    (ws.trivy_parts / "source.json").write_text('{"Results": null}', encoding="utf-8")
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        '{"Results": null}', encoding="utf-8"
+    )
     assert ws.run() == 0
-    entry = ws.targets["source"]
+    entry = ws.targets["source-development"]
     assert (entry["status"], entry["findings_unique"], entry["findings_raw"]) == (
         "ok",
         0,
@@ -332,17 +359,17 @@ def test_clean_target_is_ok_with_zero_findings(tmp_path: Path) -> None:
 
 
 def test_native_files_are_copied(full: Workspace) -> None:
-    (full.trivy_parts / "source.txt").write_text("table", encoding="utf-8")
+    (full.trivy_parts / "source-development.txt").write_text("table", encoding="utf-8")
     full.run()
     native = full.out / "_native" / "trivy"
     assert [p.name for p in (full.out / "_native").iterdir()] == ["trivy"]
     assert sorted(p.name for p in native.iterdir()) == [
         "app-1.0.0.json",
         "app-development.json",
-        "source.json",
-        "source.txt",
+        "source-development.json",
+        "source-development.txt",
     ]
-    assert (native / "source.json").read_bytes() == (
+    assert (native / "source-development.json").read_bytes() == (
         FIXTURES / "source.json"
     ).read_bytes()
 
@@ -350,7 +377,7 @@ def test_native_files_are_copied(full: Workspace) -> None:
 def test_output_is_deterministic(tmp_path: Path) -> None:
     def build(name: str) -> dict[str, bytes]:
         ws = Workspace(tmp_path / name, make_targets_doc(SOURCE, DEV, REL))
-        ws.add_part("source", "source", lockfiles=3)
+        ws.add_part("source-development", "source", lockfiles=3)
         ws.add_part("app-development", "app-development")
         ws.add_part("app-1.0.0", "app-1.0.0")
         ws.run()
@@ -372,12 +399,18 @@ def test_summary_csv_has_one_row_per_target(tmp_path: Path) -> None:
     targets_doc = make_targets_doc(SOURCE, DEV, REL)
     targets_doc["targets"][2].update(status="not_applicable", reason="no release")
     ws = Workspace(tmp_path, targets_doc)
-    ws.add_part("source", "source")
+    ws.add_part("source-development", "source")
     ws.add_part("app-development", "app-development")
     ws.run()
     with (ws.out / "summary.csv").open(encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
-    assert [r["target_id"] for r in rows] == ["source", "app-development", "app-1.0.0"]
+    assert [r["target_id"] for r in rows] == [
+        "source-development",
+        "app-development",
+        "app-1.0.0",
+    ]
+    assert rows[0]["ref"] == "development@fedcba9"
+    assert rows[1]["ref"] == "ghcr.io/example/app:development"
     assert rows[0]["findings_unique"] == "3"
     assert rows[0]["findings_raw"] == "4"
     assert rows[2]["status"] == "not_applicable"
@@ -398,14 +431,186 @@ def test_summary_md_sections(full: Workspace) -> None:
     assert "[run 42](https://github.com/example/app/actions/runs/42)" in md
     assert "0123456789abcdef0123456789abcdef01234567" in md
     assert (
-        "| CRITICAL | CVE-2000-0002 | minimist | 1.0.0 | NO | - | library | source |"
-        in md
+        "| CRITICAL | CVE-2000-0002 | minimist | 1.0.0 | NO | - | library "
+        "| source-development |" in md
     )
     assert (
         "| HIGH | CVE-2000-0001 | lodash | 4.17.0 | yes | 4.17.21 | library "
-        "| source + app-development |" in md
+        "| source-development + app-development |" in md
     )
     assert "CVE-2000-0011" not in md  # LOW is not listed in the detail table
+
+
+def test_summary_md_ref_column_shows_git_ref_and_short_sha(full: Workspace) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "| source-development | fs | development@fedcba9 |" in md
+    assert "| app-development | image | ghcr.io/example/app:development |" in md
+
+
+def test_report_targets_carry_git_ref_and_commit_sha(full: Workspace) -> None:
+    full.run()
+    fs = full.targets["source-development"]
+    assert fs["git_ref"] == "development"
+    assert fs["commit_sha"] == "fedcba9876543210fedcba9876543210fedcba98"
+    image = full.targets["app-development"]
+    assert image["git_ref"] is None
+    assert image["commit_sha"] is None
+    # the top-level commit is the default branch freshness, not a per-target value
+    report = full.json("_report/scan_report.json")
+    assert report["commit_sha"] == "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_fs_target_is_recognized_by_kind_not_by_id(tmp_path: Path) -> None:
+    release = {
+        **SOURCE,
+        "id": "source-release-1.2",
+        "git_ref": "release/1.2",
+        "commit_sha": "1" * 40,
+    }
+    ws = Workspace(tmp_path, make_targets_doc(release))
+    ws.add_part("source-release-1.2", "source", lockfiles=3)
+    assert ws.run() == 0
+    assert ws.targets["source-release-1.2"]["status"] == "ok"
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "| source-release-1.2 | fs | release/1.2@1111111 |" in md
+
+
+DB_INFO = {
+    "vulnerability_db_updated_at": "2030-01-01T06:00:00.123Z",
+    "java_db_updated_at": "2029-12-30T01:02:03.456Z",
+}
+
+
+def test_trivy_db_is_unknown_by_default(full: Workspace) -> None:
+    full.run()
+    report = full.json("_report/scan_report.json")
+    assert report["trivy_db"] == {
+        "vulnerability_db_updated_at": None,
+        "java_db_updated_at": None,
+    }
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "vulnerability DB updated `-`, Java DB updated `-`" in md
+
+
+def test_trivy_db_is_recorded_in_report_and_summary(full: Workspace) -> None:
+    assert (
+        mr.run_merge(full.targets_file, full.parts, full.out, GENERATED, DB_INFO) == 0
+    )
+    assert full.json("_report/scan_report.json")["trivy_db"] == DB_INFO
+    assert full.json("_report/scan_report.json")["schema_version"] == 1
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "vulnerability DB updated `2030-01-01T06:00:00.123Z`, "
+        "Java DB updated `2029-12-30T01:02:03.456Z`" in md
+    )
+
+
+def test_main_passes_trivy_db_info(full: Workspace) -> None:
+    assert mr.main(cli_args(full, "--trivy-db-info", json.dumps(DB_INFO))) == 0
+    assert full.json("_report/scan_report.json")["trivy_db"] == DB_INFO
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "  ", "not json", "[1]", '"x"', '{"vulnerability_db_updated_at": 5}'],
+)
+def test_parse_trivy_db_info_unknown_for_bad_input(raw: str) -> None:
+    assert mr.parse_trivy_db_info(raw) == {
+        "vulnerability_db_updated_at": None,
+        "java_db_updated_at": None,
+    }
+
+
+def test_parse_trivy_db_info_partial() -> None:
+    info = mr.parse_trivy_db_info('{"java_db_updated_at": "2030-01-01T00:00:00Z"}')
+    assert info == {
+        "vulnerability_db_updated_at": None,
+        "java_db_updated_at": "2030-01-01T00:00:00Z",
+    }
+
+
+PACKAGES_NATIVE = {
+    "Results": [
+        {
+            "Target": "a/package-lock.json",
+            "Type": "npm",
+            "Packages": [
+                {"Name": "lodash", "Version": "4.17.0"},
+                {"Name": "minimist", "Version": "1.0.0"},
+            ],
+        },
+        {
+            "Target": "b/package-lock.json",
+            "Type": "npm",
+            "Packages": [
+                {"Name": "lodash", "Version": "4.17.0"},
+                {"Name": "lodash", "Version": "4.17.21"},
+            ],
+            "Vulnerabilities": [
+                {
+                    "VulnerabilityID": "CVE-2000-0001",
+                    "PkgName": "lodash",
+                    "InstalledVersion": "4.17.0",
+                    "Severity": "HIGH",
+                }
+            ],
+        },
+        {"Target": "c/empty", "Type": "npm"},
+    ]
+}
+
+
+def test_count_packages_distinct_name_and_version() -> None:
+    assert mr.count_packages(PACKAGES_NATIVE) == {
+        "packages_scanned": 3,
+        "locations_scanned": 3,
+    }
+    assert mr.count_packages({"Results": None}) == {
+        "packages_scanned": 0,
+        "locations_scanned": 0,
+    }
+    assert mr.count_packages({}) == {"packages_scanned": 0, "locations_scanned": 0}
+
+
+def test_report_and_tables_show_packages(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV))
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps(PACKAGES_NATIVE), encoding="utf-8"
+    )
+    ws.add_part("app-development", None, status="failed", reason="boom")
+    ws.run()
+    fs = ws.targets["source-development"]
+    assert (fs["packages_scanned"], fs["locations_scanned"]) == (3, 3)
+    failed = ws.targets["app-development"]
+    assert (failed["packages_scanned"], failed["locations_scanned"]) == (None, None)
+    assert "::warning title=No packages" not in capsys.readouterr().out
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "| Status | Packages | Unique |" in md
+    assert (
+        "| source-development | fs | development@fedcba9 | ok | 3 | 1 | 1 | 1 |" in md
+    )
+    with (ws.out / "summary.csv").open(encoding="utf-8", newline="") as f:
+        rows = {r["target_id"]: r for r in csv.DictReader(f)}
+    assert rows["source-development"]["packages_scanned"] == "3"
+    assert rows["app-development"]["packages_scanned"] == ""
+
+
+def test_warning_for_ok_target_without_packages(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE))
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        '{"Results": null}', encoding="utf-8"
+    )
+    assert ws.run() == 0  # suspicious, but not a failure
+    assert ws.targets["source-development"]["packages_scanned"] == 0
+    out = capsys.readouterr().out
+    assert "::warning title=No packages in scan result::source-development" in out
 
 
 def test_markdown_cells_are_escaped() -> None:
@@ -418,7 +623,7 @@ def test_markdown_cells_are_escaped() -> None:
 
 def test_failure_reason_with_pipe_does_not_break_table(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", None, status="failed", reason="a | b")
+    ws.add_part("source-development", None, status="failed", reason="a | b")
     ws.run()
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "a \\| b" in md
@@ -546,11 +751,11 @@ def test_every_target_names_its_scanner(tmp_path: Path) -> None:
     targets_doc = make_targets_doc(SOURCE, DEV, REL)
     targets_doc["targets"][1].update(status="not_applicable", reason="tag not found")
     ws = Workspace(tmp_path, targets_doc)
-    ws.add_part("source", "source")
+    ws.add_part("source-development", "source")
     # app-1.0.0 is pending and has no part, so it fails
     assert ws.run() == 1
     assert {tid: t["scanner"] for tid, t in ws.targets.items()} == {
-        "source": "trivy",
+        "source-development": "trivy",
         "app-development": "trivy",
         "app-1.0.0": "trivy",
     }
@@ -576,21 +781,21 @@ def test_merge_records_unions_scanners_sorted() -> None:
     records = mr.merge_records(
         "example/app",
         [
-            ("source", "trivy", native),
+            ("source-development", "trivy", native),
             ("deps", "other-scanner", native),
             ("image", "trivy", native),
         ],
     )
     assert len(records) == 1
     assert records[0]["scanners"] == ["other-scanner", "trivy"]
-    assert records[0]["scan_targets"] == ["source", "deps", "image"]
+    assert records[0]["scan_targets"] == ["source-development", "deps", "image"]
     assert records[0]["locations"] == ["package-lock.json"]
 
 
 def test_parts_outside_the_scanner_directory_are_ignored(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
-    ws.add_part("source", "source")
+    ws.add_part("source-development", "source")
     for part in list(ws.trivy_parts.iterdir()):
         part.rename(ws.parts / part.name)
     assert ws.run() == 1
-    assert ws.targets["source"]["reason"] == "scan job produced no result"
+    assert ws.targets["source-development"]["reason"] == "scan job produced no result"

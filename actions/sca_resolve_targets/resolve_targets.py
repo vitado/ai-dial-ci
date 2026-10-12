@@ -342,8 +342,17 @@ def find_release_tag(release_tag: str, tags: Sequence[str]) -> str | None:
     return None
 
 
+def sanitize_id(raw: str) -> str:
+    return UNSAFE_ID_CHARS.sub("-", raw)
+
+
 def target_id(image: str, tag: str) -> str:
-    return UNSAFE_ID_CHARS.sub("-", f"{image.rsplit('/', 1)[-1]}-{tag}")
+    return sanitize_id(f"{image.rsplit('/', 1)[-1]}-{tag}")
+
+
+def source_target_id(git_ref: str) -> str:
+    """Id of a filesystem target; stable across runs, so it never contains the SHA."""
+    return sanitize_id(f"source-{git_ref}")
 
 
 def make_target(
@@ -360,8 +369,25 @@ def make_target(
         "image": image,
         "tag": tag,
         "ref": f"{registry}/{image}:{tag}" if tag else None,
+        "git_ref": None,
+        "commit_sha": None,
         "status": status,
         "reason": reason,
+    }
+
+
+def make_source_target(git_ref: str, commit_sha: str) -> dict[str, Any]:
+    """A filesystem target: ``git_ref`` (branch or tag) pinned to ``commit_sha``."""
+    return {
+        "id": source_target_id(git_ref),
+        "kind": "fs",
+        "image": None,
+        "tag": None,
+        "ref": None,
+        "git_ref": git_ref,
+        "commit_sha": commit_sha,
+        "status": "pending",
+        "reason": None,
     }
 
 
@@ -464,17 +490,7 @@ def resolve_targets(
 
     targets: list[dict[str, Any]] = []
     if scan_source:
-        targets.append(
-            {
-                "id": "source",
-                "kind": "fs",
-                "image": None,
-                "tag": None,
-                "ref": None,
-                "status": "pending",
-                "reason": None,
-            }
-        )
+        targets.append(make_source_target(default_branch, commit_sha))
     if scan_images and images:
         latest_release: str | None = None
         release_error: str | None = None
@@ -510,7 +526,7 @@ def resolve_targets(
 
 
 def build_matrix(targets_doc: Mapping[str, Any]) -> list[dict[str, Any]]:
-    keys = ("id", "kind", "image", "tag", "ref")
+    keys = ("id", "kind", "image", "tag", "ref", "git_ref", "commit_sha")
     return [
         {k: t[k] for k in keys}
         for t in targets_doc["targets"]

@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import urllib.parse
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,11 +73,11 @@ def github_routes(
     transport: FakeTransport,
     release: str | None = "1.1.14",
     release_status: int | None = None,
+    branch: str = "development",
 ) -> None:
-    transport.add(f"{API}/repos/{REPOSITORY}", ok({"default_branch": "development"}))
-    transport.add(
-        f"{API}/repos/{REPOSITORY}/commits/development", ok({"sha": "a" * 40})
-    )
+    transport.add(f"{API}/repos/{REPOSITORY}", ok({"default_branch": branch}))
+    quoted = urllib.parse.quote(branch, safe="")
+    transport.add(f"{API}/repos/{REPOSITORY}/commits/{quoted}", ok({"sha": "a" * 40}))
     latest = f"{API}/repos/{REPOSITORY}/releases/latest"
     if release_status is not None:
         transport.add(latest, rt.Response(release_status))
@@ -111,6 +112,9 @@ def run_resolve_targets(
         environ=ENV,
         now=NOW,
     )
+
+
+TARGET_KEYS = {"id", "kind", "image", "tag", "ref", "git_ref", "commit_sha"}
 
 
 def by_id(targets_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -169,17 +173,19 @@ def test_release_lines_1_uses_github_latest_release() -> None:
     )
     targets = by_id(run_resolve_targets(t, ["example/app"]))
     assert list(targets) == [
-        "source",
+        "source-development",
         "app-development",
         "app-1.1.14",
     ]
-    assert targets["source"]["kind"] == "fs"
+    assert targets["source-development"]["kind"] == "fs"
     assert targets["app-1.1.14"] == {
         "id": "app-1.1.14",
         "kind": "image",
         "image": "example/app",
         "tag": "1.1.14",
         "ref": "ghcr.io/example/app:1.1.14",
+        "git_ref": None,
+        "commit_sha": None,
         "status": "pending",
         "reason": None,
     }
@@ -223,7 +229,13 @@ def test_release_lines_3_uses_registry_semver_and_skips_github_release() -> None
     t.add(tags_url("example/x"), ok({"tags": tags}))
     targets_doc = run_resolve_targets(t, ["example/x"], release_lines=3)
     pending = [x["id"] for x in targets_doc["targets"] if x["status"] == "pending"]
-    assert pending == ["source", "x-development", "x-0.12.1", "x-0.11.4", "x-0.10.0"]
+    assert pending == [
+        "source-development",
+        "x-development",
+        "x-0.12.1",
+        "x-0.11.4",
+        "x-0.10.0",
+    ]
     assert not any(url.endswith("/releases/latest") for url, _ in t.calls)
 
 
@@ -337,7 +349,7 @@ def test_empty_images_only_source() -> None:
     t = FakeTransport()
     github_routes(t)
     targets_doc = run_resolve_targets(t, [])
-    assert [x["id"] for x in targets_doc["targets"]] == ["source"]
+    assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
     assert not any("/v2/" in url for url, _ in t.calls)
 
 
@@ -346,7 +358,7 @@ def test_scan_source_false() -> None:
     github_routes(t)
     t.add(tags_url("example/x"), ok({"tags": ["development", "1.1.14"]}))
     targets = by_id(run_resolve_targets(t, ["example/x"], scan_source=False))
-    assert "source" not in targets
+    assert "source-development" not in targets
     assert "x-development" in targets
 
 
@@ -354,7 +366,7 @@ def test_scan_images_false() -> None:
     t = FakeTransport()
     github_routes(t)
     targets_doc = run_resolve_targets(t, ["example/x"], scan_images=False)
-    assert [x["id"] for x in targets_doc["targets"]] == ["source"]
+    assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
 
 
 def test_id_collision_rejected() -> None:
@@ -371,8 +383,70 @@ def test_matrix_has_only_pending_targets_without_status() -> None:
     github_routes(t, release="1.1.14")
     t.add(tags_url("example/bff"), ok({"tags": ["development"]}))
     matrix = rt.build_matrix(run_resolve_targets(t, ["example/bff"]))
-    assert [m["id"] for m in matrix] == ["source", "bff-development"]
-    assert all(set(m) == {"id", "kind", "image", "tag", "ref"} for m in matrix)
+    assert [m["id"] for m in matrix] == ["source-development", "bff-development"]
+    assert all(set(m) == TARGET_KEYS for m in matrix)
+
+
+def test_source_target_id_from_git_ref() -> None:
+    assert rt.source_target_id("development") == "source-development"
+    assert rt.source_target_id("release/1.2") == "source-release-1.2"
+    assert rt.source_target_id("v1.2.3") == "source-v1.2.3"
+    assert rt.source_target_id("feat/a b") == "source-feat-a-b"
+
+
+def test_source_target_id_sanitized_and_independent_of_sha() -> None:
+    t = FakeTransport()
+    github_routes(t, branch="release/1.2")
+    targets = by_id(run_resolve_targets(t, []))
+    assert list(targets) == ["source-release-1.2"]
+    assert targets["source-release-1.2"]["git_ref"] == "release/1.2"
+    assert "a" * 40 not in "".join(targets)
+
+
+def test_fs_target_carries_git_ref_and_commit_sha() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    targets_doc = run_resolve_targets(t, [])
+    assert targets_doc["targets"] == [
+        {
+            "id": "source-development",
+            "kind": "fs",
+            "image": None,
+            "tag": None,
+            "ref": None,
+            "git_ref": "development",
+            "commit_sha": "a" * 40,
+            "status": "pending",
+            "reason": None,
+        }
+    ]
+    assert targets_doc["default_branch"] == "development"
+    assert targets_doc["commit_sha"] == "a" * 40
+
+
+def test_target_schema_is_uniform() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"])
+    kinds = {x["kind"] for x in targets_doc["targets"]}
+    assert kinds == {"fs", "image"}
+    for target in targets_doc["targets"]:
+        assert set(target) == TARGET_KEYS | {"status", "reason"}
+        if target["kind"] == "image":
+            assert target["git_ref"] is None
+            assert target["commit_sha"] is None
+        else:
+            assert target["git_ref"]
+            assert target["commit_sha"]
+    assert all(set(m) == TARGET_KEYS for m in rt.build_matrix(targets_doc))
+
+
+def test_matrix_carries_commit_sha_of_fs_target() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    (fs,) = rt.build_matrix(run_resolve_targets(t, []))
+    assert (fs["git_ref"], fs["commit_sha"]) == ("development", "a" * 40)
 
 
 def test_target_id_sanitized() -> None:
@@ -639,7 +713,7 @@ def test_run_writes_resolve_json_and_outputs(
         (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
     )
     assert [x["id"] for x in targets_doc["targets"]] == [
-        "source",
+        "source-development",
         "x-development",
         "x-1.1.14",
     ]
@@ -649,7 +723,7 @@ def test_run_writes_resolve_json_and_outputs(
     assert outputs["targets-file"] == str(tmp_path / "out" / "targets.json")
     assert " " not in outputs["matrix"]
     assert [m["id"] for m in json.loads(outputs["matrix"])] == [
-        "source",
+        "source-development",
         "x-development",
     ]
     console = capsys.readouterr().out

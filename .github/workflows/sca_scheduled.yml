@@ -31,6 +31,14 @@ on:
         type: string
         description: Trivy version to use (release tag, e.g. v0.75.0)
         default: "v0.75.0"
+      trivy-db-repository:
+        type: string
+        description: Trivy vulnerability DB repositories (comma-separated, tried in order)
+        default: "mirror.gcr.io/aquasec/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+      trivy-java-db-repository:
+        type: string
+        description: Trivy Java DB repositories (comma-separated, tried in order)
+        default: "mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
@@ -56,7 +64,6 @@ jobs:
       packages: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
-      commit-sha: ${{ steps.targets.outputs.commit-sha }}
     steps:
       - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
         id: targets
@@ -74,9 +81,52 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # One Trivy DB snapshot per run: all targets scan against the same DB versions, and the matrix jobs neither
+  # download the DB each nor race to save the same cache keys (this job is the single cache writer)
+  trivy-db:
+    if: ${{ inputs.scan-source || inputs.scan-images }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+    outputs:
+      cache-key: ${{ steps.key.outputs.cache-key }}
+      db-info: ${{ steps.info.outputs.db-info }}
+    steps:
+      # First, so that the key is published even if a later step fails
+      - name: Define DB cache key
+        id: key
+        run: echo "cache-key=trivy-db-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: ${{ inputs.trivy-version }}
+          cache: true # the binary is cached under a version key; this is the only job that saves it
+      - name: Download Trivy databases
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+          TRIVY_DB_REPOSITORY: ${{ inputs.trivy-db-repository }}
+          TRIVY_JAVA_DB_REPOSITORY: ${{ inputs.trivy-java-db-repository }}
+        run: |
+          trivy image --download-db-only
+          trivy image --download-java-db-only
+      - name: Describe Trivy databases
+        id: info
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: |
+          trivy version --format json > "$RUNNER_TEMP/trivy-version.json"
+          jq . "$RUNNER_TEMP/trivy-version.json"
+          db_info="$(jq -c '{vulnerability_db_updated_at: .VulnerabilityDB.UpdatedAt, java_db_updated_at: .JavaDB.UpdatedAt}' "$RUNNER_TEMP/trivy-version.json")"
+          echo "db-info=$db_info" >> "$GITHUB_OUTPUT"
+          echo "Trivy DB snapshot: $db_info" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: ${{ steps.key.outputs.cache-key }}
+
   trivy:
-    needs: targets
-    if: ${{ needs.targets.outputs.matrix != '[]' }}
+    needs: [targets, trivy-db]
+    # Runs even if trivy-db failed: the DB restore then fails and every target is reported as failed with a reason
+    if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.matrix != '[]' }}
     name: Trivy ${{ matrix.target.id }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
@@ -97,21 +147,38 @@ jobs:
       TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
       TRIVY_PKG_TYPES: os,library
       TRIVY_SCANNERS: vuln
+      TRIVY_LIST_ALL_PKGS: "true" # the package inventory in the native result: tells 0 findings from 0 packages seen
       TRIVY_INCLUDE_DEV_DEPS: "true" # trivy skips dev dependencies by default; trivy-action has no input for it
       TRIVY_EXIT_CODE: "0" # findings are the payload, not a failure
       TRIVY_DISABLE_VEX_NOTICE: "true"
+      # All targets of the run use the snapshot restored from the trivy-db job
+      TRIVY_SKIP_DB_UPDATE: "true"
+      TRIVY_SKIP_JAVA_DB_UPDATE: "true"
       TARGET_ID: ${{ matrix.target.id }}
     steps:
       - name: Prepare output directory
         run: mkdir -p "$RUNNER_TEMP/sca-out/trivy"
+      # The DB snapshot of the trivy-db job; a miss fails the target instead of silently downloading another DB
+      - name: Restore Trivy databases
+        id: db
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: ${{ needs.trivy-db.outputs.cache-key }}
+          fail-on-cache-miss: true
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        id: setup
+        with:
+          version: ${{ inputs.trivy-version }}
+          cache: true # hits the binary cache saved by trivy-db, so there is no save race between the matrix jobs
       - name: Checkout
         id: checkout
         if: ${{ matrix.target.kind == 'fs' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.repository || github.repository }}
-          # The same snapshot for all targets
-          ref: ${{ needs.targets.outputs.commit-sha }}
+          # The commit the targets job resolved for this target, not a moving branch
+          ref: ${{ matrix.target.commit_sha }}
           persist-credentials: false
           lfs: true
       - name: Detect Gradle build
@@ -157,7 +224,9 @@ jobs:
           output: ${{ runner.temp }}/sca-out/trivy/${{ matrix.target.id }}.json
           # Outside the workspace, so that the cache is not scanned
           cache-dir: ${{ runner.temp }}/trivy-cache
-          version: ${{ inputs.trivy-version }}
+          # Trivy and the DB are set up above; trivy-action must not set up or cache anything itself
+          skip-setup-trivy: true
+          cache: false
       - name: Generate Trivy report (Table)
         if: ${{ steps.trivy.outcome == 'success' }}
         run: |
@@ -166,6 +235,9 @@ jobs:
       - name: Write scan status
         if: ${{ always() }}
         env:
+          DB_OUTCOME: ${{ steps.db.outcome }}
+          DB_JOB_RESULT: ${{ needs.trivy-db.result }}
+          SETUP_OUTCOME: ${{ steps.setup.outcome }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           JAVA_OUTCOME: ${{ steps.java.outcome }}
           LOCKFILES_OUTCOME: ${{ steps.lockfiles.outcome }}
@@ -176,11 +248,14 @@ jobs:
           out="$RUNNER_TEMP/sca-out/trivy"
           status=ok
           reason=
-          for step in "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
+          for step in "trivy db restore:$DB_OUTCOME" "trivy setup:$SETUP_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
             outcome="${step#*:}"
             if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
               status=failed
               reason="${step%%:*} $outcome"
+              if [ "${step%%:*}" = "trivy db restore" ]; then
+                reason="$reason (trivy-db job: $DB_JOB_RESULT)"
+              fi
               break
             fi
           done
@@ -205,7 +280,7 @@ jobs:
           if-no-files-found: error
 
   report:
-    needs: [targets, trivy]
+    needs: [targets, trivy-db, trivy]
     # Without the targets result there is nothing to report on; the run is red anyway because the targets job failed
     if: ${{ always() && needs.targets.result == 'success' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
@@ -224,6 +299,7 @@ jobs:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca
+          trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

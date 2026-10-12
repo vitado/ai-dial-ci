@@ -44,6 +44,8 @@ from typing import Any
 SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 UNRANKED = len(SEV_ORDER)
 SCHEMA_VERSION = 1
+SHORT_SHA_LENGTH = 7
+TRIVY_DB_KEYS = ("vulnerability_db_updated_at", "java_db_updated_at")
 MERGE_KEY = (
     "(repo, CVE x package x installed-version), merged across scan_targets and scanners"
 )
@@ -186,6 +188,21 @@ def count_findings(native: Mapping[str, Any]) -> dict[str, int]:
     }
 
 
+def count_packages(native: Mapping[str, Any]) -> dict[str, int]:
+    """Inventory size of one target, so that 0 findings differ from 0 packages seen.
+
+    Needs the full package list in the native result (``TRIVY_LIST_ALL_PKGS``).
+    ``locations_scanned`` is the number of trivy Results (lockfiles, OS package
+    databases, ...); ``packages_scanned`` the distinct name x version pairs.
+    """
+    results = native.get("Results") or []
+    packages: set[tuple[str | None, str | None]] = set()
+    for result in results:
+        for package in result.get("Packages") or []:
+            packages.add((package.get("Name"), package.get("Version")))
+    return {"packages_scanned": len(packages), "locations_scanned": len(results)}
+
+
 def image_digest(native: Mapping[str, Any]) -> str | None:
     digests = (native.get("Metadata") or {}).get("RepoDigests") or []
     return digests[0] if digests else None
@@ -317,6 +334,7 @@ def build_scan_report(
     targets_doc: Mapping[str, Any],
     results: Sequence[tuple[Target, dict[str, Any], Mapping[str, Any] | None]],
     generated_utc: str,
+    trivy_db: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
     targets: list[dict[str, Any]] = []
@@ -328,6 +346,8 @@ def build_scan_report(
             "image": target.get("image"),
             "tag": target.get("tag"),
             "ref": target.get("ref"),
+            "git_ref": target.get("git_ref"),
+            "commit_sha": target.get("commit_sha"),
             "image_digest": None,
             "status": state["status"],
             "reason": state["reason"],
@@ -335,9 +355,18 @@ def build_scan_report(
             "findings_raw": None,
             "findings_unique": None,
             "vulnerable_package_versions": None,
+            "packages_scanned": None,
+            "locations_scanned": None,
         }
         if native is not None:
             entry.update(count_findings(native))
+            entry.update(count_packages(native))
+            if entry["packages_scanned"] == 0:
+                print(
+                    f"::warning title=No packages in scan result::{target['id']}: "
+                    "0 packages were seen (an empty scan is suspicious: no lockfiles, "
+                    "an unsupported ecosystem or a missing package list)"
+                )
             if target.get("kind") == "image":
                 entry["image_digest"] = image_digest(native)
             trivy_version = trivy_version or (native.get("Trivy") or {}).get("Version")
@@ -352,8 +381,32 @@ def build_scan_report(
         "run_started_at": targets_doc.get("run_started_at"),
         "generated_utc": generated_utc,
         "trivy_version": trivy_version,
+        "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
         "targets": targets,
     }
+
+
+def parse_trivy_db_info(raw: str) -> dict[str, str | None]:
+    """Parse the ``--trivy-db-info`` JSON; empty or malformed means unknown.
+
+    The metadata only decorates the report, so a problem with it must not break the
+    merge (the trivy-db job may have failed; then there is nothing to pass).
+    """
+    info: dict[str, str | None] = dict.fromkeys(TRIVY_DB_KEYS)
+    if not raw.strip():
+        return info
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"::warning title=Trivy DB info ignored::not valid JSON: {e}")
+        return info
+    if not isinstance(parsed, dict):
+        print("::warning title=Trivy DB info ignored::not a JSON object")
+        return info
+    for key in TRIVY_DB_KEYS:
+        value = parsed.get(key)
+        info[key] = value if isinstance(value, str) and value else None
+    return info
 
 
 def md_cell(value: Any) -> str:
@@ -362,6 +415,16 @@ def md_cell(value: Any) -> str:
         return "-"
     text = str(value).replace("\\", "\\\\").replace("|", "\\|")
     return text.replace("\r", " ").replace("\n", " ")
+
+
+def display_ref(target: Mapping[str, Any]) -> str | None:
+    """Image reference, or ``<git_ref>@<short sha>`` for a filesystem target."""
+    if target.get("kind") != "fs":
+        return target.get("ref")
+    git_ref, commit_sha = target.get("git_ref"), target.get("commit_sha")
+    if git_ref and commit_sha:
+        return f"{git_ref}@{commit_sha[:SHORT_SHA_LENGTH]}"
+    return git_ref
 
 
 def md_table(
@@ -393,6 +456,12 @@ def build_summary_md(report: Mapping[str, Any], vulns: Mapping[str, Any]) -> str
     lines.append(f"- Generated (UTC): {report['generated_utc']}")
     if report["trivy_version"]:
         lines.append(f"- Trivy: {report['trivy_version']}")
+    db = report["trivy_db"]
+    lines.append(
+        "- Trivy DB (one snapshot for all targets): "
+        f"vulnerability DB updated `{md_cell(db['vulnerability_db_updated_at'])}`, "
+        f"Java DB updated `{md_cell(db['java_db_updated_at'])}`"
+    )
     failed = [t for t in targets if t["status"] == STATUS_FAILED]
     if failed:
         lines += [
@@ -402,20 +471,33 @@ def build_summary_md(report: Mapping[str, Any], vulns: Mapping[str, Any]) -> str
         ]
     lines += [
         "",
-        "Counts are UNIQUE findings (CVE x package x version); `raw` counts (one per",
-        "finding x lockfile) stay in the native audit layer (`_native/<scanner>/`).",
+        "`Packages` is the number of distinct packages (name x version) the scan saw,",
+        "to tell 0 findings from 0 packages. Counts are UNIQUE findings (CVE x",
+        "package x version); `raw` counts (one per finding x lockfile) stay in the",
+        "native audit layer (`_native/<scanner>/`).",
         "",
         "## Targets",
         "",
     ]
     lines += md_table(
-        ["Target", "Kind", "Ref", "Status", "Unique", "Raw", "Vulnerable pkgs", "Note"],
+        [
+            "Target",
+            "Kind",
+            "Ref",
+            "Status",
+            "Packages",
+            "Unique",
+            "Raw",
+            "Vulnerable pkgs",
+            "Note",
+        ],
         (
             [
                 t["id"],
                 t["kind"],
-                t["ref"] or "source",
+                display_ref(t),
                 t["status"],
+                t["packages_scanned"],
                 t["findings_unique"],
                 t["findings_raw"],
                 t["vulnerable_package_versions"],
@@ -423,7 +505,7 @@ def build_summary_md(report: Mapping[str, Any], vulns: Mapping[str, Any]) -> str
             ]
             for t in targets
         ),
-        right=(4, 5, 6),
+        right=(4, 5, 6, 7),
     )
 
     lines += ["", "## Per-target coverage (unique findings)", ""]
@@ -484,6 +566,7 @@ def build_summary_md(report: Mapping[str, Any], vulns: Mapping[str, Any]) -> str
 
 def build_summary_csv(report: Mapping[str, Any]) -> str:
     count_fields = (
+        "packages_scanned",
         "findings_unique",
         "findings_raw",
         "vulnerable_package_versions",
@@ -493,7 +576,9 @@ def build_summary_csv(report: Mapping[str, Any]) -> str:
     writer.writerow(["target_id", "kind", "ref", "status", *count_fields])
     for t in report["targets"]:
         counts = ["" if t[k] is None else t[k] for k in count_fields]
-        writer.writerow([t["id"], t["kind"], t["ref"] or "", t["status"], *counts])
+        writer.writerow(
+            [t["id"], t["kind"], display_ref(t) or "", t["status"], *counts]
+        )
     return buf.getvalue()
 
 
@@ -519,7 +604,11 @@ def copy_native(scanner_parts_dir: Path, target_id: str, native_dir: Path) -> No
 
 
 def run_merge(
-    targets_file: Path, parts_dir: Path, output_dir: Path, generated_utc: str
+    targets_file: Path,
+    parts_dir: Path,
+    output_dir: Path,
+    generated_utc: str,
+    trivy_db: Mapping[str, str | None] | None = None,
 ) -> int:
     """Write all outputs; return the number of failed targets."""
     targets_doc = load_targets_file(targets_file)
@@ -536,7 +625,7 @@ def run_merge(
         results.append((target, state, native))
         copy_native(scanner_parts_dir, target["id"], native_dir)
 
-    scan_report = build_scan_report(targets_doc, results, generated_utc)
+    scan_report = build_scan_report(targets_doc, results, generated_utc, trivy_db)
     ok_scans = [
         (t["id"], SCANNER_TRIVY, native)
         for t, _, native in results
@@ -609,6 +698,14 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=True,
         help="append summary.md to $GITHUB_STEP_SUMMARY (true/false, default true)",
     )
+    parser.add_argument(
+        "--trivy-db-info",
+        default="",
+        help=(
+            "JSON object with vulnerability_db_updated_at and java_db_updated_at "
+            "of the Trivy DB snapshot used by the run (default: unknown)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -617,7 +714,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     generated_utc = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         failed_count = run_merge(
-            args.targets_file, args.parts_dir, args.output_dir, generated_utc
+            args.targets_file,
+            args.parts_dir,
+            args.output_dir,
+            generated_utc,
+            parse_trivy_db_info(args.trivy_db_info),
         )
     except InputError as e:
         print(f"::error title=Invalid merge input::{e}", file=sys.stderr)

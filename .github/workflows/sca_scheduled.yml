@@ -147,7 +147,7 @@ jobs:
       TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
       TRIVY_PKG_TYPES: os,library
       TRIVY_SCANNERS: vuln
-      TRIVY_LIST_ALL_PKGS: "true" # the package inventory in the native result: tells 0 findings from 0 packages seen
+      TRIVY_LIST_ALL_PKGS: "true" # trivy default for JSON, pinned so a repository trivy.yaml cannot disable the inventory behind packages_scanned
       TRIVY_INCLUDE_DEV_DEPS: "true" # trivy skips dev dependencies by default; trivy-action has no input for it
       TRIVY_EXIT_CODE: "0" # findings are the payload, not a failure
       TRIVY_DISABLE_VEX_NOTICE: "true"
@@ -312,8 +312,7 @@ jobs:
         if: ${{ steps.merge.outputs.failed-count != '0' }}
         env:
           FAILED_COUNT: ${{ steps.merge.outputs.failed-count }}
-          REPORT_DIR: ${{ steps.merge.outputs.report-dir }}
         run: |
-          jq -r '.targets[] | select(.status == "failed") | "::error::Target \(.id) failed: \(.reason)"' "$REPORT_DIR/_report/scan_report.json"
-          echo "::error::$FAILED_COUNT target(s) failed to be scanned"
+          # Per-target errors are annotated by the merge step; this one only fails the run
+          echo "::error::$FAILED_COUNT target(s) failed to be scanned, see the job summary or _report/scan_report.json"
           exit 1

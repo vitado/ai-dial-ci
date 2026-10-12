@@ -2210,10 +2210,22 @@ def verdict_text(
     by_exposure: dict[str, list[Record]] = {}
     for record in records:
         by_exposure.setdefault(record["exposure"], []).append(record)
+    # Only what an upgrade resolves is an action; what has no fix is watched
     actionable = {
-        exposure: [r for r in group if record_identity(r) not in in_place]
+        exposure: [
+            r
+            for r in group
+            if r["fix_available"] and record_identity(r) not in in_place
+        ]
         for exposure, group in by_exposure.items()
     }
+    unfixed = [
+        r
+        for exposure, group in by_exposure.items()
+        if exposure != EXPOSURE_SOURCE_ONLY
+        for r in group
+        if not r["fix_available"]
+    ]
 
     def lines_of(group: Sequence[Record]) -> str:
         return ", ".join(release_lines(release_tags_of(group, trivy_targets(targets))))
@@ -2245,6 +2257,17 @@ def verdict_text(
         )
     )
     clauses = [text for *_, text in ranked]
+    top_unfixed = [r for r in unfixed if r["severity"] in SEVERITIES[:2]]
+    in_base_image = sum(is_base_image(r) for r in top_unfixed)
+    where = f" ({in_base_image} in the base image)" if in_base_image else ""
+    watch = f"{len(top_unfixed)} CRITICAL/HIGH without a fix{where} — see watch"
+    if not clauses and unfixed:
+        # nothing to upgrade is not "no vulnerabilities"
+        text = f"Nothing to upgrade — {severity_phrase(unfixed)} without a fix"
+        text += f"{where} — see watch" if top_unfixed else ", see watch"
+        if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
+            text += f" · {only_sources} only in build / test dependencies"
+        return text
     if not clauses:
         names = [*release_subjects(targets)]
         if development_scanned(targets):
@@ -2260,7 +2283,8 @@ def verdict_text(
     sentences = clauses[:2]
     if rest:
         sentences[-1] += f"; {rest}"
-    return ". ".join(sentences)
+    text = ". ".join(sentences)
+    return f"{text} · {watch}" if top_unfixed else text
 
 
 def scope_row(
@@ -3060,7 +3084,10 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     header = ["Target", "Trivy", *(["OSV"] if with_osv else []), "Note"]
     legend = "Trivy: status · packages · CRITICAL/HIGH/MEDIUM/LOW findings"
     if with_osv:
-        legend += "; OSV: status · packages · findings"
+        legend += (
+            "; OSV: status · language packages only (not the OS packages of an image)"
+            " · findings"
+        )
     body = [f"<sub>{legend}</sub>", "", *md_table(header, rows)]
     return ["", *md_details("Scan coverage", body)]
 

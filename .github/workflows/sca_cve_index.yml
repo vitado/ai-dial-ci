@@ -97,4 +97,3 @@ jobs:
           package-name: ai-dial-sca-cve-index
           package-type: container
           min-versions-to-keep: 30
-          num-old-versions-to-delete: 100

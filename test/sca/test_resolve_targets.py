@@ -123,6 +123,7 @@ def run_resolve_targets(
     scan_source: bool = True,
     scan_images: bool = True,
     scan_release_source: bool = False,
+    osv_enabled: bool = False,
     token: str | None = "tkn",
 ) -> dict[str, Any]:
     http = no_sleep_http(transport)
@@ -134,6 +135,7 @@ def run_resolve_targets(
         scan_source=scan_source,
         scan_images=scan_images,
         scan_release_source=scan_release_source,
+        osv_enabled=osv_enabled,
         github=rt.GitHubClient(http, token, API),
         registry=rt.RegistryClient(http, "ghcr.io", token),
         environ=ENV,
@@ -207,6 +209,7 @@ def test_release_lines_1_uses_github_latest_release() -> None:
     assert targets["source-development"]["kind"] == "fs"
     assert targets["app-1.1.14"] == {
         "id": "app-1.1.14",
+        "scanner": "trivy",
         "kind": "image",
         "image": "example/app",
         "tag": "1.1.14",
@@ -437,6 +440,7 @@ def test_fs_target_carries_git_ref_and_commit_sha() -> None:
     assert targets_doc["targets"] == [
         {
             "id": "source-development",
+            "scanner": "trivy",
             "kind": "fs",
             "image": None,
             "tag": None,
@@ -459,7 +463,8 @@ def test_target_schema_is_uniform() -> None:
     kinds = {x["kind"] for x in targets_doc["targets"]}
     assert kinds == {"fs", "image"}
     for target in targets_doc["targets"]:
-        assert set(target) == TARGET_KEYS | {"status", "reason"}
+        assert set(target) == TARGET_KEYS | {"scanner", "status", "reason"}
+        assert target["scanner"] == "trivy"
         if target["kind"] == "image":
             assert target["git_ref"] is None
             assert target["commit_sha"] is None
@@ -732,6 +737,8 @@ def test_run_writes_resolve_json_and_outputs(
         REPOSITORY,
         "--images",
         "example/x\n",
+        "--osv-enabled",
+        "false",
         "--output-dir",
         str(tmp_path / "out"),
     ]
@@ -804,6 +811,7 @@ def test_render_table_and_annotations() -> None:
     targets = [
         {
             "id": "source",
+            "scanner": "trivy",
             "kind": "fs",
             "ref": None,
             "status": "pending",
@@ -811,6 +819,7 @@ def test_render_table_and_annotations() -> None:
         },
         {
             "id": "x-1",
+            "scanner": "trivy",
             "kind": "image",
             "ref": "ghcr.io/x:1",
             "status": "failed",
@@ -818,6 +827,7 @@ def test_render_table_and_annotations() -> None:
         },
         {
             "id": "x-2",
+            "scanner": "trivy",
             "kind": "image",
             "ref": "ghcr.io/x:2",
             "status": "not_applicable",
@@ -850,6 +860,7 @@ def test_release_source_target_of_latest_release() -> None:
     ]
     assert by_id(targets_doc)["source-0.12.0"] == {
         "id": "source-0.12.0",
+        "scanner": "trivy",
         "kind": "fs",
         "image": None,
         "tag": "0.12.0",
@@ -1022,7 +1033,14 @@ def test_run_scan_release_source_flag(tmp_path: Path) -> None:
     t = FakeTransport()
     github_routes(t, release="0.12.0")
     tag_routes(t, "0.12.0", "b" * 40)
-    base = ["--repository", REPOSITORY, "--output-dir", str(tmp_path)]
+    base = [
+        "--repository",
+        REPOSITORY,
+        "--osv-enabled",
+        "false",
+        "--output-dir",
+        str(tmp_path),
+    ]
     assert rt.run(rt.parse_args(base), t, ENV, NOW) == 0  # on by default
     targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in targets_doc["targets"]] == [
@@ -1035,3 +1053,196 @@ def test_run_scan_release_source_flag(tmp_path: Path) -> None:
     assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
     with pytest.raises(rt.ResolveError, match="scan-release-source"):
         rt.run(rt.parse_args([*base, "--scan-release-source", "maybe"]), t, ENV, NOW)
+
+
+# --- OSV targets --------------------------------------------------------------
+
+
+def test_every_target_names_its_scanner_trivy_without_osv() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"])
+    assert {x["scanner"] for x in targets_doc["targets"]} == {"trivy"}
+
+
+def test_osv_target_is_the_twin_of_every_trivy_target() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
+    # Trivy targets as before, then the OSV twins in the same order
+    assert [(x["scanner"], x["id"]) for x in targets_doc["targets"]] == [
+        ("trivy", "source-development"),
+        ("trivy", "app-development"),
+        ("trivy", "app-1.1.14"),
+        ("osv", "source-development"),
+        ("osv", "app-development"),
+        ("osv", "app-1.1.14"),
+    ]
+    trivy, osv = targets_doc["targets"][:3], targets_doc["targets"][3:]
+    assert osv == [{**x, "scanner": "osv"} for x in trivy]
+
+
+def test_osv_twins_cover_release_sources_in_resolve_order() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    tag_routes(t, "1.1.14", "c" * 40)
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(
+        t, ["example/app"], scan_release_source=True, osv_enabled=True
+    )
+    trivy_ids = ["source-development", "source-1.1.14", "app-development", "app-1.1.14"]
+    assert [(x["scanner"], x["id"]) for x in targets_doc["targets"]] == [
+        *(("trivy", i) for i in trivy_ids),
+        *(("osv", i) for i in trivy_ids),
+    ]
+    by_identity = {(x["scanner"], x["id"]): x for x in targets_doc["targets"]}
+    twin = by_identity[("osv", "source-1.1.14")]
+    # the twin carries every field of its Trivy target, `tag` and `commit_sha` included
+    assert twin == {**by_identity[("trivy", "source-1.1.14")], "scanner": "osv"}
+    assert (twin["tag"], twin["git_ref"], twin["commit_sha"]) == (
+        "1.1.14",
+        "1.1.14",
+        "c" * 40,
+    )
+    # a release source that failed to resolve has a not_applicable twin
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(f"{API}/repos/{REPOSITORY}/git/ref/tags/1.1.14", rt.Response(404))
+    failed = {
+        (x["scanner"], x["id"]): x
+        for x in run_resolve_targets(t, [], scan_release_source=True, osv_enabled=True)[
+            "targets"
+        ]
+    }
+    assert failed[("trivy", "source-1.1.14")]["status"] == "failed"
+    assert failed[("osv", "source-1.1.14")]["status"] == "not_applicable"
+    assert failed[("osv", "source-1.1.14")]["reason"] == "trivy target failed"
+
+
+def test_osv_twin_of_a_trivy_target_that_will_not_be_scanned_is_not_applicable() -> (
+    None
+):
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    # No release tag in the registry: the release target is not_applicable
+    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
+    by_identity = {(x["scanner"], x["id"]): x for x in targets_doc["targets"]}
+    trivy = by_identity[("trivy", "app-1.1.14")]
+    osv = by_identity[("osv", "app-1.1.14")]
+    assert trivy["status"] == "not_applicable"
+    assert osv["status"] == "not_applicable"
+    assert osv["reason"] == "trivy target not_applicable"
+    assert by_identity[("osv", "source-development")]["status"] == "pending"
+
+
+def test_osv_twin_of_a_trivy_target_that_failed_to_resolve_is_not_applicable() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), rt.Response(404))
+    targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
+    osv = [x for x in targets_doc["targets"] if x["scanner"] == "osv"]
+    assert [(x["id"], x["status"]) for x in osv] == [
+        ("source-development", "pending"),
+        ("app-development", "not_applicable"),
+        ("app-1.1.14", "not_applicable"),
+    ]
+    assert {x["reason"] for x in osv[1:]} == {"trivy target failed"}
+
+
+def test_matrix_holds_only_pending_trivy_targets() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
+    assert [m["id"] for m in rt.build_matrix(targets_doc)] == [
+        "source-development",
+        "app-development",
+        "app-1.1.14",
+    ]
+
+
+def test_osv_twins_are_not_annotated_twice() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
+    lines = rt.annotations(targets_doc["targets"])
+    assert len(lines) == 1
+    assert "app-1.1.14" in lines[0]
+
+
+def test_target_identity_is_scanner_and_id() -> None:
+    same_id = {"id": "source-development", "scanner": "trivy"}
+    rt.check_unique_ids([same_id, {**same_id, "scanner": "osv"}])
+    with pytest.raises(rt.ResolveError, match="collision"):
+        rt.check_unique_ids([same_id, dict(same_id)])
+
+
+def test_render_table_names_the_scanner() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    table = rt.render_table(run_resolve_targets(t, [], osv_enabled=True)["targets"])
+    assert [line.split()[:2] for line in table.splitlines()] == [
+        ["ID", "SCANNER"],
+        ["source-development", "trivy"],
+        ["source-development", "osv"],
+    ]
+
+
+def test_run_adds_osv_twins_by_default(tmp_path: Path) -> None:
+    t = FakeTransport()
+    github_routes(t)
+    tag_routes(t, "1.1.14", "b" * 40)
+    output_file = tmp_path / "github_output"
+    env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
+    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")]
+    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
+    assert [m["id"] for m in json.loads(outputs["matrix"])] == [
+        "source-development",
+        "source-1.1.14",
+    ]
+    targets_doc = json.loads(
+        (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
+    )
+    assert [(x["scanner"], x["id"]) for x in targets_doc["targets"]] == [
+        ("trivy", "source-development"),
+        ("trivy", "source-1.1.14"),
+        ("osv", "source-development"),
+        ("osv", "source-1.1.14"),
+    ]
+
+
+def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
+    t = FakeTransport()
+    github_routes(t)
+    tag_routes(t, "1.1.14", "b" * 40)
+    argv = [
+        "--repository",
+        REPOSITORY,
+        "--osv-enabled",
+        "false",
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    assert rt.run(rt.parse_args(argv), t, ENV, NOW) == 0
+    targets_doc = json.loads(
+        (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
+    )
+    assert [x["scanner"] for x in targets_doc["targets"]] == ["trivy", "trivy"]
+
+
+def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
+    argv = [
+        "--repository",
+        REPOSITORY,
+        "--osv-enabled",
+        "maybe",
+        "--output-dir",
+        str(tmp_path),
+    ]
+    with pytest.raises(rt.ResolveError):
+        rt.run(rt.parse_args(argv), FakeTransport(), ENV, NOW)

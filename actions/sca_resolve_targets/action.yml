@@ -23,6 +23,9 @@ inputs:
   scan-release-source:
     description: Whether to include the source (filesystem) targets of the latest releases (needs scan-source). They work without images, too
     default: "true"
+  osv-enabled:
+    description: Whether to add an OSV twin of every Trivy target (the packages of the Trivy target are also checked against OSV)
+    default: "true"
   github-token:
     description: Token for the GitHub API and for authenticating to ghcr.io
     default: ${{ github.token }}
@@ -32,7 +35,7 @@ inputs:
 
 outputs:
   matrix:
-    description: Compact JSON array of the pending targets (may be "[]")
+    description: Compact JSON array of the pending Trivy targets (may be "[]")
     value: ${{ steps.targets.outputs.matrix }}
   commit-sha:
     description: Commit SHA of the default branch the scan is pinned to
@@ -62,6 +65,7 @@ runs:
         SCAN_SOURCE: ${{ inputs.scan-source }}
         SCAN_IMAGES: ${{ inputs.scan-images }}
         SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
+        OSV_ENABLED: ${{ inputs.osv-enabled }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}
@@ -74,4 +78,5 @@ runs:
         --scan-source "$SCAN_SOURCE"
         --scan-images "$SCAN_IMAGES"
         --scan-release-source "$SCAN_RELEASE_SOURCE"
+        --osv-enabled "$OSV_ENABLED"
         --output-dir "$OUTPUT_DIR"

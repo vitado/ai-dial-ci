@@ -46,6 +46,7 @@ DEV = {
     "git_ref": None,
     "commit_sha": None,
 }
+OSV_SOURCE = {**SOURCE, "scanner": "osv"}
 REL = {
     "id": "app-1.0.0",
     "kind": "image",
@@ -58,8 +59,10 @@ REL = {
 
 
 def make_targets_doc(*targets: dict[str, Any]) -> dict[str, Any]:
-    """targets.json content with all given targets pending."""
-    items = [{"status": "pending", "reason": None, **t} for t in targets]
+    """targets.json content with all given targets pending (Trivy by default)."""
+    items = [
+        {"status": "pending", "reason": None, "scanner": "trivy", **t} for t in targets
+    ]
     return {
         "repo": "example/app",
         "default_branch": "main",
@@ -82,6 +85,7 @@ class Workspace:
         self.parts = tmp_path / "parts"
         self.trivy_parts = self.parts / mr.SCANNER_TRIVY
         self.trivy_parts.mkdir(parents=True)
+        self.osv_parts = self.parts / mr.SCANNER_OSV
         self.out = tmp_path / "out"
 
     def add_part(self, tid: str, fixture: str | None, **status: Any) -> None:
@@ -94,15 +98,42 @@ class Workspace:
             json.dumps(body), encoding="utf-8"
         )
 
-    def run(self, generated: str = GENERATED) -> int:
-        return mr.run_merge(self.targets_file, self.parts, self.out, generated)
+    def add_osv_part(self, tid: str, fixture: str | None, **status: Any) -> None:
+        """Add an OSV part: a fixture as osv/<id>.json and an ok status by default."""
+        self.osv_parts.mkdir(exist_ok=True)
+        if fixture:
+            shutil.copy(FIXTURES / f"{fixture}.json", self.osv_parts / f"{tid}.json")
+        body = {
+            "id": tid,
+            "status": "ok",
+            "reason": None,
+            "packages_queried": 5,
+            "packages_skipped": 0,
+        }
+        body.update(status)
+        (self.osv_parts / f"{tid}.status.json").write_text(
+            json.dumps(body), encoding="utf-8"
+        )
+
+    def run(self, generated: str = GENERATED, **kwargs: Any) -> int:
+        return mr.run_merge(
+            self.targets_file, self.parts, self.out, generated, **kwargs
+        )
 
     def json(self, rel: str) -> Any:
         return json.loads((self.out / rel).read_text(encoding="utf-8"))
 
+    def targets_of(self, scanner: str) -> dict[str, dict[str, Any]]:
+        targets = self.json("_report/scan_report.json")["targets"]
+        return {t["id"]: t for t in targets if t["scanner"] == scanner}
+
     @property
     def targets(self) -> dict[str, dict[str, Any]]:
-        return {t["id"]: t for t in self.json("_report/scan_report.json")["targets"]}
+        return self.targets_of(mr.SCANNER_TRIVY)
+
+    @property
+    def osv_targets(self) -> dict[str, dict[str, Any]]:
+        return self.targets_of(mr.SCANNER_OSV)
 
 
 @pytest.fixture
@@ -299,6 +330,7 @@ def test_totals_by_severity_and_exposure(full: Workspace) -> None:
         "packages_scanned",
         "locations_scanned",
         "findings",
+        "queried_at",
     ]
 
 
@@ -2419,7 +2451,12 @@ def test_failed_release_source_is_incomplete_but_does_not_hide_the_rest(
     ws = release_source_workspace(tmp_path, SOURCE, DEV, REL, image_pkg=True)
     doc = json.loads(ws.targets_file.read_text(encoding="utf-8"))
     doc["targets"].append(
-        {"status": "failed", "reason": "cannot resolve release tag 1.0.0", **failed}
+        {
+            "status": "failed",
+            "reason": "cannot resolve release tag 1.0.0",
+            "scanner": "trivy",
+            **failed,
+        }
     )
     ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
     assert ws.run() == 1
@@ -2456,3 +2493,638 @@ def test_source_only_action_when_the_default_branch_is_clear() -> None:
     targets = [SOURCE, RELEASE_SOURCE, DEV]
     assert not mr.found_in_default_source([other], targets)
     assert mr.found_in_default_source([other, both], targets)
+
+
+# ------------------------------------------------------------------------- OSV
+
+
+@pytest.fixture
+def with_osv(tmp_path: Path) -> Workspace:
+    """fs + two images (Trivy, all ok) and the OSV twin of the fs target (ok)."""
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV, REL, OSV_SOURCE))
+    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("app-development", "app-development")
+    ws.add_part("app-1.0.0", "app-1.0.0")
+    ws.add_osv_part("source-development", "osv-source")
+    return ws
+
+
+def trivy_only_twin(tmp_path: Path) -> Workspace:
+    """The `with_osv` run without its OSV target: the Trivy parts alone."""
+    (tmp_path / "trivy-only").mkdir()
+    ws = Workspace(tmp_path / "trivy-only", make_targets_doc(SOURCE, DEV, REL))
+    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("app-development", "app-development")
+    ws.add_part("app-1.0.0", "app-1.0.0")
+    return ws
+
+
+def osv_native(**changes: Any) -> dict[str, Any]:
+    native = json.loads((FIXTURES / "osv-source.json").read_text(encoding="utf-8"))
+    native.update(changes)
+    return native
+
+
+def write_osv_native(ws: Workspace, native: Any, tid: str = "source-development"):
+    ws.add_osv_part(tid, None)
+    (ws.osv_parts / f"{tid}.json").write_text(json.dumps(native), encoding="utf-8")
+
+
+def test_osv_target_entry_counts_queried_packages_and_findings(
+    with_osv: Workspace,
+) -> None:
+    assert with_osv.run() == 0
+    entry = with_osv.osv_targets["source-development"]
+    assert entry["scanner"] == "osv"
+    assert (entry["status"], entry["reason"]) == ("ok", None)
+    # 5 queried purls, one of them without a vulnerability; no locations in OSV
+    assert entry["packages_scanned"] == 5
+    assert entry["locations_scanned"] is None
+    # 5 distinct (purl, id) pairs. Severity: the database's own rating (MODERATE is
+    # MEDIUM), else the CVSS 3 vector of the record, else UNKNOWN. A fix is a
+    # "fixed" version event of an entry of this very package (GIT ranges and other
+    # packages of the advisory do not count)
+    assert entry["findings"] == {
+        "total": 5,
+        "fixable": 3,
+        "by_severity": {
+            "CRITICAL": 1,
+            "HIGH": 1,
+            "MEDIUM": 1,
+            "LOW": 1,
+            "UNKNOWN": 1,
+        },
+    }
+    assert entry["queried_at"] == "2030-01-01T00:10:00Z"
+    assert entry["image_digest"] is None
+    assert entry["commit_sha"] == SOURCE["commit_sha"]
+    assert entry["git_ref"] == "development"
+
+
+def test_target_entries_of_both_scanners_have_the_same_keys(
+    with_osv: Workspace,
+) -> None:
+    with_osv.run()
+    targets = with_osv.json("_report/scan_report.json")["targets"]
+    assert len({tuple(t) for t in targets}) == 1
+    assert [t["queried_at"] for t in targets if t["scanner"] == "trivy"] == [None] * 3
+
+
+def test_osv_api_url_comes_from_the_native(with_osv: Workspace) -> None:
+    with_osv.run()
+    assert with_osv.json("_report/scan_report.json")["osv"] == {
+        "api_url": "https://api.osv.dev"
+    }
+
+
+def test_osv_metadata_is_null_without_osv_targets(full: Workspace) -> None:
+    full.run()
+    assert full.json("_report/scan_report.json")["osv"] is None
+
+
+def test_osv_metadata_with_unknown_api_url(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    assert ws.run() == 1  # no part: failed, so no API URL either
+    assert ws.json("_report/scan_report.json")["osv"] == {"api_url": None}
+
+
+def test_osv_contributes_no_records(with_osv: Workspace) -> None:
+    with_osv.run()
+    records = with_osv.json("_report/vulnerabilities.json")["records"]
+    assert records
+    assert all(r["scanners"] == ["trivy"] for r in records)
+    assert all("osv" not in r["scan_targets"] for r in records)
+    assert not any(r["cve"].startswith(("GHSA", "PYSEC")) for r in records)
+
+
+def test_trivy_output_is_unchanged_by_osv_targets(
+    with_osv: Workspace, tmp_path: Path
+) -> None:
+    full = trivy_only_twin(tmp_path)
+    with_osv.run()
+    full.run()
+    assert with_osv.json("_report/vulnerabilities.json") == full.json(
+        "_report/vulnerabilities.json"
+    )
+    assert with_osv.targets == full.targets
+    keep = ("trivy_version", "trivy_db", "commit_sha", "run_id")
+    for key in keep:
+        assert (
+            with_osv.json("_report/scan_report.json")[key]
+            == full.json("_report/scan_report.json")[key]
+        )
+    # the findings sections of summary.md do not move either
+    with_osv_md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
+    full_md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert with_osv_md.split("<details>\n<summary>Scan coverage")[0].replace(
+        "3/3 targets scanned", "4/4 targets scanned"
+    ) == full_md.split("<details>\n<summary>Scan coverage")[0].replace(
+        "3/3 targets scanned", "4/4 targets scanned"
+    )
+
+
+def test_totals_count_osv_targets_but_findings_stay_trivy_records(
+    with_osv: Workspace, tmp_path: Path
+) -> None:
+    full = trivy_only_twin(tmp_path)
+    with_osv.run()
+    full.run()
+    totals = with_osv.json("_report/scan_report.json")["totals"]
+    reference = full.json("_report/scan_report.json")["totals"]
+    assert totals["targets"] == {
+        "total": 4,
+        "ok": 4,
+        "failed": 0,
+        "not_applicable": 0,
+    }
+    assert totals["findings"] == reference["findings"]
+
+
+def test_osv_natives_are_copied_next_to_the_trivy_ones(with_osv: Workspace) -> None:
+    with_osv.run()
+    native = with_osv.out / "_native"
+    assert sorted(p.name for p in native.iterdir()) == ["osv", "trivy"]
+    assert [p.name for p in (native / "osv").iterdir()] == ["source-development.json"]
+    assert (native / "osv" / "source-development.json").read_bytes() == (
+        FIXTURES / "osv-source.json"
+    ).read_bytes()
+    # the Trivy native of the same id is another file
+    assert (native / "trivy" / "source-development.json").read_bytes() == (
+        FIXTURES / "source.json"
+    ).read_bytes()
+
+
+def test_osv_target_without_a_part_is_failed(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    assert ws.targets["source-development"]["status"] == "ok"
+    entry = ws.osv_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "failed",
+        "scan job produced no result",
+    )
+    assert (entry["packages_scanned"], entry["findings"], entry["queried_at"]) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_a_trivy_part_does_not_satisfy_the_osv_target(tmp_path: Path) -> None:
+    # same id, but the part of the other scanner: identity is (scanner, id)
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    assert ws.osv_targets["source-development"]["status"] == "failed"
+
+
+def test_osv_status_failed_uses_its_reason_and_keeps_the_native_for_audit(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", "source")
+    ws.add_osv_part(
+        "source-development",
+        "osv-source",
+        status="failed",
+        reason="OSV API unavailable: HTTP 503",
+    )
+    assert ws.run() == 1
+    entry = ws.osv_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "failed",
+        "OSV API unavailable: HTTP 503",
+    )
+    assert entry["findings"] is None
+    assert (ws.out / "_native" / "osv" / "source-development.json").is_file()
+
+
+def test_osv_target_not_applicable_by_its_part_is_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", "source", status="failed", reason="boom")
+    ws.add_osv_part(
+        "source-development",
+        None,
+        status="not_applicable",
+        reason="trivy target failed",
+    )
+    assert ws.run() == 1  # only the Trivy target failed
+    assert ws.targets["source-development"]["status"] == "failed"
+    entry = ws.osv_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "not_applicable",
+        "trivy target failed",
+    )
+    assert entry["findings"] is None
+    assert entry["packages_scanned"] is None
+
+
+def test_osv_target_not_applicable_in_targets_file_is_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    # The resolve step marks the twin of a Trivy target it could not resolve itself
+    doc = make_targets_doc(
+        SOURCE,
+        {**OSV_SOURCE, "status": "not_applicable", "reason": "trivy target failed"},
+    )
+    ws = Workspace(tmp_path, doc)
+    ws.add_part("source-development", "source")
+    assert ws.run() == 0
+    entry = ws.osv_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "not_applicable",
+        "trivy target failed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        (
+            {"schema_version": 2},
+            "osv result has an unsupported schema_version: 2",
+        ),
+        (
+            {"schema_version": None},
+            "osv result has an unsupported schema_version: None",
+        ),
+        ({"packages": []}, "osv result has no packages or vulnerabilities"),
+        ({"vulnerabilities": None}, "osv result has no packages or vulnerabilities"),
+        ({"packages": {"pkg:npm/a@1": "oops"}}, "osv result has a malformed package"),
+        (
+            {"packages": {"pkg:npm/a@1": ["GHSA-unknown"]}},
+            "osv result has no record of GHSA-unknown",
+        ),
+    ],
+)
+def test_osv_result_that_is_incomplete_is_failed(
+    tmp_path: Path, changes: dict[str, Any], reason: str
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    write_osv_native(ws, osv_native(**changes))
+    assert ws.run() == 1
+    assert ws.osv_targets["source-development"]["reason"].startswith(reason)
+
+
+def test_osv_status_ok_with_invalid_json_is_failed(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    write_osv_native(ws, None)
+    (ws.osv_parts / "source-development.json").write_text("{", encoding="utf-8")
+    assert ws.run() == 1
+    assert ws.osv_targets["source-development"]["reason"].startswith(
+        "osv result is not valid JSON"
+    )
+
+
+def test_osv_clean_result_is_ok_with_zero_findings(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    write_osv_native(
+        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
+    )
+    assert ws.run() == 0
+    entry = ws.osv_targets["source-development"]
+    assert entry["status"] == "ok"
+    assert entry["findings"]["total"] == 0
+    assert entry["packages_scanned"] == 1
+
+
+def test_osv_target_with_no_queried_packages_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
+    write_osv_native(ws, osv_native(packages={}, vulnerabilities={}))
+    assert ws.run() == 0
+    assert ws.osv_targets["source-development"]["packages_scanned"] == 0
+    assert "::warning title=No packages in scan result::source-development (osv)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_failed_osv_target_makes_the_summary_incomplete_and_is_annotated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "> **Incomplete: 1 target(s) failed** — source-development (osv) "
+        "(their findings are missing)" in md
+    )
+    out = capsys.readouterr().out
+    assert (
+        "::error title=Scan target failed::source-development (osv): "
+        "scan job produced no result" in out
+    )
+
+
+def test_failed_trivy_target_is_annotated_with_its_scanner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE))
+    assert ws.run() == 1
+    assert (
+        "::error title=Scan target failed::source-development (trivy): "
+        "scan job produced no result" in capsys.readouterr().out
+    )
+
+
+def test_summary_coverage_has_a_scanner_column_and_osv_rows(
+    with_osv: Workspace,
+) -> None:
+    with_osv.run()
+    md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
+    assert "| Target | Scanner | Status | Packages | C | H | M | L | Note |" in md
+    assert "| source @ development fedcba9 | trivy | ok | 0 | 1 | 1 | 1 | 0 | - |" in md
+    assert "| source @ development fedcba9 | osv | ok | 5 | 1 | 1 | 1 | 1 | - |" in md
+
+
+def test_summary_coverage_is_as_before_without_osv(full: Workspace) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "| Target | Status | Packages | C | H | M | L | Note |" in md
+    assert "Scanner" not in md
+    assert "OSV" not in md
+
+
+def test_summary_footer_has_the_osv_scope_and_the_no_merge_note(
+    with_osv: Workspace,
+) -> None:
+    with_osv.run()
+    md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
+    assert md.rstrip().endswith("</sub>")
+    footer = md.rstrip().splitlines()[-1]
+    assert footer == (
+        "<sub>OSV: language packages only; findings counted, "
+        "not yet merged into the findings above</sub>"
+    )
+
+
+def test_summary_headline_without_trivy_scan_but_with_an_osv_one(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_osv_part("source-development", "osv-source")
+    assert ws.run() == 1  # the Trivy part is missing
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No Trivy target was scanned" in md
+
+
+def test_summary_without_any_scanned_target_is_unchanged(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    assert ws.run() == 2
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No target was scanned" in md
+
+
+def test_osv_target_does_not_change_the_no_findings_headline(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps({"Results": []}), encoding="utf-8"
+    )
+    ws.add_osv_part("source-development", "osv-source")
+    assert ws.run() == 0
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No known vulnerabilities · 0 packages in 1 targets" in md
+
+
+def test_targets_file_identity_is_scanner_and_id(tmp_path: Path) -> None:
+    # the same id for two scanners is fine
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
+    mr.load_targets_file(ws.targets_file)
+    # twice for one scanner is not
+    doc = make_targets_doc(OSV_SOURCE, OSV_SOURCE)
+    ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(mr.InputError, match="duplicate osv target id"):
+        mr.load_targets_file(ws.targets_file)
+
+
+@pytest.mark.parametrize("scanner", [None, "", "snyk", "ort"])
+def test_targets_file_needs_a_known_scanner(
+    tmp_path: Path, scanner: str | None
+) -> None:
+    doc = make_targets_doc({**SOURCE, "scanner": scanner})
+    path = tmp_path / "targets.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(mr.InputError, match="invalid scanner"):
+        mr.load_targets_file(path)
+
+
+# ---- OSV: severity, fixes, findings
+
+
+def test_osv_severity_prefers_the_database_rating_and_maps_moderate() -> None:
+    def severity(rating: str) -> str:
+        return mr.osv_severity({"database_specific": {"severity": rating}})
+
+    assert [
+        severity(v)
+        for v in ("MODERATE", "moderate", "MEDIUM", "HIGH", "CRITICAL", "LOW")
+    ] == ["MEDIUM", "MEDIUM", "MEDIUM", "HIGH", "CRITICAL", "LOW"]
+    # the database rating wins over the vectors
+    record = {
+        "database_specific": {"severity": "LOW"},
+        "severity": [
+            {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}
+        ],
+    }
+    assert mr.osv_severity(record) == "LOW"
+
+
+def test_osv_severity_falls_back_to_the_highest_cvss3_vector() -> None:
+    record = {
+        "severity": [
+            {
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L",
+            },
+            {
+                "type": "CVSS_V3",
+                "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            },
+        ]
+    }
+    assert mr.osv_severity(record) == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {},
+        {"database_specific": {"severity": "BOGUS"}},
+        {"database_specific": {"severity": 7}},
+        {"database_specific": None},
+        {"severity": []},
+        {"severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N"}]},
+        {"severity": [{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"}]},
+        {"severity": [{"type": "CVSS_V3", "score": "not a vector"}]},
+        {"severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N"}]},
+        {"severity": [{"type": "CVSS_V3", "score": 9.8}]},
+        {
+            "severity": [
+                {
+                    "type": "CVSS_V3",
+                    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+                }
+            ]
+        },
+    ],
+)
+def test_osv_severity_is_unknown_without_a_usable_rating(record: dict) -> None:
+    assert mr.osv_severity(record) == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    ("vector", "score", "rating"),
+    [
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8, "CRITICAL"),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0, "CRITICAL"),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", 7.5, "HIGH"),
+        ("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H", 9.9, "CRITICAL"),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "MEDIUM"),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "MEDIUM"),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", 5.3, "MEDIUM"),
+        ("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 1.8, "LOW"),
+        ("CVSS:3.0/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N", 5.5, "MEDIUM"),
+        ("CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 6.8, "MEDIUM"),
+    ],
+)
+def test_cvss3_base_score_and_rating(vector: str, score: float, rating: str) -> None:
+    assert mr.cvss3_base_score(vector) == score
+    assert mr.cvss3_rating(score) == rating
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        "",
+        "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H",
+        "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    ],
+)
+def test_cvss3_base_score_rejects_other_or_malformed_vectors(vector: str) -> None:
+    assert mr.cvss3_base_score(vector) is None
+
+
+def test_cvss3_score_zero_has_no_rating() -> None:
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N"
+    assert mr.cvss3_base_score(vector) == 0.0
+    assert mr.cvss3_rating(0.0) == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    ("purl", "expected"),
+    [
+        ("pkg:npm/lodash@4.17.0", ("npm", "", "lodash")),
+        ("pkg:npm/%40babel/traverse@7.20.0", ("npm", "@babel", "traverse")),
+        ("pkg:pypi/Requests@2.0.0", ("pypi", "", "Requests")),
+        (
+            "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1?type=jar",
+            ("maven", "org.apache.logging.log4j", "log4j-core"),
+        ),
+        ("pkg:golang/github.com/a/b@v1#sub/path", ("golang", "github.com/a", "b")),
+        ("pkg:NPM/x", ("npm", "", "x")),
+        ("lodash@1", None),
+        ("pkg:npm", None),
+        ("pkg:npm//x", None),
+    ],
+)
+def test_parse_purl(purl: str, expected: tuple[str, str, str] | None) -> None:
+    assert mr.parse_purl(purl) == expected
+
+
+@pytest.mark.parametrize(
+    ("purl", "identity"),
+    [
+        ("pkg:npm/%40babel/traverse@7.20.0", ("npm", "@babel/traverse")),
+        ("pkg:pypi/Foo_Bar.baz@1", ("PyPI", "foo-bar-baz")),
+        ("pkg:maven/org.example/lib@1", ("Maven", "org.example:lib")),
+        ("pkg:golang/github.com/a/b@v1", ("Go", "github.com/a/b")),
+        ("pkg:apk/alpine/zlib@1.3.2-r0", None),
+        ("not a purl", None),
+    ],
+)
+def test_purl_identity_is_the_osv_package(
+    purl: str, identity: tuple[str, str] | None
+) -> None:
+    assert mr.purl_identity(purl) == identity
+
+
+def _affected(ecosystem: str, name: str, *events: dict, kind: str = "ECOSYSTEM"):
+    return {
+        "package": {"ecosystem": ecosystem, "name": name},
+        "ranges": [{"type": kind, "events": [{"introduced": "0"}, *events]}],
+    }
+
+
+def test_osv_has_fix_needs_a_fixed_event_of_this_package() -> None:
+    record = {
+        "affected": [
+            _affected("PyPI", "requests", {"fixed": "2.31.0"}),
+            _affected("PyPI", "other", {"last_affected": "1.0"}),
+        ]
+    }
+    assert mr.osv_has_fix(record, "pkg:pypi/Requests@2.0.0")
+    assert not mr.osv_has_fix(record, "pkg:pypi/other@1.0")
+    assert not mr.osv_has_fix(record, "pkg:pypi/unlisted@1.0")
+
+
+def test_osv_has_fix_ignores_git_ranges_and_unknown_purls() -> None:
+    record = {"affected": [_affected("npm", "a", {"fixed": "abc123"}, kind="GIT")]}
+    assert not mr.osv_has_fix(record, "pkg:npm/a@1")
+    record = {"affected": [_affected("npm", "a", {"fixed": "1.2.3"}, kind="SEMVER")]}
+    assert mr.osv_has_fix(record, "pkg:npm/a@1")
+    assert not mr.osv_has_fix(record, "pkg:apk/alpine/a@1")
+    assert not mr.osv_has_fix({}, "pkg:npm/a@1")
+
+
+def test_osv_has_fix_matches_by_purl_or_by_ecosystem_with_a_suffix() -> None:
+    by_purl = {
+        "affected": [
+            {
+                "package": {"purl": "pkg:maven/org.example/lib"},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"fixed": "2.0"}]}],
+            }
+        ]
+    }
+    assert mr.osv_has_fix(by_purl, "pkg:maven/org.example/lib@1.0")
+    suffixed = {
+        "affected": [_affected("Maven:https://repo", "org.example:lib", {"fixed": "2"})]
+    }
+    assert mr.osv_has_fix(suffixed, "pkg:maven/org.example/lib@1.0")
+    broken = {"affected": [{"package": {"ecosystem": "npm"}}, {"ranges": []}]}
+    assert not mr.osv_has_fix(broken, "pkg:npm/a@1")
+
+
+def test_osv_findings_are_distinct_by_purl_and_vulnerability() -> None:
+    found = mr.osv_findings(osv_native())
+    assert sorted(found) == [
+        ("pkg:maven/org.example/lib@1.0", "GHSA-dddd-dddd-0001"),
+        ("pkg:npm/%40scope/pkg@1.0.0", "GHSA-bbbb-bbbb-0001"),
+        ("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0001"),
+        ("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0002"),
+        ("pkg:pypi/Requests@2.0.0", "PYSEC-2030-1"),
+    ]
+    assert found[("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0001")] == ("CRITICAL", True)
+    assert found[("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0002")] == ("LOW", False)
+    assert found[("pkg:npm/%40scope/pkg@1.0.0", "GHSA-bbbb-bbbb-0001")] == (
+        "HIGH",
+        True,
+    )
+    assert found[("pkg:pypi/Requests@2.0.0", "PYSEC-2030-1")] == ("UNKNOWN", True)
+    assert found[("pkg:maven/org.example/lib@1.0", "GHSA-dddd-dddd-0001")] == (
+        "MEDIUM",
+        False,
+    )
+
+
+def test_osv_findings_count_a_repeated_id_once() -> None:
+    native = osv_native()
+    native["packages"]["pkg:npm/lodash@4.17.0"] = ["GHSA-aaaa-aaaa-0001"] * 2
+    assert len(mr.osv_findings(native)) == 4

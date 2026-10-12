@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "queried_at": "2030-01-01T00:10:00Z",
+  "api_url": "https://api.osv.dev",
+  "packages": {
+    "pkg:npm/lodash@4.17.0": ["GHSA-aaaa-aaaa-0001", "GHSA-aaaa-aaaa-0002"],
+    "pkg:npm/%40scope/pkg@1.0.0": ["GHSA-bbbb-bbbb-0001"],
+    "pkg:pypi/Requests@2.0.0": ["PYSEC-2030-1"],
+    "pkg:maven/org.example/lib@1.0": ["GHSA-dddd-dddd-0001"],
+    "pkg:npm/clean@1.0.0": []
+  },
+  "vulnerabilities": {
+    "GHSA-aaaa-aaaa-0001": {
+      "id": "GHSA-aaaa-aaaa-0001",
+      "aliases": ["CVE-2030-0001"],
+      "database_specific": {"severity": "CRITICAL"},
+      "affected": [
+        {
+          "package": {"ecosystem": "npm", "name": "lodash"},
+          "ranges": [
+            {
+              "type": "SEMVER",
+              "events": [{"introduced": "0"}, {"fixed": "4.17.21"}]
+            }
+          ]
+        }
+      ]
+    },
+    "GHSA-aaaa-aaaa-0002": {
+      "id": "GHSA-aaaa-aaaa-0002",
+      "aliases": ["CVE-2030-0002"],
+      "database_specific": {"severity": "LOW"},
+      "affected": [
+        {
+          "package": {"ecosystem": "npm", "name": "lodash"},
+          "ranges": [
+            {
+              "type": "SEMVER",
+              "events": [{"introduced": "0"}, {"last_affected": "4.17.20"}]
+            }
+          ]
+        }
+      ]
+    },
+    "GHSA-bbbb-bbbb-0001": {
+      "id": "GHSA-bbbb-bbbb-0001",
+      "aliases": ["CVE-2030-0003"],
+      "severity": [
+        {
+          "type": "CVSS_V3",
+          "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+        }
+      ],
+      "affected": [
+        {
+          "package": {"ecosystem": "npm", "name": "@scope/pkg"},
+          "ranges": [
+            {
+              "type": "SEMVER",
+              "events": [{"introduced": "0"}, {"fixed": "1.0.1"}]
+            }
+          ]
+        }
+      ]
+    },
+    "PYSEC-2030-1": {
+      "id": "PYSEC-2030-1",
+      "aliases": ["CVE-2030-0004"],
+      "affected": [
+        {
+          "package": {"ecosystem": "PyPI", "name": "requests"},
+          "ranges": [
+            {
+              "type": "ECOSYSTEM",
+              "events": [{"introduced": "0"}, {"fixed": "2.31.0"}]
+            }
+          ]
+        }
+      ]
+    },
+    "GHSA-dddd-dddd-0001": {
+      "id": "GHSA-dddd-dddd-0001",
+      "aliases": ["CVE-2030-0005"],
+      "database_specific": {"severity": "MODERATE"},
+      "affected": [
+        {
+          "package": {"ecosystem": "Maven", "name": "org.example:lib"},
+          "ranges": [
+            {
+              "type": "GIT",
+              "repo": "https://example.invalid/lib.git",
+              "events": [{"introduced": "0"}, {"fixed": "0123456789abcdef"}]
+            }
+          ]
+        },
+        {
+          "package": {"ecosystem": "Maven", "name": "org.example:other"},
+          "ranges": [
+            {
+              "type": "ECOSYSTEM",
+              "events": [{"introduced": "0"}, {"fixed": "2.0"}]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

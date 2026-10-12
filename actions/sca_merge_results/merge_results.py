@@ -3,11 +3,11 @@
 
 Inputs:
   * targets.json written by sca_resolve_targets (the list of targets);
-  * a parts directory with one subdirectory per scanner (``trivy/``) holding,
-    per scanned target id, ``<id>.json`` (native JSON), ``<id>.status.json``,
-    an optional ``<id>.txt`` (table) and, for a Gradle build, ``<id>.gradle-graph/``
-    (the resolved dependency graph, one JSON file per Gradle project, written by
-    the generate_gradle_lockfiles action).
+  * a parts directory with one subdirectory per scanner (``trivy/``, ``osv/``)
+    holding, per scanned target id, ``<id>.json`` (native JSON),
+    ``<id>.status.json``, an optional ``<id>.txt`` (table) and, for a Trivy Gradle
+    build, ``<id>.gradle-graph/`` (the resolved dependency graph, one JSON file per
+    Gradle project, written by the generate_gradle_lockfiles action).
 
 Outputs (in the output directory):
   * ``_report/vulnerabilities.json`` - the findings only: canonical deduplicated
@@ -22,8 +22,11 @@ Outputs (in the output directory):
   * ``_native/<scanner>/<id>.json|txt`` - the unmodified per-target results
     (audit).
 
-Trivy is the only scanner today; the report schema names the scanner wherever
-another one could contribute (``scanners``, ``scanner``, ``_native/<scanner>/``).
+A target is identified by its scanner and its id (the id names the scanned
+subject, which several scanners share). Trivy is the only scanner whose findings
+are merged into the records. OSV, queried for the language packages of every Trivy
+target, is reported per target - status, package and finding counts, native
+result - but contributes no records yet.
 
 A Gradle lockfile has no dependency graph, so the packages of a trivy ``gradle``
 Result carry neither ``Relationship`` nor ``DependsOn``. They are filled in from
@@ -51,11 +54,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import posixpath
 import re
 import shutil
 import sys
+import urllib.parse
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -83,6 +88,8 @@ STATUS_FAILED = "failed"
 STATUS_NOT_APPLICABLE = "not_applicable"
 
 SCANNER_TRIVY = "trivy"
+SCANNER_OSV = "osv"
+SCANNERS = (SCANNER_TRIVY, SCANNER_OSV)
 
 KIND_FS = "fs"
 KIND_IMAGE = "image"
@@ -185,14 +192,21 @@ def load_targets_file(path: Path) -> dict[str, Any]:
         raise InputError(f"cannot read targets file {path}: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("targets"), list):
         raise InputError(f"targets file {path} has no 'targets' list")
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for target in data["targets"]:
         tid = target.get("id") if isinstance(target, dict) else None
         if not isinstance(tid, str) or not TARGET_ID_RE.fullmatch(tid):
             raise InputError(f"targets file {path} has an invalid target id: {tid!r}")
-        if tid in seen:
-            raise InputError(f"targets file {path} has a duplicate target id: {tid}")
-        seen.add(tid)
+        scanner = target.get("scanner")
+        if scanner not in SCANNERS:
+            raise InputError(
+                f"targets file {path} has an invalid scanner of {tid}: {scanner!r}"
+            )
+        if (scanner, tid) in seen:
+            raise InputError(
+                f"targets file {path} has a duplicate {scanner} target id: {tid}"
+            )
+        seen.add((scanner, tid))
     return data
 
 
@@ -202,11 +216,12 @@ def load_target_result(
     """Determine the final status of one target.
 
     Returns ``(state, native)``: state carries ``status`` and ``reason``; native
-    is the parsed trivy result for ``ok`` targets, else None. Anything short of
-    a complete, valid result is ``failed`` - a broken scan must not look like a
-    clean target.
+    is the parsed native result of the target's scanner for ``ok`` targets, else
+    None. Anything short of a complete, valid result is ``failed`` - a broken scan
+    must not look like a clean target.
     """
     tid = target["id"]
+    scanner = target["scanner"]
     state: dict[str, Any] = {
         "status": target.get("status"),
         "reason": target.get("reason"),
@@ -230,18 +245,27 @@ def load_target_result(
 
     if status.get("status") == STATUS_FAILED:
         return failed(status.get("reason") or "scan job reported failure")
+    if status.get("status") == STATUS_NOT_APPLICABLE:
+        # The job found nothing to scan (an OSV target whose Trivy target failed)
+        state.update(
+            status=STATUS_NOT_APPLICABLE,
+            reason=status.get("reason") or "nothing to scan",
+        )
+        return state, None
     if status.get("status") != STATUS_OK:
         return failed(f"unexpected scan status: {status.get('status')!r}")
 
     native_path = scanner_parts_dir / f"{tid}.json"
     if not native_path.is_file():
-        return failed("trivy result file is missing")
+        return failed(f"{scanner} result file is missing")
     try:
         native = read_json(native_path)
     except (OSError, ValueError) as e:
-        return failed(f"trivy result is not valid JSON: {e}")
+        return failed(f"{scanner} result is not valid JSON: {e}")
     if not isinstance(native, dict):
-        return failed("trivy result is not a JSON object")
+        return failed(f"{scanner} result is not a JSON object")
+    if scanner == SCANNER_OSV and (problem := osv_result_problem(native)):
+        return failed(problem)
 
     state.update(status=STATUS_OK, reason=None)
     return state, native
@@ -994,6 +1018,195 @@ def merge_records(
     return list(by_key.values()), by_record
 
 
+# ---- OSV: reported per target, not merged into the records yet
+
+OSV_NATIVE_SCHEMA_VERSION = 1
+OSV_FOOTER = (
+    "OSV: language packages only; findings counted, not yet merged into the "
+    "findings above"
+)
+# CVSS 3.x qualitative rating: lower bound of the base score -> severity
+CVSS3_RATINGS = ((9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM"), (0.1, "LOW"))
+CVSS3_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+# Privileges required depend on the scope: (unchanged, changed)
+CVSS3_PRIVILEGES = {"N": (0.85, 0.85), "L": (0.62, 0.68), "H": (0.27, 0.5)}
+# purl type -> (OSV ecosystem, separator of namespace and name in the OSV name)
+PURL_ECOSYSTEMS = {
+    "npm": ("npm", "/"),
+    "pypi": ("PyPI", "/"),
+    "maven": ("Maven", ":"),
+    "golang": ("Go", "/"),
+    "cargo": ("crates.io", "/"),
+    "nuget": ("NuGet", "/"),
+    "gem": ("RubyGems", "/"),
+    "composer": ("Packagist", "/"),
+}
+# Ecosystems whose package names are case-insensitive (PEP 503 normalization)
+CASE_INSENSITIVE_ECOSYSTEMS = ("PyPI", "NuGet")
+# Version ranges whose "fixed" events are versions (GIT ranges name commits)
+OSV_VERSION_RANGE_TYPES = ("ECOSYSTEM", "SEMVER")
+
+
+def osv_result_problem(native: Mapping[str, Any]) -> str | None:
+    """Why an OSV result cannot be counted (it is incomplete), else None."""
+    if native.get("schema_version") != OSV_NATIVE_SCHEMA_VERSION:
+        version = native.get("schema_version")
+        return f"osv result has an unsupported schema_version: {version!r}"
+    packages = native.get("packages")
+    records = native.get("vulnerabilities")
+    if not isinstance(packages, dict) or not isinstance(records, dict):
+        return "osv result has no packages or vulnerabilities"
+    for vuln_ids in packages.values():
+        if not isinstance(vuln_ids, list):
+            return "osv result has a malformed package entry"
+        for vuln_id in vuln_ids:
+            if not isinstance(records.get(vuln_id), dict):
+                return f"osv result has no record of {vuln_id}"
+    return None
+
+
+def parse_purl(purl: str) -> tuple[str, str, str] | None:
+    """``(type, namespace, name)`` of a purl, percent-decoded; None if malformed."""
+    if not purl.startswith("pkg:"):
+        return None
+    body = purl[len("pkg:") :].split("#", 1)[0].split("?", 1)[0].split("@", 1)[0]
+    parts = body.split("/")
+    if len(parts) < 2 or not all(parts):
+        return None
+    namespace = "/".join(urllib.parse.unquote(part) for part in parts[1:-1])
+    return parts[0].lower(), namespace, urllib.parse.unquote(parts[-1])
+
+
+def osv_identity(ecosystem: str, name: str) -> tuple[str, str]:
+    """``(ecosystem, name)`` in the form OSV package references are compared in."""
+    if ecosystem in CASE_INSENSITIVE_ECOSYSTEMS:
+        name = _PEP503_SEPARATORS_RE.sub("-", name).lower()
+    return ecosystem, name
+
+
+def purl_identity(purl: str) -> tuple[str, str] | None:
+    """The OSV package of a purl; None for a malformed purl or an unknown purl type."""
+    parsed = parse_purl(purl)
+    known = PURL_ECOSYSTEMS.get(parsed[0]) if parsed else None
+    if parsed is None or known is None:
+        return None
+    ecosystem, separator = known
+    _, namespace, name = parsed
+    return osv_identity(ecosystem, separator.join(p for p in (namespace, name) if p))
+
+
+def affected_identity(affected: Mapping[str, Any]) -> tuple[str, str] | None:
+    """The package of an OSV ``affected`` entry, by its purl or ecosystem and name."""
+    package = affected.get("package") or {}
+    purl = package.get("purl")
+    if isinstance(purl, str) and (identity := purl_identity(purl)):
+        return identity
+    ecosystem, name = package.get("ecosystem"), package.get("name")
+    if not isinstance(ecosystem, str) or not isinstance(name, str):
+        return None
+    # An ecosystem may carry a suffix ("Alpine:v3.15")
+    return osv_identity(ecosystem.split(":", 1)[0], name)
+
+
+def osv_has_fix(record: Mapping[str, Any], purl: str) -> bool:
+    """Whether the advisory names a fixed version of the package of ``purl``.
+
+    Only entries of this very package count (an advisory often covers several
+    packages) and only version ranges (``GIT`` ranges name commits).
+    """
+    identity = purl_identity(purl)
+    return identity is not None and any(
+        "fixed" in event
+        for affected in record.get("affected") or []
+        if affected_identity(affected) == identity
+        for version_range in affected.get("ranges") or []
+        if version_range.get("type") in OSV_VERSION_RANGE_TYPES
+        for event in version_range.get("events") or []
+    )
+
+
+def cvss3_roundup(value: float) -> float:
+    """Round up to one decimal as CVSS 3.1 specifies (immune to float noise)."""
+    scaled = round(value * 100_000)
+    if scaled % 10_000 == 0:
+        return scaled / 100_000
+    return (scaled // 10_000 + 1) / 10.0
+
+
+def cvss3_base_score(vector: str) -> float | None:
+    """The base score of a CVSS 3.x vector string; None if it is not a valid one."""
+    version, *parts = vector.split("/")
+    if version not in ("CVSS:3.0", "CVSS:3.1"):
+        return None
+    metrics = dict(part.split(":", 1) for part in parts if ":" in part)
+    try:
+        changed = {"U": False, "C": True}[metrics["S"]]
+        privileges = CVSS3_PRIVILEGES[metrics["PR"]][changed]
+        exploitability_weights = [
+            CVSS3_WEIGHTS[k][metrics[k]] for k in ("AV", "AC", "UI")
+        ]
+        impact_weights = [CVSS3_WEIGHTS[k][metrics[k]] for k in ("C", "I", "A")]
+    except KeyError:
+        return None
+    iss = 1 - math.prod(1 - weight for weight in impact_weights)
+    if changed:
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+    else:
+        impact = 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    exploitability = 8.22 * math.prod(exploitability_weights) * privileges
+    return cvss3_roundup(min((1.08 if changed else 1) * (impact + exploitability), 10))
+
+
+def cvss3_rating(score: float) -> str:
+    return next(
+        (rating for bound, rating in CVSS3_RATINGS if score >= bound), UNKNOWN_SEVERITY
+    )
+
+
+def osv_severity(record: Mapping[str, Any]) -> str:
+    """The severity of an OSV record as one of the Trivy levels.
+
+    The database's own rating wins (``database_specific.severity`` of GHSA records,
+    where ``MODERATE`` is ``MEDIUM``); otherwise the highest rating of the CVSS 3.x
+    vectors in ``severity[]``. CVSS 2 and 4 vectors are not rated, so a record that
+    has nothing else is UNKNOWN.
+    """
+    own = (record.get("database_specific") or {}).get("severity")
+    if isinstance(own, str):
+        own = {"MODERATE": "MEDIUM"}.get(own.upper(), own.upper())
+        if own in SEV_ORDER:
+            return own
+    ratings = [
+        cvss3_rating(score)
+        for entry in record.get("severity") or []
+        if isinstance(entry.get("score"), str)
+        and (score := cvss3_base_score(entry["score"])) is not None
+    ]
+    return min(ratings, key=SEV_ORDER.__getitem__, default=UNKNOWN_SEVERITY)
+
+
+def osv_findings(native: Mapping[str, Any]) -> dict[tuple[str, str], tuple[str, bool]]:
+    """Unique findings of one OSV target: (purl, OSV id) -> (severity, fixable)."""
+    records = native["vulnerabilities"]
+    return {
+        (purl, vuln_id): (
+            osv_severity(records[vuln_id]),
+            osv_has_fix(records[vuln_id], purl),
+        )
+        for purl, vuln_ids in native["packages"].items()
+        for vuln_id in set(vuln_ids)
+    }
+
+
 # ---- Exposure
 
 
@@ -1145,7 +1358,7 @@ def build_target_entry(
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "id": target["id"],
-        "scanner": SCANNER_TRIVY,
+        "scanner": target["scanner"],
         "kind": target.get("kind"),
         "image": target.get("image"),
         "tag": target.get("tag"),
@@ -1158,8 +1371,15 @@ def build_target_entry(
         "packages_scanned": None,
         "locations_scanned": None,
         "findings": None,
+        "queried_at": None,
     }
-    if native is not None:
+    if native is None:
+        return entry
+    if target["scanner"] == SCANNER_OSV:
+        entry["packages_scanned"] = len(native["packages"])
+        entry["findings"] = finding_stats(osv_findings(native).values())
+        entry["queried_at"] = native.get("queried_at")
+    else:
         entry.update(count_packages(native))
         entry["findings"] = finding_stats(target_findings(native).values())
         if target.get("kind") == KIND_IMAGE:
@@ -1196,18 +1416,26 @@ def build_scan_report(
     trivy_db: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
+    osv_api_url = None
     targets: list[dict[str, Any]] = []
     for target, state, native in results:
         entry = build_target_entry(target, state, native)
         if native is not None:
             if entry["packages_scanned"] == 0:
                 print(
-                    f"::warning title=No packages in scan result::{target['id']}: "
+                    "::warning title=No packages in scan result::"
+                    f"{target_name(target)}: "
                     "0 packages were seen (an empty scan is suspicious: no lockfiles, "
                     "an unsupported ecosystem or a missing package list)"
                 )
-            trivy_version = trivy_version or (native.get("Trivy") or {}).get("Version")
+            if target["scanner"] == SCANNER_OSV:
+                osv_api_url = osv_api_url or native.get("api_url")
+            else:
+                trivy_version = trivy_version or (native.get("Trivy") or {}).get(
+                    "Version"
+                )
         targets.append(entry)
+    has_osv = any(t["scanner"] == SCANNER_OSV for t in targets)
     return {
         "schema_version": SCHEMA_VERSION,
         "repo": targets_doc.get("repo"),
@@ -1219,6 +1447,7 @@ def build_scan_report(
         "generated_utc": generated_utc,
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
+        "osv": {"api_url": osv_api_url} if has_osv else None,
         "totals": build_totals(targets, records),
         "targets": targets,
     }
@@ -1338,6 +1567,18 @@ def has_several_images(targets: Iterable[Mapping[str, Any]]) -> bool:
     return len({t.get("image") for t in targets if t.get("kind") == KIND_IMAGE}) > 1
 
 
+def target_name(target: Mapping[str, Any]) -> str:
+    """The id of a target, qualified by the scanner unless it is Trivy."""
+    if target["scanner"] == SCANNER_TRIVY:
+        return target["id"]
+    return f"{target['id']} ({target['scanner']})"
+
+
+def trivy_targets(targets: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The targets whose findings are in the records."""
+    return [t for t in targets if t["scanner"] == SCANNER_TRIVY]
+
+
 def target_label(target: Mapping[str, Any], several_images: bool) -> str:
     """Short name: ``source @ development 3d0c8a3``, ``source @ 1.0 3d0c8a3``,
     ``image :1.0``, ``app :1.0``.
@@ -1432,7 +1673,9 @@ def totals_line(report: Mapping[str, Any]) -> str:
 
 
 def no_findings_line(report: Mapping[str, Any]) -> str:
-    ok_targets = [t for t in report["targets"] if t["status"] == STATUS_OK]
+    ok_targets = [
+        t for t in trivy_targets(report["targets"]) if t["status"] == STATUS_OK
+    ]
     packages = sum(t["packages_scanned"] or 0 for t in ok_targets)
     return (
         f"No known vulnerabilities · {packages} packages in {len(ok_targets)} targets"
@@ -1443,15 +1686,19 @@ def headline_lines(report: Mapping[str, Any], records: Sequence[Record]) -> list
     """One line per group: failures, each released tag, development, totals."""
     targets = report["targets"]
     lines: list[str] = []
-    failed = [t["id"] for t in targets if t["status"] == STATUS_FAILED]
+    failed = [target_name(t) for t in targets if t["status"] == STATUS_FAILED]
     if failed:
         lines.append(
             f"**Incomplete: {len(failed)} target(s) failed** — {', '.join(failed)} "
             "(their findings are missing)"
         )
-    ok = [t for t in targets if t["status"] == STATUS_OK]
+    ok = [t for t in trivy_targets(targets) if t["status"] == STATUS_OK]
     if not ok:
-        return [*lines, "No target was scanned"]
+        scanned = any(t["status"] == STATUS_OK for t in targets)
+        return [
+            *lines,
+            "No Trivy target was scanned" if scanned else "No target was scanned",
+        ]
     if not records:
         return [*lines, no_findings_line(report)]
 
@@ -1903,9 +2150,12 @@ def severity_cells(findings: Mapping[str, Any] | None) -> list[Any]:
 
 def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     several = has_several_images(targets)
+    # Only a run with another scanner needs the column: Trivy-only reports stay as is
+    with_scanner = any(t["scanner"] != SCANNER_TRIVY for t in targets)
     rows = (
         [
             target_label(t, several),
+            *([t["scanner"]] if with_scanner else []),
             t["status"],
             t["packages_scanned"],
             *severity_cells(t["findings"]),
@@ -1913,8 +2163,19 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
         ]
         for t in targets
     )
-    header = ["Target", "Status", "Packages", "C", "H", "M", "L", "Note"]
-    body = md_table(header, rows, right=(2, 3, 4, 5, 6))
+    header = [
+        "Target",
+        *(["Scanner"] if with_scanner else []),
+        "Status",
+        "Packages",
+        "C",
+        "H",
+        "M",
+        "L",
+        "Note",
+    ]
+    first_number = 3 if with_scanner else 2
+    body = md_table(header, rows, right=range(first_number, first_number + 5))
     return ["", *md_details("Scan coverage", body)]
 
 
@@ -1940,7 +2201,10 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
     generated = format_timestamp(report["generated_utc"])
     if generated:
         parts.append(f"generated {generated}")
-    return ["", f"<sub>{' · '.join(parts)}</sub>"]
+    lines = ["", f"<sub>{' · '.join(parts)}</sub>"]
+    if report.get("osv"):
+        lines += ["", f"<sub>{OSV_FOOTER}</sub>"]
+    return lines
 
 
 def build_summary_md(
@@ -1948,13 +2212,15 @@ def build_summary_md(
 ) -> str:
     records = vulns["records"]
     targets = report["targets"]
+    # The findings sections are about the records, so about the Trivy targets only
+    record_targets = trivy_targets(targets)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
     lines += render_headline(headline_lines(report, records))
     if records:
-        fixes = render_what_to_fix(records, sightings, targets)
+        fixes = render_what_to_fix(records, sightings, record_targets)
         lines += ["", *fixes] if fixes else []
-        lines += render_watch(records, targets)
-        lines += render_severity_sections(records, targets)
+        lines += render_watch(records, record_targets)
+        lines += render_severity_sections(records, record_targets)
         lines += render_dependency_paths(records)
     lines += render_coverage(targets)
     lines += render_footer(report)
@@ -1992,16 +2258,23 @@ def run_merge(
     """Write all outputs; return the number of failed targets."""
     targets_doc = load_targets_file(targets_file)
     report_dir = output_dir / "_report"
-    native_dir = output_dir / "_native" / SCANNER_TRIVY
-    # Parts are namespaced by scanner: <parts-dir>/<scanner>/<id>.*
-    scanner_parts_dir = parts_dir / SCANNER_TRIVY
     report_dir.mkdir(parents=True, exist_ok=True)
-    native_dir.mkdir(parents=True, exist_ok=True)
+    # The Trivy native directory always exists; other scanners' only if they are used
+    (output_dir / "_native" / SCANNER_TRIVY).mkdir(parents=True, exist_ok=True)
 
     results = []
     for target in targets_doc["targets"]:
+        scanner = target["scanner"]
+        # Parts are namespaced by scanner: <parts-dir>/<scanner>/<id>.*
+        native_dir = output_dir / "_native" / scanner
+        native_dir.mkdir(parents=True, exist_ok=True)
+        scanner_parts_dir = parts_dir / scanner
         state, native = load_target_result(target, scanner_parts_dir)
-        if native is not None and target.get("kind") == KIND_FS:
+        if (
+            native is not None
+            and scanner == SCANNER_TRIVY
+            and target.get("kind") == KIND_FS
+        ):
             apply_gradle_graph(
                 target["id"],
                 native,
@@ -2010,15 +2283,17 @@ def run_merge(
         results.append((target, state, native))
         copy_native(scanner_parts_dir, target["id"], native_dir)
 
+    # Only Trivy findings are records; OSV targets are reported per target
+    trivy_only = trivy_targets(targets_doc["targets"])
     ok_scans = [
         (t["id"], SCANNER_TRIVY, native)
         for t, _, native in results
-        if native is not None
+        if native is not None and t["scanner"] == SCANNER_TRIVY
     ]
     repo = targets_doc.get("repo")
-    image_ids = {t["id"] for t in targets_doc["targets"] if t.get("kind") == KIND_IMAGE}
+    image_ids = {t["id"] for t in trivy_only if t.get("kind") == KIND_IMAGE}
     merged, sightings = merge_records(repo, ok_scans, image_ids)
-    records = finalize_records(merged, targets_doc["targets"])
+    records = finalize_records(merged, trivy_only)
     scan_report = build_scan_report(
         targets_doc, results, records, generated_utc, trivy_db
     )
@@ -2032,7 +2307,8 @@ def run_merge(
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]
     for t in failed:
-        print(f"::error title=Scan target failed::{t['id']}: {t['reason']}")
+        name = f"{t['id']} ({t['scanner']})"
+        print(f"::error title=Scan target failed::{name}: {t['reason']}")
     totals = scan_report["totals"]["findings"]
     print(
         f"canonical set: {totals['total']} records ({totals['fixable']} fixable); "

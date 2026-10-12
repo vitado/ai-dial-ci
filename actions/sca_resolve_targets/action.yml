@@ -20,6 +20,9 @@ inputs:
   scan-images:
     description: Whether to include the image targets
     default: "true"
+  ort-enabled:
+    description: Whether to also scan every source (filesystem) target with ORT (adds ORT targets)
+    default: "false"
   github-token:
     description: Token for the GitHub API and for authenticating to ghcr.io
     default: ${{ github.token }}
@@ -29,8 +32,11 @@ inputs:
 
 outputs:
   matrix:
-    description: Compact JSON array of the pending targets (may be "[]")
+    description: Compact JSON array of the pending Trivy targets (may be "[]")
     value: ${{ steps.targets.outputs.matrix }}
+  ort-matrix:
+    description: Compact JSON array of the pending ORT targets ("[]" unless ort-enabled)
+    value: ${{ steps.targets.outputs.ort-matrix }}
   commit-sha:
     description: Commit SHA of the default branch the scan is pinned to
     value: ${{ steps.targets.outputs.commit-sha }}
@@ -58,6 +64,7 @@ runs:
         RELEASE_LINES: ${{ inputs.release-lines }}
         SCAN_SOURCE: ${{ inputs.scan-source }}
         SCAN_IMAGES: ${{ inputs.scan-images }}
+        ORT_ENABLED: ${{ inputs.ort-enabled }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}
@@ -69,4 +76,5 @@ runs:
         --release-lines "$RELEASE_LINES"
         --scan-source "$SCAN_SOURCE"
         --scan-images "$SCAN_IMAGES"
+        --ort-enabled "$ORT_ENABLED"
         --output-dir "$OUTPUT_DIR"

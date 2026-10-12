@@ -3,9 +3,9 @@
 
 Inputs:
   * targets.json written by sca_resolve_targets (the list of targets);
-  * a parts directory with one subdirectory per scanner (``trivy/``) holding,
-    per scanned target id, ``<id>.json`` (native JSON), ``<id>.status.json``
-    and an optional ``<id>.txt`` (table).
+  * a parts directory with one subdirectory per scanner (``trivy/``, ``ort/``)
+    holding, per scanned target id, ``<id>.json`` (native JSON),
+    ``<id>.status.json`` and an optional ``<id>.txt`` (table).
 
 Outputs (in the output directory):
   * ``_report/vulnerabilities.json`` - the findings only: canonical deduplicated
@@ -20,8 +20,11 @@ Outputs (in the output directory):
   * ``_native/<scanner>/<id>.json|txt`` - the unmodified per-target results
     (audit).
 
-Trivy is the only scanner today; the report schema names the scanner wherever
-another one could contribute (``scanners``, ``scanner``, ``_native/<scanner>/``).
+A target is identified by its scanner and its id (the id names the scanned
+subject, which several scanners share). Trivy is the only scanner whose findings
+are merged into the records. ORT (analyze + advise with OSV) is reported per
+target - status, package and finding counts, native result - but contributes no
+records yet.
 
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
@@ -53,6 +56,7 @@ UNKNOWN_SEVERITY = "UNKNOWN"
 SCHEMA_VERSION = 1
 SHORT_SHA_LENGTH = 7
 TRIVY_DB_KEYS = ("vulnerability_db_updated_at", "java_db_updated_at")
+ORT_CONFIG_KEYS = ("config_repository", "config_revision")
 MERGE_KEY = (
     "(repo, CVE x package x installed-version), merged across scan_targets and scanners"
 )
@@ -63,6 +67,8 @@ STATUS_FAILED = "failed"
 STATUS_NOT_APPLICABLE = "not_applicable"
 
 SCANNER_TRIVY = "trivy"
+SCANNER_ORT = "ort"
+SCANNERS = (SCANNER_TRIVY, SCANNER_ORT)
 
 KIND_FS = "fs"
 KIND_IMAGE = "image"
@@ -163,14 +169,21 @@ def load_targets_file(path: Path) -> dict[str, Any]:
         raise InputError(f"cannot read targets file {path}: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("targets"), list):
         raise InputError(f"targets file {path} has no 'targets' list")
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for target in data["targets"]:
         tid = target.get("id") if isinstance(target, dict) else None
         if not isinstance(tid, str) or not TARGET_ID_RE.fullmatch(tid):
             raise InputError(f"targets file {path} has an invalid target id: {tid!r}")
-        if tid in seen:
-            raise InputError(f"targets file {path} has a duplicate target id: {tid}")
-        seen.add(tid)
+        scanner = target.get("scanner")
+        if scanner not in SCANNERS:
+            raise InputError(
+                f"targets file {path} has an invalid scanner of {tid}: {scanner!r}"
+            )
+        if (scanner, tid) in seen:
+            raise InputError(
+                f"targets file {path} has a duplicate {scanner} target id: {tid}"
+            )
+        seen.add((scanner, tid))
     return data
 
 
@@ -180,11 +193,12 @@ def load_target_result(
     """Determine the final status of one target.
 
     Returns ``(state, native)``: state carries ``status`` and ``reason``; native
-    is the parsed trivy result for ``ok`` targets, else None. Anything short of
-    a complete, valid result is ``failed`` - a broken scan must not look like a
-    clean target.
+    is the parsed native result of the target's scanner for ``ok`` targets, else
+    None. Anything short of a complete, valid result is ``failed`` - a broken scan
+    must not look like a clean target.
     """
     tid = target["id"]
+    scanner = target["scanner"]
     state: dict[str, Any] = {
         "status": target.get("status"),
         "reason": target.get("reason"),
@@ -213,13 +227,15 @@ def load_target_result(
 
     native_path = scanner_parts_dir / f"{tid}.json"
     if not native_path.is_file():
-        return failed("trivy result file is missing")
+        return failed(f"{scanner} result file is missing")
     try:
         native = read_json(native_path)
     except (OSError, ValueError) as e:
-        return failed(f"trivy result is not valid JSON: {e}")
+        return failed(f"{scanner} result is not valid JSON: {e}")
     if not isinstance(native, dict):
-        return failed("trivy result is not a JSON object")
+        return failed(f"{scanner} result is not a JSON object")
+    if scanner == SCANNER_ORT and (problem := ort_result_problem(native)):
+        return failed(problem)
 
     state.update(status=STATUS_OK, reason=None)
     return state, native
@@ -825,6 +841,75 @@ def merge_records(
     return list(by_key.values()), by_record
 
 
+# ---- ORT (analyze + advise): reported per target, not merged into the records yet
+
+
+def ort_result_problem(native: Mapping[str, Any]) -> str | None:
+    """Why an ORT result cannot be counted (it lacks a part), else None."""
+    analyzer = native.get("analyzer")
+    if not isinstance(analyzer, dict) or not isinstance(analyzer.get("result"), dict):
+        return "ort result has no analyzer result"
+    if not isinstance(native.get("advisor"), dict):
+        return "ort result has no advisor run"
+    return None
+
+
+def ort_inventory(native: Mapping[str, Any]) -> dict[str, int]:
+    """``packages_scanned`` (distinct package ids), ``locations_scanned`` (projects)."""
+    result = native["analyzer"]["result"]
+    ids = {package.get("id") for package in result.get("packages") or []}
+    return {
+        "packages_scanned": len(ids),
+        "locations_scanned": len(result.get("projects") or []),
+    }
+
+
+def ort_normalize_severity(value: Any) -> str:
+    """OSV/ORT severity as one of the Trivy levels (``MODERATE`` is ``MEDIUM``)."""
+    if isinstance(value, str):
+        value = value.upper()
+        if value == "MODERATE":
+            value = "MEDIUM"
+    return normalize_severity(value)
+
+
+def ort_vulnerability_severity(vuln: Mapping[str, Any]) -> str:
+    """The highest severity of the references of an ORT vulnerability."""
+    severities = (
+        ort_normalize_severity(reference.get("severity"))
+        for reference in vuln.get("references") or []
+    )
+    return min(severities, key=SEV_ORDER.__getitem__, default=UNKNOWN_SEVERITY)
+
+
+def ort_findings(native: Mapping[str, Any]) -> dict[tuple[str, str], tuple[str, bool]]:
+    """Unique findings of one ORT target, by (package id, vulnerability id).
+
+    The value is ``(severity, fixable)``: a finding is fixable if the advisory names
+    a first fixed version; if the same finding is reported more than once, the
+    highest severity and any fix count.
+    """
+    found: dict[tuple[str, str], tuple[str, bool]] = {}
+    for package_id, advisor_results in (native["advisor"].get("results") or {}).items():
+        for advisor_result in advisor_results or []:
+            for vuln in advisor_result.get("vulnerabilities") or []:
+                key = (package_id, vuln.get("id"))
+                severity, fixable = found.get(key, (UNKNOWN_SEVERITY, False))
+                found[key] = (
+                    min(severity, ort_vulnerability_severity(vuln), key=SEV_ORDER.get),
+                    fixable or bool(vuln.get("first_fixed_versions")),
+                )
+    return found
+
+
+def ort_version(native: Mapping[str, Any]) -> str | None:
+    return (native["advisor"].get("environment") or {}).get("ort_version")
+
+
+def ort_advised_at(native: Mapping[str, Any]) -> str | None:
+    return native["advisor"].get("end_time")
+
+
 # ---- Exposure
 
 
@@ -960,7 +1045,7 @@ def build_target_entry(
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
         "id": target["id"],
-        "scanner": SCANNER_TRIVY,
+        "scanner": target["scanner"],
         "kind": target.get("kind"),
         "image": target.get("image"),
         "tag": target.get("tag"),
@@ -973,8 +1058,15 @@ def build_target_entry(
         "packages_scanned": None,
         "locations_scanned": None,
         "findings": None,
+        "advised_at": None,
     }
-    if native is not None:
+    if native is None:
+        return entry
+    if target["scanner"] == SCANNER_ORT:
+        entry.update(ort_inventory(native))
+        entry["findings"] = finding_stats(ort_findings(native).values())
+        entry["advised_at"] = ort_advised_at(native)
+    else:
         entry.update(count_packages(native))
         entry["findings"] = finding_stats(target_findings(native).values())
         if target.get("kind") == KIND_IMAGE:
@@ -1009,20 +1101,29 @@ def build_scan_report(
     records: Sequence[Record],
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
+    ort_config: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
+    ort_run_version = None
     targets: list[dict[str, Any]] = []
     for target, state, native in results:
         entry = build_target_entry(target, state, native)
         if native is not None:
             if entry["packages_scanned"] == 0:
                 print(
-                    f"::warning title=No packages in scan result::{target['id']}: "
+                    "::warning title=No packages in scan result::"
+                    f"{target_name(target)}: "
                     "0 packages were seen (an empty scan is suspicious: no lockfiles, "
                     "an unsupported ecosystem or a missing package list)"
                 )
-            trivy_version = trivy_version or (native.get("Trivy") or {}).get("Version")
+            if target["scanner"] == SCANNER_ORT:
+                ort_run_version = ort_run_version or ort_version(native)
+            else:
+                trivy_version = trivy_version or (native.get("Trivy") or {}).get(
+                    "Version"
+                )
         targets.append(entry)
+    has_ort = any(t["scanner"] == SCANNER_ORT for t in targets)
     return {
         "schema_version": SCHEMA_VERSION,
         "repo": targets_doc.get("repo"),
@@ -1034,6 +1135,12 @@ def build_scan_report(
         "generated_utc": generated_utc,
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
+        "ort": {
+            "version": ort_run_version,
+            **{key: (ort_config or {}).get(key) for key in ORT_CONFIG_KEYS},
+        }
+        if has_ort
+        else None,
         "totals": build_totals(targets, records),
         "targets": targets,
     }
@@ -1153,6 +1260,18 @@ def has_several_images(targets: Iterable[Mapping[str, Any]]) -> bool:
     return len({t.get("image") for t in targets if t.get("kind") == KIND_IMAGE}) > 1
 
 
+def target_name(target: Mapping[str, Any]) -> str:
+    """The id of a target, qualified by the scanner unless it is Trivy."""
+    if target["scanner"] == SCANNER_TRIVY:
+        return target["id"]
+    return f"{target['id']} ({target['scanner']})"
+
+
+def trivy_targets(targets: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The targets whose findings are in the records."""
+    return [t for t in targets if t["scanner"] == SCANNER_TRIVY]
+
+
 def target_label(target: Mapping[str, Any], several_images: bool) -> str:
     """Short name: ``source @ development 3d0c8a3``, ``image :1.0``, ``app :1.0``."""
     if target.get("kind") == KIND_FS:
@@ -1245,7 +1364,9 @@ def totals_line(report: Mapping[str, Any]) -> str:
 
 
 def no_findings_line(report: Mapping[str, Any]) -> str:
-    ok_targets = [t for t in report["targets"] if t["status"] == STATUS_OK]
+    ok_targets = [
+        t for t in trivy_targets(report["targets"]) if t["status"] == STATUS_OK
+    ]
     packages = sum(t["packages_scanned"] or 0 for t in ok_targets)
     return (
         f"No known vulnerabilities · {packages} packages in {len(ok_targets)} targets"
@@ -1256,15 +1377,19 @@ def headline_lines(report: Mapping[str, Any], records: Sequence[Record]) -> list
     """One line per group: failures, each released tag, development, totals."""
     targets = report["targets"]
     lines: list[str] = []
-    failed = [t["id"] for t in targets if t["status"] == STATUS_FAILED]
+    failed = [target_name(t) for t in targets if t["status"] == STATUS_FAILED]
     if failed:
         lines.append(
             f"**Incomplete: {len(failed)} target(s) failed** — {', '.join(failed)} "
             "(their findings are missing)"
         )
-    ok = [t for t in targets if t["status"] == STATUS_OK]
+    ok = [t for t in trivy_targets(targets) if t["status"] == STATUS_OK]
     if not ok:
-        return [*lines, "No target was scanned"]
+        scanned = any(t["status"] == STATUS_OK for t in targets)
+        return [
+            *lines,
+            "No Trivy target was scanned" if scanned else "No target was scanned",
+        ]
     if not records:
         return [*lines, no_findings_line(report)]
 
@@ -1689,9 +1814,12 @@ def severity_cells(findings: Mapping[str, Any] | None) -> list[Any]:
 
 def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     several = has_several_images(targets)
+    # Only a run with another scanner needs the column: Trivy-only reports stay as is
+    with_scanner = any(t["scanner"] != SCANNER_TRIVY for t in targets)
     rows = (
         [
             target_label(t, several),
+            *([t["scanner"]] if with_scanner else []),
             t["status"],
             t["packages_scanned"],
             *severity_cells(t["findings"]),
@@ -1699,8 +1827,19 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
         ]
         for t in targets
     )
-    header = ["Target", "Status", "Packages", "C", "H", "M", "L", "Note"]
-    body = md_table(header, rows, right=(2, 3, 4, 5, 6))
+    header = [
+        "Target",
+        *(["Scanner"] if with_scanner else []),
+        "Status",
+        "Packages",
+        "C",
+        "H",
+        "M",
+        "L",
+        "Note",
+    ]
+    first_number = 3 if with_scanner else 2
+    body = md_table(header, rows, right=range(first_number, first_number + 5))
     return ["", *md_details("Scan coverage", body)]
 
 
@@ -1726,7 +1865,25 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
     generated = format_timestamp(report["generated_utc"])
     if generated:
         parts.append(f"generated {generated}")
-    return ["", f"<sub>{' · '.join(parts)}</sub>"]
+    lines = ["", f"<sub>{' · '.join(parts)}</sub>"]
+    ort = report.get("ort")
+    if ort:
+        lines += ["", f"<sub>{' · '.join(ort_footer_parts(ort))}</sub>"]
+    return lines
+
+
+def ort_footer_parts(ort: Mapping[str, Any]) -> list[str]:
+    parts = [f"ORT {ort['version']}" if ort["version"] else "ORT"]
+    config = "@".join(
+        part for part in (ort["config_repository"], ort["config_revision"]) if part
+    )
+    if config:
+        parts.append(f"config {config}")
+    parts.append(
+        "ORT findings are counted in Scan coverage, "
+        "not yet merged into the findings above"
+    )
+    return parts
 
 
 def build_summary_md(
@@ -1734,13 +1891,15 @@ def build_summary_md(
 ) -> str:
     records = vulns["records"]
     targets = report["targets"]
+    # The findings sections are about the records, so about the Trivy targets only
+    record_targets = trivy_targets(targets)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
     lines += render_headline(headline_lines(report, records))
     if records:
-        fixes = render_what_to_fix(records, sightings, targets)
+        fixes = render_what_to_fix(records, sightings, record_targets)
         lines += ["", *fixes] if fixes else []
-        lines += render_watch(records, targets)
-        lines += render_severity_sections(records, targets)
+        lines += render_watch(records, record_targets)
+        lines += render_severity_sections(records, record_targets)
         lines += render_dependency_paths(records)
     lines += render_coverage(targets)
     lines += render_footer(report)
@@ -1774,33 +1933,39 @@ def run_merge(
     output_dir: Path,
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
+    ort_config: Mapping[str, str | None] | None = None,
 ) -> int:
     """Write all outputs; return the number of failed targets."""
     targets_doc = load_targets_file(targets_file)
     report_dir = output_dir / "_report"
-    native_dir = output_dir / "_native" / SCANNER_TRIVY
-    # Parts are namespaced by scanner: <parts-dir>/<scanner>/<id>.*
-    scanner_parts_dir = parts_dir / SCANNER_TRIVY
     report_dir.mkdir(parents=True, exist_ok=True)
-    native_dir.mkdir(parents=True, exist_ok=True)
+    # The Trivy native directory always exists; other scanners' only if they are used
+    (output_dir / "_native" / SCANNER_TRIVY).mkdir(parents=True, exist_ok=True)
 
     results = []
     for target in targets_doc["targets"]:
+        scanner = target["scanner"]
+        # Parts are namespaced by scanner: <parts-dir>/<scanner>/<id>.*
+        native_dir = output_dir / "_native" / scanner
+        native_dir.mkdir(parents=True, exist_ok=True)
+        scanner_parts_dir = parts_dir / scanner
         state, native = load_target_result(target, scanner_parts_dir)
         results.append((target, state, native))
         copy_native(scanner_parts_dir, target["id"], native_dir)
 
+    # Only Trivy findings are records; ORT targets are reported per target (stage A)
+    trivy_only = trivy_targets(targets_doc["targets"])
     ok_scans = [
         (t["id"], SCANNER_TRIVY, native)
         for t, _, native in results
-        if native is not None
+        if native is not None and t["scanner"] == SCANNER_TRIVY
     ]
     repo = targets_doc.get("repo")
-    image_ids = {t["id"] for t in targets_doc["targets"] if t.get("kind") == KIND_IMAGE}
+    image_ids = {t["id"] for t in trivy_only if t.get("kind") == KIND_IMAGE}
     merged, sightings = merge_records(repo, ok_scans, image_ids)
-    records = finalize_records(merged, targets_doc["targets"])
+    records = finalize_records(merged, trivy_only)
     scan_report = build_scan_report(
-        targets_doc, results, records, generated_utc, trivy_db
+        targets_doc, results, records, generated_utc, trivy_db, ort_config
     )
     vulns = build_vulnerabilities(repo, generated_utc, records)
 
@@ -1812,7 +1977,8 @@ def run_merge(
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]
     for t in failed:
-        print(f"::error title=Scan target failed::{t['id']}: {t['reason']}")
+        name = f"{t['id']} ({t['scanner']})"
+        print(f"::error title=Scan target failed::{name}: {t['reason']}")
     totals = scan_report["totals"]["findings"]
     print(
         f"canonical set: {totals['total']} records ({totals['fixable']} fixable); "
@@ -1871,6 +2037,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "of the Trivy DB snapshot used by the run (default: unknown)"
         ),
     )
+    parser.add_argument(
+        "--ort-config-repository",
+        default="",
+        help="ORT configuration repository used by the run (default: unknown)",
+    )
+    parser.add_argument(
+        "--ort-config-revision",
+        default="",
+        help="ORT configuration revision used by the run (default: unknown)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1884,6 +2060,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             generated_utc,
             parse_trivy_db_info(args.trivy_db_info),
+            {
+                "config_repository": args.ort_config_repository or None,
+                "config_revision": args.ort_config_revision or None,
+            },
         )
     except InputError as e:
         print(f"::error title=Invalid merge input::{e}", file=sys.stderr)

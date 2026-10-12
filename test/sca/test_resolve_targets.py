@@ -97,6 +97,7 @@ def run_resolve_targets(
     release_lines: int = 1,
     scan_source: bool = True,
     scan_images: bool = True,
+    ort_enabled: bool = False,
     token: str | None = "tkn",
 ) -> dict[str, Any]:
     http = no_sleep_http(transport)
@@ -107,6 +108,7 @@ def run_resolve_targets(
         release_lines=release_lines,
         scan_source=scan_source,
         scan_images=scan_images,
+        ort_enabled=ort_enabled,
         github=rt.GitHubClient(http, token, API),
         registry=rt.RegistryClient(http, "ghcr.io", token),
         environ=ENV,
@@ -180,6 +182,7 @@ def test_release_lines_1_uses_github_latest_release() -> None:
     assert targets["source-development"]["kind"] == "fs"
     assert targets["app-1.1.14"] == {
         "id": "app-1.1.14",
+        "scanner": "trivy",
         "kind": "image",
         "image": "example/app",
         "tag": "1.1.14",
@@ -410,6 +413,7 @@ def test_fs_target_carries_git_ref_and_commit_sha() -> None:
     assert targets_doc["targets"] == [
         {
             "id": "source-development",
+            "scanner": "trivy",
             "kind": "fs",
             "image": None,
             "tag": None,
@@ -432,7 +436,8 @@ def test_target_schema_is_uniform() -> None:
     kinds = {x["kind"] for x in targets_doc["targets"]}
     assert kinds == {"fs", "image"}
     for target in targets_doc["targets"]:
-        assert set(target) == TARGET_KEYS | {"status", "reason"}
+        assert set(target) == TARGET_KEYS | {"scanner", "status", "reason"}
+        assert target["scanner"] == "trivy"
         if target["kind"] == "image":
             assert target["git_ref"] is None
             assert target["commit_sha"] is None
@@ -774,6 +779,7 @@ def test_render_table_and_annotations() -> None:
     targets = [
         {
             "id": "source",
+            "scanner": "trivy",
             "kind": "fs",
             "ref": None,
             "status": "pending",
@@ -781,6 +787,7 @@ def test_render_table_and_annotations() -> None:
         },
         {
             "id": "x-1",
+            "scanner": "trivy",
             "kind": "image",
             "ref": "ghcr.io/x:1",
             "status": "failed",
@@ -788,6 +795,7 @@ def test_render_table_and_annotations() -> None:
         },
         {
             "id": "x-2",
+            "scanner": "trivy",
             "kind": "image",
             "ref": "ghcr.io/x:2",
             "status": "not_applicable",
@@ -801,3 +809,126 @@ def test_render_table_and_annotations() -> None:
         "::warning title=Scan target x-1 failed to resolve::boom",
         "::notice title=Scan target x-2 skipped::nope",
     ]
+
+
+# --- ORT targets --------------------------------------------------------------
+
+
+def test_every_target_names_its_scanner_trivy_without_ort() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"])
+    assert {x["scanner"] for x in targets_doc["targets"]} == {"trivy"}
+    assert rt.build_matrix(targets_doc, "ort") == []
+
+
+def test_ort_target_is_the_twin_of_each_fs_target_and_never_of_an_image() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    targets_doc = run_resolve_targets(t, ["example/app"], ort_enabled=True)
+    # Trivy targets as before, then the ORT ones in the same order
+    assert [(x["scanner"], x["id"]) for x in targets_doc["targets"]] == [
+        ("trivy", "source-development"),
+        ("trivy", "app-development"),
+        ("trivy", "app-1.1.14"),
+        ("ort", "source-development"),
+    ]
+    trivy_fs, *_, ort_fs = targets_doc["targets"]
+    assert ort_fs == {**trivy_fs, "scanner": "ort"}
+    assert [m["id"] for m in rt.build_matrix(targets_doc, "ort")] == [
+        "source-development"
+    ]
+    assert [m["id"] for m in rt.build_matrix(targets_doc)] == [
+        "source-development",
+        "app-development",
+        "app-1.1.14",
+    ]
+
+
+def test_ort_matrix_entries_have_the_matrix_schema() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    (ort_fs,) = rt.build_matrix(run_resolve_targets(t, [], ort_enabled=True), "ort")
+    assert set(ort_fs) == TARGET_KEYS
+    assert (ort_fs["git_ref"], ort_fs["commit_sha"]) == ("development", "a" * 40)
+
+
+def test_no_ort_target_without_source_scan() -> None:
+    t = FakeTransport()
+    github_routes(t, release="1.1.14")
+    t.add(tags_url("example/x"), ok({"tags": ["development"]}))
+    targets_doc = run_resolve_targets(
+        t, ["example/x"], scan_source=False, ort_enabled=True
+    )
+    assert {x["scanner"] for x in targets_doc["targets"]} == {"trivy"}
+    assert rt.build_matrix(targets_doc, "ort") == []
+
+
+def test_target_identity_is_scanner_and_id() -> None:
+    same_id = {"id": "source-development", "scanner": "trivy"}
+    rt.check_unique_ids([same_id, {**same_id, "scanner": "ort"}])
+    with pytest.raises(rt.ResolveError, match="collision"):
+        rt.check_unique_ids([same_id, dict(same_id)])
+
+
+def test_render_table_names_the_scanner() -> None:
+    t = FakeTransport()
+    github_routes(t)
+    table = rt.render_table(run_resolve_targets(t, [], ort_enabled=True)["targets"])
+    assert [line.split()[:2] for line in table.splitlines()] == [
+        ["ID", "SCANNER"],
+        ["source-development", "trivy"],
+        ["source-development", "ort"],
+    ]
+
+
+def test_run_outputs_both_matrices(tmp_path: Path) -> None:
+    t = FakeTransport()
+    github_routes(t)
+    output_file = tmp_path / "github_output"
+    env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
+    argv = [
+        "--repository",
+        REPOSITORY,
+        "--ort-enabled",
+        "true",
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
+    assert " " not in outputs["ort-matrix"]
+    assert [m["id"] for m in json.loads(outputs["ort-matrix"])] == [
+        "source-development"
+    ]
+    assert [m["id"] for m in json.loads(outputs["matrix"])] == ["source-development"]
+    targets_doc = json.loads(
+        (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
+    )
+    assert [x["scanner"] for x in targets_doc["targets"]] == ["trivy", "ort"]
+
+
+def test_run_ort_matrix_is_empty_by_default(tmp_path: Path) -> None:
+    t = FakeTransport()
+    github_routes(t)
+    output_file = tmp_path / "github_output"
+    env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
+    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")]
+    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
+    assert outputs["ort-matrix"] == "[]"
+
+
+def test_run_rejects_invalid_ort_enabled(tmp_path: Path) -> None:
+    argv = [
+        "--repository",
+        REPOSITORY,
+        "--ort-enabled",
+        "maybe",
+        "--output-dir",
+        str(tmp_path),
+    ]
+    with pytest.raises(rt.ResolveError):
+        rt.run(rt.parse_args(argv), FakeTransport(), ENV, NOW)

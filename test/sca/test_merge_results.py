@@ -46,6 +46,7 @@ DEV = {
     "git_ref": None,
     "commit_sha": None,
 }
+ORT_SOURCE = {**SOURCE, "scanner": "ort"}
 REL = {
     "id": "app-1.0.0",
     "kind": "image",
@@ -58,8 +59,10 @@ REL = {
 
 
 def make_targets_doc(*targets: dict[str, Any]) -> dict[str, Any]:
-    """targets.json content with all given targets pending."""
-    items = [{"status": "pending", "reason": None, **t} for t in targets]
+    """targets.json content with all given targets pending (Trivy by default)."""
+    items = [
+        {"status": "pending", "reason": None, "scanner": "trivy", **t} for t in targets
+    ]
     return {
         "repo": "example/app",
         "default_branch": "main",
@@ -82,6 +85,7 @@ class Workspace:
         self.parts = tmp_path / "parts"
         self.trivy_parts = self.parts / mr.SCANNER_TRIVY
         self.trivy_parts.mkdir(parents=True)
+        self.ort_parts = self.parts / mr.SCANNER_ORT
         self.out = tmp_path / "out"
 
     def add_part(self, tid: str, fixture: str | None, **status: Any) -> None:
@@ -94,15 +98,42 @@ class Workspace:
             json.dumps(body), encoding="utf-8"
         )
 
-    def run(self, generated: str = GENERATED) -> int:
-        return mr.run_merge(self.targets_file, self.parts, self.out, generated)
+    def add_ort_part(self, tid: str, fixture: str | None, **status: Any) -> None:
+        """Add an ORT part: a fixture as ort/<id>.json and an ok status by default."""
+        self.ort_parts.mkdir(exist_ok=True)
+        if fixture:
+            shutil.copy(FIXTURES / f"{fixture}.json", self.ort_parts / f"{tid}.json")
+        body = {
+            "id": tid,
+            "status": "ok",
+            "reason": None,
+            "analyzer_errors": 0,
+            "advisor_errors": 0,
+        }
+        body.update(status)
+        (self.ort_parts / f"{tid}.status.json").write_text(
+            json.dumps(body), encoding="utf-8"
+        )
+
+    def run(self, generated: str = GENERATED, **kwargs: Any) -> int:
+        return mr.run_merge(
+            self.targets_file, self.parts, self.out, generated, **kwargs
+        )
 
     def json(self, rel: str) -> Any:
         return json.loads((self.out / rel).read_text(encoding="utf-8"))
 
+    def targets_of(self, scanner: str) -> dict[str, dict[str, Any]]:
+        targets = self.json("_report/scan_report.json")["targets"]
+        return {t["id"]: t for t in targets if t["scanner"] == scanner}
+
     @property
     def targets(self) -> dict[str, dict[str, Any]]:
-        return {t["id"]: t for t in self.json("_report/scan_report.json")["targets"]}
+        return self.targets_of(mr.SCANNER_TRIVY)
+
+    @property
+    def ort_targets(self) -> dict[str, dict[str, Any]]:
+        return self.targets_of(mr.SCANNER_ORT)
 
 
 @pytest.fixture
@@ -299,6 +330,7 @@ def test_totals_by_severity_and_exposure(full: Workspace) -> None:
         "packages_scanned",
         "locations_scanned",
         "findings",
+        "advised_at",
     ]
 
 
@@ -1915,3 +1947,451 @@ def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
     )
     assert "No fix available — watch (1)" in md  # collapsed: only a MEDIUM
     assert "| 1 | urllib3 2.7.0 · python | 1 MEDIUM |" in md
+
+
+# ---------------------------------------------------------------- ORT (stage A)
+
+
+@pytest.fixture
+def with_ort(tmp_path: Path) -> Workspace:
+    """fs + two images (Trivy, all ok) and the ORT twin of the fs target (ok)."""
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV, REL, ORT_SOURCE))
+    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("app-development", "app-development")
+    ws.add_part("app-1.0.0", "app-1.0.0")
+    ws.add_ort_part("source-development", "ort-source")
+    return ws
+
+
+def trivy_only_twin(tmp_path: Path) -> Workspace:
+    """The `with_ort` run without its ORT target: the Trivy parts alone."""
+    (tmp_path / "trivy-only").mkdir()
+    ws = Workspace(tmp_path / "trivy-only", make_targets_doc(SOURCE, DEV, REL))
+    ws.add_part("source-development", "source", lockfiles=3)
+    ws.add_part("app-development", "app-development")
+    ws.add_part("app-1.0.0", "app-1.0.0")
+    return ws
+
+
+def test_ort_target_entry_counts_distinct_packages_projects_and_findings(
+    with_ort: Workspace,
+) -> None:
+    assert with_ort.run() == 0
+    entry = with_ort.ort_targets["source-development"]
+    assert entry["scanner"] == "ort"
+    assert (entry["status"], entry["reason"]) == ("ok", None)
+    # 6 package entries, one of them a repeat of lodash; 2 analyzer projects
+    assert entry["packages_scanned"] == 5
+    assert entry["locations_scanned"] == 2
+    # 5 distinct (package, vulnerability) pairs: requests is reported twice by the
+    # advisor results, with its highest severity kept; a fix is a non-empty
+    # first_fixed_versions; MODERATE is MEDIUM, a missing or unknown severity UNKNOWN
+    assert entry["findings"] == {
+        "total": 5,
+        "fixable": 2,
+        "by_severity": {
+            "CRITICAL": 1,
+            "HIGH": 1,
+            "MEDIUM": 1,
+            "LOW": 0,
+            "UNKNOWN": 2,
+        },
+    }
+    assert entry["advised_at"] == "2030-01-01T00:10:00Z"
+    assert entry["image_digest"] is None
+    assert entry["commit_sha"] == SOURCE["commit_sha"]
+    assert entry["git_ref"] == "development"
+
+
+def test_target_entries_of_both_scanners_have_the_same_keys(
+    with_ort: Workspace,
+) -> None:
+    with_ort.run()
+    targets = with_ort.json("_report/scan_report.json")["targets"]
+    assert len({tuple(t) for t in targets}) == 1
+    assert [t["advised_at"] for t in targets if t["scanner"] == "trivy"] == [None] * 3
+
+
+def test_ort_metadata_comes_from_the_native_and_the_merge_inputs(
+    with_ort: Workspace,
+) -> None:
+    with_ort.run(
+        ort_config={
+            "config_repository": "https://example.invalid/ort-config.git",
+            "config_revision": "1.2.3",
+        }
+    )
+    assert with_ort.json("_report/scan_report.json")["ort"] == {
+        "version": "94.2.0",
+        "config_repository": "https://example.invalid/ort-config.git",
+        "config_revision": "1.2.3",
+    }
+
+
+def test_ort_metadata_is_null_without_ort_targets(full: Workspace) -> None:
+    full.run()
+    assert full.json("_report/scan_report.json")["ort"] is None
+
+
+def test_ort_metadata_with_unknown_version_and_config(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(ORT_SOURCE))
+    assert ws.run() == 1  # no part: failed, so no version either
+    assert ws.json("_report/scan_report.json")["ort"] == {
+        "version": None,
+        "config_repository": None,
+        "config_revision": None,
+    }
+
+
+def test_ort_contributes_no_records(with_ort: Workspace) -> None:
+    with_ort.run()
+    records = with_ort.json("_report/vulnerabilities.json")["records"]
+    assert records
+    assert all(r["scanners"] == ["trivy"] for r in records)
+    assert all("ort" not in r["scan_targets"] for r in records)
+    assert not any(r["cve"].startswith("GHSA") for r in records)
+
+
+def test_trivy_output_is_unchanged_by_ort_targets(
+    with_ort: Workspace, tmp_path: Path
+) -> None:
+    full = trivy_only_twin(tmp_path)
+    with_ort.run()
+    full.run()
+    assert with_ort.json("_report/vulnerabilities.json") == full.json(
+        "_report/vulnerabilities.json"
+    )
+    assert with_ort.targets == full.targets
+    keep = ("trivy_version", "trivy_db", "commit_sha", "run_id")
+    for key in keep:
+        assert (
+            with_ort.json("_report/scan_report.json")[key]
+            == full.json("_report/scan_report.json")[key]
+        )
+    # the findings sections of summary.md do not move either
+    with_ort_md = (with_ort.out / "summary.md").read_text(encoding="utf-8")
+    full_md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert with_ort_md.split("<details>\n<summary>Scan coverage")[0].replace(
+        "3/3 targets scanned", "4/4 targets scanned"
+    ) == full_md.split("<details>\n<summary>Scan coverage")[0].replace(
+        "3/3 targets scanned", "4/4 targets scanned"
+    )
+
+
+def test_totals_count_ort_targets_but_findings_stay_trivy_records(
+    with_ort: Workspace, tmp_path: Path
+) -> None:
+    full = trivy_only_twin(tmp_path)
+    with_ort.run()
+    full.run()
+    totals = with_ort.json("_report/scan_report.json")["totals"]
+    reference = full.json("_report/scan_report.json")["totals"]
+    assert totals["targets"] == {
+        "total": 4,
+        "ok": 4,
+        "failed": 0,
+        "not_applicable": 0,
+    }
+    assert totals["findings"] == reference["findings"]
+
+
+def test_ort_natives_are_copied_without_a_table(with_ort: Workspace) -> None:
+    with_ort.run()
+    native = with_ort.out / "_native"
+    assert sorted(p.name for p in native.iterdir()) == ["ort", "trivy"]
+    assert [p.name for p in (native / "ort").iterdir()] == ["source-development.json"]
+    assert (native / "ort" / "source-development.json").read_bytes() == (
+        FIXTURES / "ort-source.json"
+    ).read_bytes()
+    # the Trivy native of the same id is another file
+    assert (native / "trivy" / "source-development.json").read_bytes() == (
+        FIXTURES / "source.json"
+    ).read_bytes()
+
+
+def test_ort_target_without_a_part_is_failed(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    assert ws.targets["source-development"]["status"] == "ok"
+    entry = ws.ort_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "failed",
+        "scan job produced no result",
+    )
+    assert (entry["packages_scanned"], entry["findings"], entry["advised_at"]) == (
+        None,
+        None,
+        None,
+    )
+
+
+def test_ort_trivy_part_does_not_satisfy_the_ort_target(tmp_path: Path) -> None:
+    # same id, but the part of the other scanner: identity is (scanner, id)
+    ws = Workspace(tmp_path, make_targets_doc(ORT_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    assert ws.ort_targets["source-development"]["status"] == "failed"
+
+
+def test_ort_status_failed_uses_its_reason_and_keeps_the_native_for_audit(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    ws.add_part("source-development", "source")
+    ws.add_ort_part(
+        "source-development",
+        "ort-source",
+        status="failed",
+        reason="advisor reported 2 error(s)",
+        advisor_errors=2,
+    )
+    assert ws.run() == 1
+    entry = ws.ort_targets["source-development"]
+    assert (entry["status"], entry["reason"]) == (
+        "failed",
+        "advisor reported 2 error(s)",
+    )
+    assert entry["findings"] is None
+    assert (ws.out / "_native" / "ort" / "source-development.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("native", "reason"),
+    [
+        ({"advisor": {"results": {}}}, "ort result has no analyzer result"),
+        ({"analyzer": {"result": {}}}, "ort result has no advisor run"),
+        ({"analyzer": {}, "advisor": {}}, "ort result has no analyzer result"),
+    ],
+)
+def test_ort_result_without_analyzer_or_advisor_is_failed(
+    tmp_path: Path, native: dict[str, Any], reason: str
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(ORT_SOURCE))
+    ws.add_ort_part("source-development", None)
+    (ws.ort_parts / "source-development.json").write_text(
+        json.dumps(native), encoding="utf-8"
+    )
+    assert ws.run() == 1
+    assert ws.ort_targets["source-development"]["reason"] == reason
+
+
+def test_ort_status_ok_with_invalid_json_is_failed(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(ORT_SOURCE))
+    ws.add_ort_part("source-development", None)
+    (ws.ort_parts / "source-development.json").write_text("{", encoding="utf-8")
+    assert ws.run() == 1
+    assert ws.ort_targets["source-development"]["reason"].startswith(
+        "ort result is not valid JSON"
+    )
+
+
+def test_ort_clean_result_is_ok_with_zero_findings(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(ORT_SOURCE))
+    ws.add_ort_part("source-development", None)
+    clean = {
+        "analyzer": {"result": {"projects": [{"id": "p"}], "packages": []}},
+        "advisor": {"end_time": "2030-01-01T00:00:00Z", "results": {}},
+    }
+    (ws.ort_parts / "source-development.json").write_text(
+        json.dumps(clean), encoding="utf-8"
+    )
+    assert ws.run() == 0
+    entry = ws.ort_targets["source-development"]
+    assert entry["status"] == "ok"
+    assert entry["findings"]["total"] == 0
+    assert entry["packages_scanned"] == 0
+    assert ws.json("_report/scan_report.json")["ort"]["version"] is None
+
+
+def test_failed_ort_target_makes_the_summary_incomplete_and_is_annotated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    ws.add_part("source-development", "source")
+    assert ws.run() == 1
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "> **Incomplete: 1 target(s) failed** — source-development (ort) "
+        "(their findings are missing)" in md
+    )
+    out = capsys.readouterr().out
+    assert (
+        "::error title=Scan target failed::source-development (ort): "
+        "scan job produced no result" in out
+    )
+
+
+def test_failed_trivy_target_is_annotated_with_its_scanner(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE))
+    assert ws.run() == 1
+    assert (
+        "::error title=Scan target failed::source-development (trivy): "
+        "scan job produced no result" in capsys.readouterr().out
+    )
+
+
+def test_summary_coverage_has_a_scanner_column_and_ort_rows(
+    with_ort: Workspace,
+) -> None:
+    with_ort.run()
+    md = (with_ort.out / "summary.md").read_text(encoding="utf-8")
+    assert "| Target | Scanner | Status | Packages | C | H | M | L | Note |" in md
+    assert "| source @ development fedcba9 | trivy | ok | 0 | 1 | 1 | 1 | 0 | - |" in md
+    assert "| source @ development fedcba9 | ort | ok | 5 | 1 | 1 | 1 | 0 | - |" in md
+
+
+def test_summary_coverage_is_as_before_without_ort(full: Workspace) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "| Target | Status | Packages | C | H | M | L | Note |" in md
+    assert "Scanner" not in md
+    assert "ORT" not in md
+
+
+def test_summary_footer_names_ort_version_config_and_the_no_merge_note(
+    with_ort: Workspace,
+) -> None:
+    with_ort.run(
+        ort_config={
+            "config_repository": "https://example.invalid/ort-config.git",
+            "config_revision": "1.2.3",
+        }
+    )
+    md = (with_ort.out / "summary.md").read_text(encoding="utf-8")
+    assert md.rstrip().endswith("</sub>")
+    footer = md.rstrip().splitlines()[-1]
+    assert footer == (
+        "<sub>ORT 94.2.0 · config https://example.invalid/ort-config.git@1.2.3 · "
+        "ORT findings are counted in Scan coverage, "
+        "not yet merged into the findings above</sub>"
+    )
+
+
+def test_summary_headline_without_trivy_scan_but_with_an_ort_one(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    ws.add_ort_part("source-development", "ort-source")
+    assert ws.run() == 1  # the Trivy part is missing
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No Trivy target was scanned" in md
+
+
+def test_summary_without_any_scanned_target_is_unchanged(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    assert ws.run() == 2
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No target was scanned" in md
+
+
+def test_ort_target_does_not_change_the_no_findings_headline(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    ws.add_part("source-development", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps({"Results": []}), encoding="utf-8"
+    )
+    ws.add_ort_part("source-development", "ort-source")
+    assert ws.run() == 0
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "> No known vulnerabilities · 0 packages in 1 targets" in md
+
+
+def test_targets_file_identity_is_scanner_and_id(tmp_path: Path) -> None:
+    # the same id for two scanners is fine
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, ORT_SOURCE))
+    mr.load_targets_file(ws.targets_file)
+    # twice for one scanner is not
+    doc = make_targets_doc(ORT_SOURCE, ORT_SOURCE)
+    ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(mr.InputError, match="duplicate ort target id"):
+        mr.load_targets_file(ws.targets_file)
+
+
+@pytest.mark.parametrize("scanner", [None, "", "snyk"])
+def test_targets_file_needs_a_known_scanner(
+    tmp_path: Path, scanner: str | None
+) -> None:
+    doc = make_targets_doc({**SOURCE, "scanner": scanner})
+    path = tmp_path / "targets.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(mr.InputError, match="invalid scanner"):
+        mr.load_targets_file(path)
+
+
+def test_ort_severity_is_normalized_to_the_trivy_levels() -> None:
+    assert [
+        mr.ort_normalize_severity(value)
+        for value in ("MODERATE", "moderate", "MEDIUM", "HIGH", "CRITICAL", "LOW")
+    ] == ["MEDIUM", "MEDIUM", "MEDIUM", "HIGH", "CRITICAL", "LOW"]
+    assert [mr.ort_normalize_severity(value) for value in (None, "", "BOGUS", 7)] == [
+        "UNKNOWN"
+    ] * 4
+
+
+def test_ort_vulnerability_severity_is_the_highest_of_its_references() -> None:
+    def vuln(*severities: str | None) -> dict[str, Any]:
+        return {"references": [{"severity": s} for s in severities]}
+
+    assert mr.ort_vulnerability_severity(vuln("LOW", "MODERATE", "HIGH")) == "HIGH"
+    assert mr.ort_vulnerability_severity(vuln(None, "LOW")) == "LOW"
+    assert mr.ort_vulnerability_severity(vuln(None, "BOGUS")) == "UNKNOWN"
+    assert mr.ort_vulnerability_severity(vuln()) == "UNKNOWN"
+    assert mr.ort_vulnerability_severity({}) == "UNKNOWN"
+
+
+def test_ort_findings_are_distinct_by_package_and_vulnerability() -> None:
+    native = json.loads((FIXTURES / "ort-source.json").read_text(encoding="utf-8"))
+    found = mr.ort_findings(native)
+    assert sorted(found) == [
+        ("Maven:org.example:lib:1.0", "GHSA-dddd-dddd-0001"),
+        ("NPM::lodash:4.17.0", "GHSA-aaaa-aaaa-0001"),
+        ("NPM::lodash:4.17.0", "GHSA-aaaa-aaaa-0002"),
+        ("NPM::minimist:1.2.0", "GHSA-bbbb-bbbb-0001"),
+        ("PyPI::requests:2.0.0", "GHSA-cccc-cccc-0001"),
+    ]
+    assert found[("PyPI::requests:2.0.0", "GHSA-cccc-cccc-0001")] == ("HIGH", False)
+    assert found[("NPM::lodash:4.17.0", "GHSA-aaaa-aaaa-0001")] == ("CRITICAL", True)
+    assert found[("NPM::lodash:4.17.0", "GHSA-aaaa-aaaa-0002")] == ("MEDIUM", False)
+    assert found[("NPM::minimist:1.2.0", "GHSA-bbbb-bbbb-0001")] == ("UNKNOWN", True)
+
+
+def test_main_passes_ort_config(with_ort: Workspace, tmp_path: Path) -> None:
+    code = mr.main(
+        [
+            "--targets-file",
+            str(with_ort.targets_file),
+            "--parts-dir",
+            str(with_ort.parts),
+            "--output-dir",
+            str(with_ort.out),
+            "--ort-config-repository",
+            "https://example.invalid/ort-config.git",
+            "--ort-config-revision",
+            "9.9.9",
+        ]
+    )
+    assert code == 0
+    ort = with_ort.json("_report/scan_report.json")["ort"]
+    assert (ort["config_repository"], ort["config_revision"]) == (
+        "https://example.invalid/ort-config.git",
+        "9.9.9",
+    )
+
+
+def test_main_leaves_ort_config_unknown_by_default(with_ort: Workspace) -> None:
+    code = mr.main(
+        [
+            "--targets-file",
+            str(with_ort.targets_file),
+            "--parts-dir",
+            str(with_ort.parts),
+            "--output-dir",
+            str(with_ort.out),
+        ]
+    )
+    assert code == 0
+    ort = with_ort.json("_report/scan_report.json")["ort"]
+    assert (ort["config_repository"], ort["config_revision"]) == (None, None)

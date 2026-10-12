@@ -37,6 +37,11 @@ DOCKER_HUB_ALIASES = {
 }
 GHCR_HOST = "ghcr.io"
 
+SCANNER_TRIVY = "trivy"
+SCANNER_ORT = "ort"
+
+KIND_FS = "fs"
+
 TAGS_PAGE_SIZE = 1000
 MAX_TAG_PAGES = 100
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -365,6 +370,7 @@ def make_target(
     """An image target; without a known tag the id is ``<image>-release``."""
     return {
         "id": target_id(image, tag or "release"),
+        "scanner": SCANNER_TRIVY,
         "kind": "image",
         "image": image,
         "tag": tag,
@@ -380,7 +386,8 @@ def make_source_target(git_ref: str, commit_sha: str) -> dict[str, Any]:
     """A filesystem target: ``git_ref`` (branch or tag) pinned to ``commit_sha``."""
     return {
         "id": source_target_id(git_ref),
-        "kind": "fs",
+        "scanner": SCANNER_TRIVY,
+        "kind": KIND_FS,
         "image": None,
         "tag": None,
         "ref": None,
@@ -389,6 +396,11 @@ def make_source_target(git_ref: str, commit_sha: str) -> dict[str, Any]:
         "status": "pending",
         "reason": None,
     }
+
+
+def make_ort_target(source_target: Mapping[str, Any]) -> dict[str, Any]:
+    """The ORT twin of a filesystem target: same subject, another scanner."""
+    return {**source_target, "scanner": SCANNER_ORT}
 
 
 def parse_images(raw: str) -> list[str]:
@@ -464,11 +476,13 @@ def resolve_image_targets(
 
 
 def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
-    seen: set[str] = set()
+    """A target is identified by its scanner and id (the id names the subject)."""
+    seen: set[tuple[str, str]] = set()
     for target in targets:
-        if target["id"] in seen:
+        identity = (target["scanner"], target["id"])
+        if identity in seen:
             raise ResolveError(f"target id collision: {target['id']!r}")
-        seen.add(target["id"])
+        seen.add(identity)
 
 
 def resolve_targets(
@@ -479,6 +493,7 @@ def resolve_targets(
     release_lines: int,
     scan_source: bool,
     scan_images: bool,
+    ort_enabled: bool,
     github: GitHubClient,
     registry: RegistryClient,
     environ: Mapping[str, str],
@@ -505,6 +520,10 @@ def resolve_targets(
                     registry, image, latest_release, release_lines, release_error
                 )
             )
+    if ort_enabled:
+        # After all trivy targets, in the same order; ORT scans sources only
+        ort_targets = [make_ort_target(t) for t in targets if t["kind"] == KIND_FS]
+        targets.extend(ort_targets)
     check_unique_ids(targets)
 
     server = environ.get("GITHUB_SERVER_URL", "https://github.com")
@@ -525,12 +544,15 @@ def resolve_targets(
     }
 
 
-def build_matrix(targets_doc: Mapping[str, Any]) -> list[dict[str, Any]]:
+def build_matrix(
+    targets_doc: Mapping[str, Any], scanner: str = SCANNER_TRIVY
+) -> list[dict[str, Any]]:
+    """The pending targets of one scanner (the matrix of its job)."""
     keys = ("id", "kind", "image", "tag", "ref", "git_ref", "commit_sha")
     return [
         {k: t[k] for k in keys}
         for t in targets_doc["targets"]
-        if t["status"] == "pending"
+        if t["status"] == "pending" and t["scanner"] == scanner
     ]
 
 
@@ -541,15 +563,15 @@ def format_output(name: str, value: str) -> str:
 
 
 def render_table(targets: Sequence[Mapping[str, Any]]) -> str:
-    rows = [("ID", "REF", "STATUS", "REASON")]
+    rows = [("ID", "SCANNER", "REF", "STATUS", "REASON")]
     rows += [
-        (t["id"], t["ref"] or t["kind"], t["status"], t["reason"] or "")
+        (t["id"], t["scanner"], t["ref"] or t["kind"], t["status"], t["reason"] or "")
         for t in targets
     ]
-    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    widths = [max(len(row[i]) for row in rows) for i in range(4)]
     lines = [
-        "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:3]))
-        + f"  {row[3]}"
+        "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:4]))
+        + f"  {row[4]}"
         for row in rows
     ]
     return "\n".join(line.rstrip() for line in lines)
@@ -597,6 +619,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scan-images", default="true", help="true/false (default: %(default)s)"
     )
     parser.add_argument(
+        "--ort-enabled",
+        default="false",
+        help="true/false: also scan the source targets with ORT (default: %(default)s)",
+    )
+    parser.add_argument(
         "--output-dir", required=True, type=Path, help="directory for targets.json"
     )
     parser.add_argument(
@@ -621,6 +648,7 @@ def run(
     images = parse_images(args.images)
     scan_source = parse_bool(args.scan_source, "scan-source")
     scan_images = parse_bool(args.scan_images, "scan-images")
+    ort_enabled = parse_bool(args.ort_enabled, "ort-enabled")
     token = args.github_token or environ.get("GITHUB_TOKEN") or None
 
     http = HttpClient(transport)
@@ -635,6 +663,7 @@ def run(
         release_lines=release_lines,
         scan_source=scan_source,
         scan_images=scan_images,
+        ort_enabled=ort_enabled,
         github=github,
         registry=registry,
         environ=environ,
@@ -655,16 +684,17 @@ def run(
 
     output_path = environ.get("GITHUB_OUTPUT")
     if output_path:
+        outputs = {
+            "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
+            "ort-matrix": json.dumps(
+                build_matrix(targets_doc, SCANNER_ORT), separators=(",", ":")
+            ),
+            "commit-sha": targets_doc["commit_sha"],
+            "default-branch": targets_doc["default_branch"],
+            "targets-file": str(targets_file),
+        }
         with open(output_path, "a", encoding="utf-8", newline="\n") as out:
-            out.write(
-                format_output(
-                    "matrix",
-                    json.dumps(build_matrix(targets_doc), separators=(",", ":")),
-                )
-            )
-            out.write(format_output("commit-sha", targets_doc["commit_sha"]))
-            out.write(format_output("default-branch", targets_doc["default_branch"]))
-            out.write(format_output("targets-file", str(targets_file)))
+            out.writelines(format_output(k, v) for k, v in outputs.items())
     return 0
 
 

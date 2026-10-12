@@ -1,0 +1,94 @@
+{
+  "repository": {
+    "vcs": {"type": "Git", "url": "https://example.invalid/example/app.git", "revision": "fedcba9876543210fedcba9876543210fedcba98", "path": ""},
+    "config": {}
+  },
+  "analyzer": {
+    "start_time": "2030-01-01T00:00:00Z",
+    "end_time": "2030-01-01T00:05:00Z",
+    "environment": {"ort_version": "94.2.0"},
+    "result": {
+      "projects": [
+        {"id": "NPM::example-app:1.0.0", "definition_file_path": "package.json"},
+        {"id": "PyPI::example-tools:0.1.0", "definition_file_path": "tools/poetry.lock"}
+      ],
+      "packages": [
+        {"id": "NPM::lodash:4.17.0", "purl": "pkg:npm/lodash@4.17.0"},
+        {"id": "NPM::minimist:1.2.0", "purl": "pkg:npm/minimist@1.2.0"},
+        {"id": "NPM::left-pad:1.3.0", "purl": "pkg:npm/left-pad@1.3.0"},
+        {"id": "PyPI::requests:2.0.0", "purl": "pkg:pypi/requests@2.0.0"},
+        {"id": "Maven:org.example:lib:1.0", "purl": "pkg:maven/org.example/lib@1.0"},
+        {"id": "NPM::lodash:4.17.0", "purl": "pkg:npm/lodash@4.17.0"}
+      ],
+      "issues": {},
+      "dependency_graphs": {}
+    }
+  },
+  "advisor": {
+    "start_time": "2030-01-01T00:05:00Z",
+    "end_time": "2030-01-01T00:10:00Z",
+    "environment": {"ort_version": "94.2.0"},
+    "config": {},
+    "provider_issues": [],
+    "results": {
+      "NPM::lodash:4.17.0": [
+        {
+          "advisor": {"name": "OSV"},
+          "summary": {"start_time": "2030-01-01T00:05:00Z", "end_time": "2030-01-01T00:10:00Z"},
+          "vulnerabilities": [
+            {
+              "id": "GHSA-aaaa-aaaa-0001",
+              "summary": "Synthetic advisory one",
+              "references": [
+                {"url": "https://example.invalid/a1", "scoring_system": "CVSS_V3", "severity": "MODERATE", "vector": "CVSS:3.1/AV:N"},
+                {"url": "https://example.invalid/a1-b", "scoring_system": "CVSS_V3", "severity": "CRITICAL", "vector": "CVSS:3.1/AV:N"}
+              ],
+              "first_fixed_versions": ["4.17.21"]
+            },
+            {
+              "id": "GHSA-aaaa-aaaa-0002",
+              "summary": "Synthetic advisory two",
+              "references": [
+                {"url": "https://example.invalid/a2", "severity": "MODERATE"}
+              ]
+            }
+          ]
+        }
+      ],
+      "NPM::minimist:1.2.0": [
+        {
+          "advisor": {"name": "OSV"},
+          "summary": {"start_time": "2030-01-01T00:05:00Z", "end_time": "2030-01-01T00:10:00Z"},
+          "vulnerabilities": [
+            {"id": "GHSA-bbbb-bbbb-0001", "references": [], "first_fixed_versions": ["1.2.6"]}
+          ]
+        }
+      ],
+      "PyPI::requests:2.0.0": [
+        {
+          "advisor": {"name": "OSV"},
+          "summary": {"start_time": "2030-01-01T00:05:00Z", "end_time": "2030-01-01T00:10:00Z"},
+          "vulnerabilities": [
+            {"id": "GHSA-cccc-cccc-0001", "references": [{"url": "https://example.invalid/c1", "severity": "LOW"}]}
+          ]
+        },
+        {
+          "advisor": {"name": "OSV"},
+          "summary": {"start_time": "2030-01-01T00:05:00Z", "end_time": "2030-01-01T00:10:00Z"},
+          "vulnerabilities": [
+            {"id": "GHSA-cccc-cccc-0001", "references": [{"url": "https://example.invalid/c1", "severity": "HIGH"}]}
+          ]
+        }
+      ],
+      "Maven:org.example:lib:1.0": [
+        {
+          "advisor": {"name": "OSV"},
+          "summary": {"start_time": "2030-01-01T00:05:00Z", "end_time": "2030-01-01T00:10:00Z"},
+          "vulnerabilities": [
+            {"id": "GHSA-dddd-dddd-0001", "references": [{"url": "https://example.invalid/d1", "severity": "BOGUS"}]}
+          ]
+        }
+      ]
+    }
+  }
+}

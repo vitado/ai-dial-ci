@@ -6,13 +6,19 @@ inputs:
     description: Path to targets.json produced by the sca_resolve_targets action
     required: true
   parts-dir:
-    description: Directory with the per-scanner scan parts (<scanner>/<id>.json, <scanner>/<id>.status.json, optional <scanner>/<id>.txt; trivy is the only scanner today)
+    description: Directory with the per-scanner scan parts (<scanner>/<id>.json, <scanner>/<id>.status.json, optional <scanner>/<id>.txt; scanners are trivy and ort)
     required: true
   output-dir:
-    description: Directory to write the report into (summary.md, _report/, _native/trivy/)
+    description: Directory to write the report into (summary.md, _report/, _native/<scanner>/)
     required: true
   trivy-db-info:
     description: 'JSON object {"vulnerability_db_updated_at": ..., "java_db_updated_at": ...} describing the Trivy DB snapshot of the run; empty means unknown'
+    default: ""
+  ort-config-repository:
+    description: ORT configuration repository the run used; recorded in scan_report.json when ORT targets exist, empty means unknown
+    default: ""
+  ort-config-revision:
+    description: ORT configuration revision the run used; recorded in scan_report.json when ORT targets exist, empty means unknown
     default: ""
   step-summary:
     description: Whether to append summary.md to the job summary
@@ -43,10 +49,14 @@ runs:
         OUTPUT_DIR: ${{ inputs.output-dir }}
         STEP_SUMMARY: ${{ inputs.step-summary }}
         TRIVY_DB_INFO: ${{ inputs.trivy-db-info }}
+        ORT_CONFIG_REPOSITORY: ${{ inputs.ort-config-repository }}
+        ORT_CONFIG_REVISION: ${{ inputs.ort-config-revision }}
       run: |
         python "$ACTION_PATH/merge_results.py" \
           --targets-file "$TARGETS_FILE" \
           --parts-dir "$PARTS_DIR" \
           --output-dir "$OUTPUT_DIR" \
           --step-summary "$STEP_SUMMARY" \
-          --trivy-db-info "$TRIVY_DB_INFO"
+          --trivy-db-info "$TRIVY_DB_INFO" \
+          --ort-config-repository "$ORT_CONFIG_REPOSITORY" \
+          --ort-config-revision "$ORT_CONFIG_REVISION"

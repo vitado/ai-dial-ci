@@ -39,6 +39,22 @@ on:
         type: string
         description: Trivy Java DB repositories (comma-separated, tried in order)
         default: "mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
+      ort-enabled:
+        type: boolean
+        description: Also scan the source code with ORT (analyzer and advisor with OSV). Its findings are counted in the report but not merged into the findings yet
+        default: false
+      ort-version:
+        type: string
+        description: ORT version to use
+        default: "94.2.0"
+      ort-config-repository:
+        type: string
+        description: ORT config repository to use
+        default: ${{ vars.ORT_CONFIG_VCS_URL || 'https://github.com/epam/ai-dial-ort-config.git' }}
+      ort-config-revision:
+        type: string
+        description: ORT config revision to use
+        default: ${{ vars.ORT_CONFIG_VCS_REVISION || '92.5.0' }}
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
@@ -64,6 +80,7 @@ jobs:
       packages: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
+      ort-matrix: ${{ steps.targets.outputs.ort-matrix }}
     steps:
       - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
         id: targets
@@ -74,6 +91,7 @@ jobs:
           release-lines: ${{ inputs.release-lines }}
           scan-source: ${{ inputs.scan-source }}
           scan-images: ${{ inputs.scan-images }}
+          ort-enabled: ${{ inputs.ort-enabled }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -279,8 +297,147 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ORT (analyzer + advisor with OSV) scans the source code next to Trivy. It runs in its own job and its failure
+  # is a failed target like Trivy's, but its findings are not merged into the records yet (see sca_merge_results)
+  ort:
+    needs: targets
+    if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.ort-matrix != '[]' }}
+    name: ORT ${{ matrix.target.id }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.ort-matrix) }}
+    env:
+      TARGET_ID: ${{ matrix.target.id }}
+    steps:
+      - name: Prepare output directory
+        run: mkdir -p "$RUNNER_TEMP/sca-out/ort"
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          # The commit the targets job resolved for this target, not a moving branch
+          ref: ${{ matrix.target.commit_sha }}
+          persist-credentials: false
+          lfs: true
+      - name: Detect Gradle build
+        id: stack
+        run: |
+          if [ -f gradlew ] && { [ -f build.gradle ] || [ -f build.gradle.kts ]; }; then
+            echo "java=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "java=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare Java
+        id: java
+        if: ${{ steps.stack.outputs.java == 'true' }}
+        uses: epam/ai-dial-ci/actions/java_prepare@4.12.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          java-distribution: ${{ inputs.java-distribution }}
+      # The ORT image has JDK 25 only, which Gradle 8.x cannot run on, and `javaVersion` would download a JDK from
+      # foojay, an extra service to depend on. So the JDK set up above is mounted into the container and used as
+      # the Gradle JDK (`javaHome`); a `customJdkUrl` of the repository `.ort.yml` still takes precedence over it
+      - name: Configure ORT for Gradle
+        id: gradle
+        if: ${{ steps.stack.outputs.java == 'true' }}
+        env:
+          JDK_MOUNT: /opt/jdk-host
+        run: |
+          echo "docker-cli-args=-v $JAVA_HOME:$JDK_MOUNT:ro" >> "$GITHUB_OUTPUT"
+          echo "ort-cli-args=-P ort.analyzer.packageManagers.GradleInspector.options.javaHome=$JDK_MOUNT" >> "$GITHUB_OUTPUT"
+      # ORT chooses the package managers itself (its defaults), so there is no per-stack setup here. It sets no HTTP
+      # timeouts, so a hung request would block the job for 6 hours; the step timeout stops it earlier and lets the
+      # status step below report the target as failed
+      - name: Run ORT
+        id: ort
+        timeout-minutes: 60
+        uses: oss-review-toolkit/ort-ci-github-action@086d928d24ef1653dc0777296b312fda5faaaf52 # v1.2.0
+        with:
+          image: "ghcr.io/oss-review-toolkit/ort-minimal:${{ inputs.ort-version }}"
+          run: "analyzer, advisor"
+          advisors: OSV
+          allow-dynamic-versions: "true"
+          # Percentage of the runner memory instead of a fixed size, which depends on the runner and on the
+          # repository visibility
+          ort-jdk-java-options: "-XX:MaxRAMPercentage=75.0"
+          ort-cli-args: >-
+            -P ort.forceOverwrite=true
+            --stacktrace
+            ${{ steps.gradle.outputs.ort-cli-args }}
+          docker-cli-args: >-
+            -e GPR_USERNAME=${{ github.actor }}
+            -e GPR_PASSWORD=${{ secrets.GITHUB_TOKEN }}
+            ${{ steps.gradle.outputs.docker-cli-args }}
+          ort-config-repository: ${{ inputs.ort-config-repository }}
+          ort-config-revision: ${{ inputs.ort-config-revision }}
+      # The action swallows the ORT exit code 2 (issues) and its `fail-on` does not work for the advisor, so the
+      # verdict is made here from the result. The status is written even if ORT failed: a failed target must not
+      # look like a clean one
+      - name: Write scan status
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          GRADLE_OUTCOME: ${{ steps.gradle.outcome }}
+          ORT_OUTCOME: ${{ steps.ort.outcome }}
+        run: |
+          out="$RUNNER_TEMP/sca-out/ort"
+          result="$HOME/.ort/ort-results/advisor-result.json"
+          status=ok
+          reason=
+          for step in "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "gradle configuration:$GRADLE_OUTCOME" "ort run:$ORT_OUTCOME"; do
+            outcome="${step#*:}"
+            if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
+              status=failed
+              reason="${step%%:*} $outcome"
+              break
+            fi
+          done
+          analyzer_errors=0
+          advisor_errors=0
+          # Error issues: anywhere under `analyzer` (as the gates' "Fail on ORT Analyzer errors"), and the provider
+          # issues and per-package advisor issues. Since ORT 93 a failed OSV request ends up in the latter
+          analyzer_issues='[.analyzer | .. | objects | select(has("severity") and has("message")) | select(.severity == "ERROR")]'
+          advisor_issues='[(.advisor.provider_issues // [])[], ((.advisor.results // {}) | .[][] | (.summary.issues // [])[]) | select(.severity == "ERROR")]'
+          describe='.[:20][] | "[\(.severity)] \(.source // "unknown"): \(.message)"'
+          if [ -f "$result" ] && jq -e . "$result" > /dev/null 2>&1; then
+            # Kept even for a failed target, for audit
+            cp "$result" "$out/$TARGET_ID.json"
+            analyzer_errors="$(jq "$analyzer_issues | length" "$result")"
+            advisor_errors="$(jq "$advisor_issues | length" "$result")"
+            echo "Analyzer ERROR issues: $analyzer_errors, advisor ERROR issues: $advisor_errors"
+            if [ "$analyzer_errors" -gt 0 ] || [ "$advisor_errors" -gt 0 ]; then
+              jq -r "$analyzer_issues | $describe" "$result"
+              jq -r "$advisor_issues | $describe" "$result"
+              if [ "$status" = "ok" ]; then
+                status=failed
+                reason="ort reported $analyzer_errors analyzer and $advisor_errors advisor error issue(s)"
+              fi
+            fi
+          elif [ "$status" = "ok" ]; then
+            status=failed
+            reason="advisor result is missing or is not valid JSON"
+          fi
+          jq -n --arg id "$TARGET_ID" --arg status "$status" --arg reason "$reason" --argjson analyzer_errors "$analyzer_errors" --argjson advisor_errors "$advisor_errors" \
+            '{id: $id, status: $status, reason: (if $reason == "" then null else $reason end), analyzer_errors: $analyzer_errors, advisor_errors: $advisor_errors}' \
+            > "$out/$TARGET_ID.status.json"
+          cat "$out/$TARGET_ID.status.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: sca-part-ort-${{ matrix.target.id }}
+          path: ${{ runner.temp }}/sca-out/
+          retention-days: 1
+          if-no-files-found: error
+
   report:
-    needs: [targets, trivy-db, trivy]
+    needs: [targets, trivy-db, trivy, ort]
     # Without the targets result there is nothing to report on; the run is red anyway because the targets job failed
     if: ${{ always() && needs.targets.result == 'success' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
@@ -300,6 +457,8 @@ jobs:
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca
           trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
+          ort-config-repository: ${{ inputs.ort-config-repository }}
+          ort-config-revision: ${{ inputs.ort-config-revision }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

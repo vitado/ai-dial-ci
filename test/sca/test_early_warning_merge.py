@@ -27,9 +27,20 @@ GENERATED_FROM = {
     "days": 90,
     "from": "2029-10-12T10:00:00Z",
     "to": "2030-01-01T10:00:00Z",
-    "feed": "https://example.invalid/feed",
-    "assets": 91,
+}
+INDEX = {
+    "ref": "ghcr.io/example/ai-dial-sca-cve-index:1",
+    "digest": "sha256:" + "0123456789abcdef" * 4,
+    "built_at": "2030-01-01T03:21:00Z",
     "gaps": [],
+}
+HISTORY = {
+    "basis": "cna_history",
+    "cna": "Google",
+    "confirmed": 119,
+    "errors": 4,
+    "pending": 7,
+    "ratio": 0.9675,
 }
 
 
@@ -59,6 +70,7 @@ def candidate(
         "package": package or GUAVA,
         "affected_range": ">= 4.0, < 33.7.2",
         "rule": "T2",
+        "confidence": HISTORY,
         "severity": severity,
         "severity_source": "cna" if cvss else None,
         "cvss": cvss,
@@ -75,6 +87,7 @@ def write_part(
     status: str = "ok",
     reason: str | None = None,
     generated_from: dict[str, Any] | None = None,
+    index: dict[str, Any] | None = INDEX,
 ) -> None:
     part = ws.parts / "early-warning"
     part.mkdir(parents=True, exist_ok=True)
@@ -86,6 +99,7 @@ def write_part(
                 "window_days": 90,
                 "records_scanned": 4321,
                 "candidates": len(candidates or []),
+                "index": index,
                 "diagnostics": {},
             }
         ),
@@ -176,6 +190,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "candidates": 1,
         "reported": 1,
         "packages": 1,
+        "index": INDEX,
     }
     document = ws.json("_report/early_warning.json")
     assert document["schema_version"] == 1
@@ -193,6 +208,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "package": GUAVA,
         "affected_range": ">= 4.0, < 33.7.2",
         "rule": "T2",
+        "confidence": HISTORY,
         "severity": "HIGH",
         "severity_source": "cna",
         "cvss": {
@@ -386,7 +402,8 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
                 severity="MEDIUM",
                 score=5.0,
                 cna="bcorg",
-                rule="T1",
+                rule="repo-level",
+                confidence={"basis": "name_match"},
                 affected_range="< 1.86",
             ),
         ],
@@ -400,8 +417,8 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
     ) in text
     lines = text.splitlines()
     header = (
-        "| Package | Severity | CVE | CNA | Published | Affected | Rule | Exposure "
-        "| Where |"
+        "| Package | Severity | CVE | CNA | Published | Affected | Rule "
+        "| Confidence | Exposure | Where |"
     )
     start = lines.index(header)
     table = []
@@ -421,14 +438,15 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
     ) in guava
     # distinct values only
     assert (
-        "| Google | 2030-01-05 | &lt; 33.8.0 · &gt;= 4.0, &lt; 33.7.2 | T2 |" in guava
+        "| Google | 2030-01-05 | &lt; 33.8.0 · &gt;= 4.0, &lt; 33.7.2 | T2 "
+        "| 97% · Google 119/123 confirmed |" in guava
     )
     assert "development only" in guava
     assert "image :development" in guava
     assert "source gradle.lockfile" in guava
     assert bcprov.startswith("| org.bouncycastle:bcprov-jdk18on 1.85 | MEDIUM 5.0 | ")
     assert "| bcorg |" in bcprov
-    assert "| T1 |" in bcprov
+    assert "| repo-level | name match |" in bcprov
     assert "<details>" not in section  # up to 5 packages stay open
 
 
@@ -456,6 +474,70 @@ def test_summary_section_is_collapsed_above_five_packages(ws: Workspace) -> None
     )
     merge(five)
     assert "Show the" not in summary(five)
+
+
+def history(confirmed: int, errors: int, cna: str | None = "VulnCheck") -> dict:
+    ratio = confirmed / (confirmed + errors) if confirmed + errors else None
+    return {
+        "basis": "cna_history",
+        "cna": cna,
+        "confirmed": confirmed,
+        "errors": errors,
+        "pending": 3,
+        "ratio": ratio,
+    }
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected"),
+    [
+        (history(119, 4), "97% · VulnCheck 119/123 confirmed"),
+        (history(0, 0, "Google"), "no history · Google 0/0"),
+        (history(10, 0), "100% · VulnCheck 10/10 confirmed"),
+        # rounded up to 100 would hide the error
+        (history(299, 1), "99% · VulnCheck 299/300 confirmed"),
+        (history(0, 5), "0% · VulnCheck 0/5 confirmed"),
+        (history(4, 0, None), "100% · ? 4/4 confirmed"),
+        ({"basis": "name_match"}, "name match"),
+    ],
+)
+def test_confidence_text(confidence: dict[str, Any], expected: str) -> None:
+    assert mr.confidence_text(confidence) == expected
+
+
+def test_a_candidate_with_an_unknown_or_missing_confidence_is_unavailable(
+    ws: Workspace,
+) -> None:
+    for confidence in ({"basis": "magic"}, {"basis": "cna_history"}, None, "high"):
+        write_part(ws, [candidate(confidence=confidence)])
+        assert merge(ws)["status"] == "failed"
+    broken = candidate()
+    del broken["confidence"]
+    write_part(ws, [broken])
+    assert merge(ws)["status"] == "failed"
+
+
+def test_the_confidence_does_not_filter_or_reorder_the_entries(ws: Workspace) -> None:
+    write_part(
+        ws,
+        [
+            candidate("CVE-2030-0001", confidence=history(0, 9)),
+            candidate("CVE-2030-0002", confidence={"basis": "name_match"}),
+            candidate("CVE-2030-0003", severity="CRITICAL", score=9.8),
+        ],
+    )
+    merge(ws)
+    assert [e["cve"] for e in entries(ws)] == [
+        "CVE-2030-0003",
+        "CVE-2030-0001",  # the worst confidence, and still before the next one
+        "CVE-2030-0002",
+    ]
+    assert entries(ws)[1]["confidence"] == history(0, 9)
+
+
+def test_short_digest() -> None:
+    assert mr.short_digest("sha256:" + "ab" * 32) == "sha256:" + "ab" * 6
+    assert mr.short_digest(None) is None
 
 
 def test_severity_text_names_the_source_and_exploitation() -> None:
@@ -588,26 +670,65 @@ def test_totals_line_places_the_early_warning_after_the_osv_count() -> None:
 # ------------------------------------------------------------------- footer
 
 
-def test_footer_names_the_feed_window_and_the_gaps(ws: Workspace) -> None:
+def test_footer_names_the_index_the_window_and_the_gaps(ws: Workspace) -> None:
     write_part(ws, [candidate()])
     merge(ws)
     assert (
-        "<sub>Early warning: CVE records published or updated in the last 90 days "
+        "<sub>Early warning: CVE index of 2030-01-01 03:21Z (sha256:0123456789ab), "
+        "records published or updated in the last 90 days "
         "(since 2029-10-12 10:00Z), 4321 checked</sub>"
     ) in summary(ws)
-    write_part(
-        ws, [candidate()], generated_from={**GENERATED_FROM, "gaps": ["2029-12-24"]}
+    gap = {"from": "2029-12-24T04:00:00Z", "to": "2029-12-24T07:00:00Z"}
+    write_part(ws, [candidate()], index={**INDEX, "gaps": [gap]})
+    report = merge(ws)
+    assert report["index"]["gaps"] == [gap]
+    assert "· feed gaps: 2029-12-24T04:00:00Z to 2029-12-24T07:00:00Z</sub>" in summary(
+        ws
     )
-    merge(ws)
-    assert "· feed gaps: 2029-12-24</sub>" in summary(ws)
+
+
+def test_many_gaps_are_listed_up_to_a_few_and_counted(ws: Workspace) -> None:
+    gaps = [
+        {"from": f"2029-12-{day:02d}T04:00:00Z", "to": f"2029-12-{day:02d}T05:00:00Z"}
+        for day in range(10, 18)
+    ]
+    write_part(ws, [], index={**INDEX, "gaps": gaps})
+    assert merge(ws)["index"]["gaps"] == gaps  # the report has all of them
+    text = summary(ws)
+    assert "2029-12-14T04:00:00Z to 2029-12-14T05:00:00Z and 3 more</sub>" in text
+    assert "2029-12-15" not in text
 
 
 def test_footer_is_there_when_nothing_is_reported(ws: Workspace) -> None:
     write_part(ws, [])
     report = merge(ws)
     assert report["reported"] == 0
-    assert "Early warning: CVE records published or updated" in summary(ws)
+    assert "Early warning: CVE index of" in summary(ws)
     assert entries(ws) == []
+
+
+def test_the_report_has_the_index_of_a_failed_part_too(ws: Workspace) -> None:
+    write_part(ws, status="failed", reason="the delta cannot be read")
+    assert merge(ws)["index"] == INDEX
+    write_part(ws, status="failed", reason="cannot pull the index", index=None)
+    assert merge(ws)["index"] is None
+
+
+def test_an_ok_part_without_an_index_is_unavailable(ws: Workspace) -> None:
+    write_part(ws, [candidate()], index=None)
+    report = merge(ws)
+    assert report["status"] == "failed"
+    assert "no index" in report["reason"]
+
+
+@pytest.mark.parametrize(
+    "index", [{"ref": "r"}, {**INDEX, "gaps": [{"from": "x"}]}, "not an object"]
+)
+def test_an_index_that_is_not_valid_is_unavailable(ws: Workspace, index: Any) -> None:
+    write_part(ws, [candidate()], index=index)
+    report = merge(ws)
+    assert report["status"] == "failed"
+    assert "index is not valid" in report["reason"]
 
 
 # ------------------------------------------------------------ failure semantics

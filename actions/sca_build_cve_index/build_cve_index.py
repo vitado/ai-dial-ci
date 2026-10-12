@@ -47,8 +47,8 @@ A confirmed claim whose affected versions disagree with OSV (the CNA says a fixe
 version is affected or a version OSV lists as vulnerable is not) is flagged
 ``range_differs`` in the evidence and is not counted as an error: it is the package
 the CNA is trusted for here, and judging ranges across version schemes is a problem
-of its own. The tier of a CNA is not decided here: the caller computes it from the
-counts and its own threshold.
+of its own. How far a CNA is believed is not decided here: the early warning shows
+the counts of a CNA as the confidence of its signals, without a threshold.
 
 A feed with holes does not fail the build: every hour of every day of the covered
 span must be covered by the ``end_of_day`` delta of its day or by its own hourly

@@ -11,10 +11,31 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "actions" / "sca_build_cve_index" / "previous_index.sh"
-BASH = shutil.which("bash")
 IMAGE = "ghcr.io/epam/ai-dial-sca-cve-index"
 
-pytestmark = pytest.mark.skipif(BASH is None, reason="bash is needed")
+
+def find_bash() -> str | None:
+    """The bash that runs the script. On Windows the first ``bash`` of the PATH can be
+    the WSL launcher of System32, which takes Linux paths and does not see the
+    Windows ones of the fake tools and of the script; the bash of Git for Windows
+    (next to the ``git`` of the PATH) is used instead.
+    """
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    for parent in Path(git).resolve().parents[:3] if git else ():
+        bash = parent / "bin" / "bash.exe"
+        if bash.is_file():
+            return str(bash)
+    return None
+
+
+BASH = find_bash()
+
+pytestmark = pytest.mark.skipif(
+    BASH is None,
+    reason="bash is needed (on Windows the bash of Git for Windows, found from git)",
+)
 
 FAKE_GH = """#!/usr/bin/env bash
 echo "gh $*" >> "$CALLS"
@@ -63,7 +84,7 @@ def run(
         "BOOTSTRAP": bootstrap,
     }
     result = subprocess.run(
-        [BASH, str(SCRIPT)], env=env, capture_output=True, text=True, check=False
+        [BASH, SCRIPT.as_posix()], env=env, capture_output=True, text=True, check=False
     )
     made = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
     written = output.read_text(encoding="utf-8") if output.exists() else ""

@@ -16,17 +16,36 @@ Inputs:
   * targets.json written by sca_resolve_targets;
   * a parts directory with the ``trivy/`` parts (``<id>.json`` and
     ``<id>.status.json`` of every Trivy target): the package inventory;
-  * the CVE records published or updated in the last ``--window-days`` days: the
-    delta zips of the cvelistV5 GitHub releases (one ``end_of_day`` delta per past
-    day, the hourly deltas of today);
+  * the central CVE index (see sca_build_cve_index), an OCI artifact pulled with
+    ORAS (``--cve-index``), or a directory that holds one (``--index-dir``, for
+    tests and for running the script by hand with no registry): the CVE records of
+    the last 180 days and the reputation of their CNAs. The deltas of the cvelistV5
+    releases since the index was built are applied to its records, with the code of
+    the builder (the ``end_of_day`` delta of each past day, the hourly deltas of
+    today, the delta log for what they lack), so the records are hours old and not
+    a day. There is no other source of records: no index, no early warning;
   * the source repository of each package, from deps.dev (API v3).
 
 Outputs (``<output-dir>/early-warning/``):
   * ``status.json`` - ``{status, reason, window_days, records_scanned,
-    candidates, diagnostics}``; status is ``ok``, ``failed`` or ``skipped``;
+    candidates, index, diagnostics}``; status is ``ok``, ``failed`` or ``skipped``;
+    ``index`` is ``{ref, digest, built_at, gaps}`` (``gaps``: the hours of the
+    window for which the feed had no delta, the index's and those of the deltas
+    applied since), or null if no index was read;
   * ``candidates.json`` (``ok`` only) - ``{schema_version, generated_utc,
     generated_from, candidates[]}``; a candidate is one CVE for one package
-    version, with the CNA data it was matched by and where the package was seen.
+    version, with the CNA data it was matched by, how far the match can be trusted
+    (``confidence``) and where the package was seen.
+
+Confidence. There are no tiers and no threshold here: the signal is shown with the
+numbers that say how far it can be believed, and what is done with it is a policy of
+the report and of the notifications. For T1 and T2 (the CNA itself named the package
+or the repository) it is the history of that CNA in the index: of the claims of its
+records in the window, how many a vulnerability database confirmed
+(``basis: cna_history``, ``cna``, ``confirmed``, ``errors``, ``pending`` and
+``ratio = confirmed / (confirmed + errors)``, null with no resolved claim). For T3
+and repo-level, where the CVE only matches by names, the history of the CNA says
+nothing about our matching error, so there is none (``basis: name_match``).
 
 Matching (the narrow form recommended by the study of the CVE feed; only npm, PyPI,
 Maven and Cargo packages, OS packages are out of scope like in OSV):
@@ -48,30 +67,32 @@ The affected versions are checked with the version scheme of the package
 ecosystem. A version that cannot be parsed or compared never makes a match
 (precision over recall); these are counted in the diagnostics.
 
-A failure of the feed or of deps.dev is not a failure of the scan: the status is
-``failed`` with a reason and the script exits 0 (the report says "Early warning
-unavailable"). Only an unusable input exits non-zero.
+A failure of the index, of the deltas or of deps.dev is not a failure of the scan:
+the status is ``failed`` with a reason and the script exits 0 (the report says
+"Early warning unavailable"). Only an unusable input exits non-zero.
 
-The HTTP layer is injectable: every request goes through a ``Transport`` (a
-callable ``(method, url, headers, body) -> Response``), so the logic can be tested
-with a fake transport and no network. Python standard library only.
+The HTTP layer of deps.dev is injectable: every request goes through a ``Transport``
+(a callable ``(method, url, headers, body) -> Response``), the downloads of the
+deltas through the ``Downloader`` of the builder and the ORAS call through a
+``subprocess.run``-like runner, so the logic can be tested with fakes and no
+network. Python standard library only (and the ``oras`` command).
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import re
 import secrets
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +103,7 @@ from pathlib import Path
 from typing import Any
 
 FEED_URL = "https://github.com/CVEProject/cvelistV5/releases/download"
+ORAS_TIMEOUT_SECONDS = 300
 DEPSDEV_URL = "https://api.deps.dev"
 USER_AGENT = "ai-dial-ci-sca-early-warning"
 
@@ -94,9 +116,6 @@ CLASS_LANGUAGE_PACKAGES = "lang-pkgs"
 SCHEMA_VERSION = 1
 PART_DIR = "early-warning"
 
-DEFAULT_WINDOW_DAYS = 90
-MAX_WINDOW_DAYS = 365
-
 REQUEST_TIMEOUT_SECONDS = 60.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
@@ -104,13 +123,8 @@ MAX_RETRY_AFTER_SECONDS = 60.0
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
-# A delta zip is a few MB; this only stops an answer that is not one
+# deps.dev answers are small; this only stops an answer that is not one
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
-# A CVE record is some kB; a member that is much larger is not read
-MAX_MEMBER_BYTES = 8 * 1024 * 1024
-# The hourly release of an hour appears up to an hour after it: the latest hours of
-# today may be missing without being a gap
-HOURLY_GRACE_HOURS = 2
 DEPSDEV_WORKERS = 4
 # deps.dev is considered unavailable after this many failed requests in a row
 DEPSDEV_BREAKER = 10
@@ -149,8 +163,8 @@ class TransportError(Exception):
     """A network-level failure (DNS, connection, timeout)."""
 
 
-class FeedError(Exception):
-    """The CVE feed cannot be read completely."""
+class IndexUnavailable(Exception):
+    """The CVE index cannot be pulled, read or brought up to date."""
 
 
 class DepsDevError(Exception):
@@ -1014,7 +1028,7 @@ def resolve_repos(
 
 
 # --------------------------------------------------------------------------
-# The CVE feed
+# CVE records: severity, the slim form, the names of the feed assets
 # --------------------------------------------------------------------------
 
 
@@ -1206,34 +1220,6 @@ def slim_record(document: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def read_delta_zip(data: bytes) -> tuple[list[dict[str, Any]], int]:
-    """``(slim records, unreadable members)`` of a delta zip."""
-    records: list[dict[str, Any]] = []
-    unreadable = 0
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile as err:
-        raise FeedError(f"not a valid zip file: {err}") from err
-    with archive:
-        for info in archive.infolist():
-            base = info.filename.rsplit("/", 1)[-1]
-            if not (base.startswith("CVE-") and base.endswith(".json")):
-                continue
-            if info.file_size > MAX_MEMBER_BYTES:
-                unreadable += 1
-                continue
-            try:
-                record = slim_record(json.loads(archive.read(info)))
-            except (ValueError, zipfile.BadZipFile):
-                unreadable += 1
-                continue
-            if record is None or not record["cve"]:
-                unreadable += 1
-                continue
-            records.append(record)
-    return records, unreadable
-
-
 def end_of_day_asset(day: date) -> str:
     return f"cve_{day}_at_end_of_day/{day}_delta_CVEs_at_end_of_day.zip"
 
@@ -1242,93 +1228,197 @@ def hourly_asset(day: date, hour: int) -> str:
     return f"cve_{day}_{hour:02d}00Z/{day}_delta_CVEs_at_{hour:02d}00Z.zip"
 
 
-@dataclass
-class FeedResult:
-    # The latest PUBLISHED version of each record updated inside the window
-    records: dict[str, dict[str, Any]] = field(default_factory=dict)
-    assets: int = 0
-    bytes: int = 0
-    gaps: list[str] = field(default_factory=list)
-    unreadable: int = 0
+# --------------------------------------------------------------------------
+# The CVE index
+# --------------------------------------------------------------------------
+
+REPUTATION_FILE = "reputation.json"
+BASIS_CNA_HISTORY = "cna_history"
+BASIS_NAME_MATCH = "name_match"
+STATE_PUBLISHED = "PUBLISHED"
+_BUILDER_DIR = Path(__file__).resolve().parents[1] / "sca_build_cve_index"
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
-class FeedClient:
-    def __init__(self, http: HttpClient, feed_url: str) -> None:
-        self._http = http
-        self._feed_url = feed_url.rstrip("/")
-        self._headers = {"User-Agent": USER_AGENT}
-
-    def download(self, asset: str) -> bytes | None:
-        """The asset, or None if the release does not have it (404)."""
-        url = f"{self._feed_url}/{asset}"
-        try:
-            response = self._http.request("GET", url, self._headers, None)
-        except TransportError as err:
-            raise FeedError(str(err)) from err
-        if response.status == HTTP_NOT_FOUND:
-            return None
-        if response.status != HTTP_OK:
-            raise FeedError(f"GET {url}: HTTP {response.status}")
-        return response.body
-
-
-def collect_feed(client: FeedClient, now: datetime, window_days: int) -> FeedResult:
-    """The records published or updated in the last ``window_days`` days.
-
-    A delta holds the latest version of the records that changed in its period, so
-    the deltas of the days of the window hold exactly them: the ``end_of_day`` delta
-    of each past day, else (not published yet or missing) its 24 hourly deltas, and
-    the hourly deltas of today. A day or hour without any asset is a gap, reported
-    and not an error, except for the latest hours of today (see
-    HOURLY_GRACE_HOURS). A delta that cannot be downloaded or read is a FeedError.
+def builder() -> Any:
+    """The module of the index builder, a sibling action: its code reads the index and
+    applies the deltas to it. Imported when needed, not at the top: the builder
+    imports this module for its helpers (names, versions, the form of a record), and a
+    cycle of imports at load time would depend on which of the two runs as a script.
     """
-    now = now.astimezone(UTC)
-    cutoff = now - timedelta(days=window_days)
-    result = FeedResult()
-    latest: dict[str, dict[str, Any]] = {}
+    if str(_BUILDER_DIR) not in sys.path:
+        sys.path.insert(0, str(_BUILDER_DIR))
+    import build_cve_index
 
-    def add(asset: str) -> bool:
-        data = client.download(asset)
-        if data is None:
-            return False
+    return build_cve_index
+
+
+@dataclass
+class IndexData:
+    """The CVE index as read: the records (the latest version of each), the reputation
+    of the CNAs (``cnas``: name -> ``{confirmed, errors, pending}``), its metadata and
+    the gaps of the feed in its window (``{from, to}`` ranges of hours). ``ref`` and
+    ``digest`` say which artifact it is (no digest for a directory).
+    """
+
+    records: dict[str, dict[str, Any]]
+    cnas: dict[str, dict[str, int]]
+    metadata: dict[str, Any]
+    ref: str
+    digest: str | None = None
+    gaps: list[dict[str, str]] = field(default_factory=list)
+
+
+def pull_index(ref: str, dest: Path, run: Runner = subprocess.run) -> str:
+    """Pull the index artifact into ``dest`` with ORAS, anonymously; return its digest.
+
+    The reference is resolved to a digest first and the artifact pulled by that
+    digest, so that the digest in the report is that of what was read, even if the
+    tag moves in between. ORAS or the registry failing is IndexUnavailable.
+    """
+
+    def oras(*arguments: str) -> str:
         try:
-            records, unreadable = read_delta_zip(data)
-        except FeedError as err:
-            raise FeedError(f"{asset}: {err}") from err
-        result.assets += 1
-        result.bytes += len(data)
-        result.unreadable += unreadable
-        for record in records:
-            known = latest.get(record["cve"])
-            when, known_when = parse_time(record["updated"]), None
-            if known is not None:
-                known_when = parse_time(known["updated"])
-            if known is None or (when and (known_when is None or when >= known_when)):
-                latest[record["cve"]] = record
-        return True
+            done = run(
+                ["oras", *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=ORAS_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            raise IndexUnavailable(f"cannot pull {ref}: {err}") from err
+        if done.returncode != 0:
+            lines = (done.stderr or "").strip().splitlines()
+            reason = lines[-1] if lines else f"exit code {done.returncode}"
+            raise IndexUnavailable(
+                f"cannot pull {ref}: oras {arguments[0]} failed: {reason}"
+            )
+        return done.stdout.strip()
 
-    first = cutoff.date()
-    today = now.date()
-    day = first
-    while day <= today:
-        if day < today:
-            if not add(end_of_day_asset(day)):
-                hours = [add(hourly_asset(day, h)) for h in range(24)]
-                if not any(hours):
-                    result.gaps.append(str(day))
-        else:
-            for hour in range(now.hour + 1):
-                if not add(hourly_asset(day, hour)) and hour <= (
-                    now.hour - HOURLY_GRACE_HOURS
-                ):
-                    result.gaps.append(f"{day} {hour:02d}00Z")
-        day += timedelta(days=1)
+    digest = oras("resolve", ref)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise IndexUnavailable(f"cannot pull {ref}: no digest ({digest[:80]!r})")
+    repository = re.sub(r":[^:/@]+$", "", ref.split("@")[0])
+    oras("pull", f"{repository}@{digest}", "--output", str(dest))
+    return digest
 
-    for cve, record in latest.items():
-        updated = parse_time(record["updated"])
-        if record["state"] == "PUBLISHED" and updated and updated >= cutoff:
-            result.records[cve] = record
-    return result
+
+def _valid_reputation(document: Any, schema_version: int) -> bool:
+    cnas = document.get("cnas") if isinstance(document, dict) else None
+    return (
+        isinstance(cnas, dict)
+        and document.get("schema_version") == schema_version
+        and all(
+            isinstance(counts, dict)
+            and all(
+                isinstance(counts.get(name), int) and not isinstance(counts[name], bool)
+                for name in ("confirmed", "errors", "pending")
+            )
+            for counts in cnas.values()
+        )
+    )
+
+
+def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
+    """The index in a directory. An index that cannot be read, or that has another
+    schema, is IndexUnavailable: the early warning is not made from a guess.
+    """
+    bci = builder()
+    try:
+        previous = bci.read_previous(directory)
+        reputation = read_json(directory / REPUTATION_FILE)
+        gaps = list(previous.metadata.get("gaps") or [])
+        bci.gaps_of(gaps)  # the shape of the gaps is checked here and not later
+    except (bci.IndexBuildError, OSError, ValueError) as err:
+        raise IndexUnavailable(f"the index {ref} cannot be read: {err}") from err
+    if not _valid_reputation(reputation, bci.SCHEMA_VERSION):
+        raise IndexUnavailable(f"the index {ref}: {REPUTATION_FILE} is not valid")
+    return IndexData(
+        previous.records, reputation["cnas"], previous.metadata, ref, digest, gaps
+    )
+
+
+def catch_up(
+    index: IndexData,
+    downloader: Any,
+    feed_url: str,
+    work_dir: Path,
+    now: datetime,
+) -> None:
+    """Bring the records of the index up to ``now``: the deltas of the days since it
+    was built, and the records that the delta log lists and the deltas lack (the
+    code of the builder). Keeps the records that are published and were updated in
+    the window of the index, and sets ``index.gaps`` to the gaps of the feed in that
+    window: those of the index before the day it was built, and those of the deltas
+    applied now. A delta that cannot be downloaded or read is IndexUnavailable.
+    """
+    bci = builder()
+    now = now.astimezone(UTC).replace(microsecond=0)
+    built = parse_time(index.metadata.get("built_at"))
+    window_days = index.metadata.get("window_days")
+    if built is None or not isinstance(window_days, int) or window_days < 1:
+        raise IndexUnavailable(f"the index {index.ref} has no built_at or window")
+    cutoff = now - timedelta(days=window_days)
+    if built < cutoff:
+        raise IndexUnavailable(
+            f"the index {index.ref} was built {built:%Y-%m-%d}, before its window of "
+            f"{window_days} days: no delta connects it to today"
+        )
+    since = datetime(built.year, built.month, built.day, tzinfo=UTC)
+    feed = bci.Feed()
+    try:
+        client = bci.FeedClient(downloader, feed_url, work_dir / "feed")
+        bci.apply_deltas(index.records, client, since.date(), now, cutoff, feed)
+        bci.reconcile(
+            index.records, downloader, work_dir / "reconcile", since, now, cutoff, feed
+        )
+        gaps = feed.gaps | {h for h in bci.gaps_of(index.gaps) if h < since}
+    except bci.IndexBuildError as err:
+        raise IndexUnavailable(str(err)) from err
+    first_hour = cutoff.replace(minute=0, second=0)
+    index.gaps = bci.gap_ranges({h for h in gaps if h >= first_hour})
+    index.records = {
+        cve: record
+        for cve, record in index.records.items()
+        if record["state"] == STATE_PUBLISHED
+        and (parse_time(record["updated"]) or cutoff) >= cutoff
+    }
+
+
+def index_document(index: IndexData) -> dict[str, Any]:
+    """What the report says about the index it was made from."""
+    return {
+        "ref": index.ref,
+        "digest": index.digest,
+        "built_at": index.metadata.get("built_at"),
+        "gaps": index.gaps,
+    }
+
+
+def confidence_of(
+    rule: str, cna: str | None, cnas: Mapping[str, Mapping[str, int]]
+) -> dict[str, Any]:
+    """How far a match can be believed. T1 and T2 rest on what the CNA claimed, so
+    its history in the index is the confidence; T3 and repo-level match by names,
+    where the history of the CNA says nothing about our error.
+    """
+    if rule not in (RULE_T1, RULE_T2):
+        return {"basis": BASIS_NAME_MATCH}
+    counts = cnas.get(cna or "") or {}
+    confirmed, errors, pending = (
+        counts.get(name, 0) for name in ("confirmed", "errors", "pending")
+    )
+    resolved = confirmed + errors
+    return {
+        "basis": BASIS_CNA_HISTORY,
+        "cna": cna,
+        "confirmed": confirmed,
+        "errors": errors,
+        "pending": pending,
+        "ratio": round(confirmed / resolved, 4) if resolved else None,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1561,10 +1651,12 @@ def match_records(
     records: Iterable[Mapping[str, Any]],
     index: Index,
     inventory: Inventory,
+    cnas: Mapping[str, Mapping[str, int]],
 ) -> MatchResult:
     """Candidates: one per CVE and package version that the CNA data says is
     affected. When several entries or rules say so, the strongest rule (T1, T2, T3,
-    repo-level) and its entry are kept.
+    repo-level) and its entry are kept. ``cnas`` is the reputation of the CNAs, for
+    the confidence of each candidate.
     """
     result = MatchResult()
     for record in sorted(records, key=lambda r: r["cve"]):
@@ -1584,14 +1676,17 @@ def match_records(
                 continue
             best = min(affecting, key=lambda h: RULE_PRIORITY[h.rule])
             result.candidates.append(
-                candidate_document(record, best, inventory.sightings[package])
+                candidate_document(record, best, inventory.sightings[package], cnas)
             )
     result.candidates.sort(key=candidate_sort_key)
     return result
 
 
 def candidate_document(
-    record: Mapping[str, Any], hit: Hit, sightings: Mapping[str, set[str]]
+    record: Mapping[str, Any],
+    hit: Hit,
+    sightings: Mapping[str, set[str]],
+    cnas: Mapping[str, Mapping[str, int]],
 ) -> dict[str, Any]:
     package = hit.package
     return {
@@ -1608,6 +1703,7 @@ def candidate_document(
         },
         "affected_range": describe_range(hit.entry),
         "rule": hit.rule,
+        "confidence": confidence_of(hit.rule, record["assigner"], cnas),
         **select_severity(record["metrics"]),
         "exploitation": record["metrics"]["exploitation"],
         "sightings": {
@@ -1652,9 +1748,10 @@ def utc_text(moment: datetime) -> str:
 def status_document(
     status: str,
     reason: str | None,
-    window_days: int,
+    window_days: int | None = None,
     records_scanned: int | None = None,
     candidates: int | None = None,
+    index: Mapping[str, Any] | None = None,
     diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1663,8 +1760,20 @@ def status_document(
         "window_days": window_days,
         "records_scanned": records_scanned,
         "candidates": candidates,
+        "index": dict(index) if index else None,
         "diagnostics": dict(diagnostics or {}),
     }
+
+
+def load_index(
+    args: argparse.Namespace, work_dir: Path, run: Runner = subprocess.run
+) -> IndexData:
+    """The index of ``--index-dir``, or the one of ``--cve-index`` pulled with ORAS."""
+    if args.index_dir:
+        return read_index(args.index_dir, str(args.index_dir), None)
+    destination = work_dir / "index"
+    digest = pull_index(args.cve_index, destination, run)
+    return read_index(destination, args.cve_index, digest)
 
 
 def analyse(
@@ -1672,59 +1781,70 @@ def analyse(
     transport: Transport,
     now: datetime,
     sleep: Callable[[float], None] = time.sleep,
+    downloader: Any = None,
+    run: Runner = subprocess.run,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """``(status document, candidates document)``; the latter only if ``ok``."""
-    window_days = args.window_days
+    """``(status document, candidates document)``; the latter only if ``ok``.
+
+    ``downloader`` fetches the deltas (the builder's ``Downloader``), ``run`` calls
+    ORAS; both default to the real ones.
+    """
     targets = load_targets_file(args.targets_file)
     inventory = load_inventory(targets, args.parts_dir / SCANNER_TRIVY)
     if not inventory.targets_read:
-        return status_document(
-            STATUS_SKIPPED, "no Trivy target was scanned", window_days
-        ), None
+        return status_document(STATUS_SKIPPED, "no Trivy target was scanned"), None
     http = HttpClient(transport, sleep)
     diagnostics: dict[str, Any] = {
         "packages": len(inventory.sightings),
         "packages_unsupported": inventory.unsupported,
     }
+    index: IndexData | None = None
     try:
-        feed = collect_feed(FeedClient(http, args.feed_url), now, window_days)
+        with tempfile.TemporaryDirectory(prefix="sca-early-warning-") as work:
+            index = load_index(args, Path(work), run)
+            catch_up(
+                index,
+                downloader or builder().UrllibDownloader(),
+                args.feed_url,
+                Path(work),
+                now,
+            )
         lookup = resolve_repos(DepsDevClient(http, args.depsdev_url), inventory)
-    except (FeedError, DepsDevUnavailable) as err:
+    except (IndexUnavailable, DepsDevUnavailable) as err:
         return status_document(
-            STATUS_FAILED, str(err), window_days, diagnostics=diagnostics
+            STATUS_FAILED,
+            str(err),
+            index.metadata.get("window_days") if index else None,
+            index=index_document(index) if index else None,
+            diagnostics=diagnostics,
         ), None
-    index = build_index(inventory, lookup.repos)
-    matched = match_records(feed.records.values(), index, inventory)
+    window_days = index.metadata["window_days"]
+    match_index = build_index(inventory, lookup.repos)
+    matched = match_records(index.records.values(), match_index, inventory, index.cnas)
     diagnostics.update(
-        feed_assets=feed.assets,
-        feed_bytes=feed.bytes,
-        feed_gaps=feed.gaps,
-        feed_unreadable_records=feed.unreadable,
+        index_records=len(index.records),
         depsdev_requests=lookup.requests,
         depsdev_names_without_repo=lookup.without_repo,
         depsdev_errors=lookup.errors,
         outcomes=dict(sorted(matched.outcomes.items())),
     )
-    window = {
-        "days": window_days,
-        "from": utc_text(now - timedelta(days=window_days)),
-        "to": utc_text(now),
-        "feed": args.feed_url,
-        "assets": feed.assets,
-        "gaps": feed.gaps,
-    }
     candidates_doc = {
         "schema_version": SCHEMA_VERSION,
         "generated_utc": utc_text(now),
-        "generated_from": window,
+        "generated_from": {
+            "days": window_days,
+            "from": utc_text(now - timedelta(days=window_days)),
+            "to": utc_text(now),
+        },
         "candidates": matched.candidates,
     }
     status = status_document(
         STATUS_OK,
         None,
         window_days,
-        len(feed.records),
+        len(index.records),
         len(matched.candidates),
+        index_document(index),
         diagnostics,
     )
     return status, candidates_doc
@@ -1742,33 +1862,35 @@ def run(
     environ: Mapping[str, str],
     now: datetime,
     sleep: Callable[[float], None] = time.sleep,
+    downloader: Any = None,
+    runner: Runner = subprocess.run,
 ) -> str:
     """Write the part; return its status."""
     for name in ("feed_url", "depsdev_url"):
         url = getattr(args, name).rstrip("/")
         if urllib.parse.urlsplit(url).scheme != "https":
             raise InputError(f"{name.replace('_', '-')} must be an https URL")
-    if not 1 <= args.window_days <= MAX_WINDOW_DAYS:
-        raise InputError(f"window-days must be 1 to {MAX_WINDOW_DAYS}")
-    status, candidates = analyse(args, transport, now, sleep)
+    if bool(args.cve_index) == bool(args.index_dir):
+        raise InputError("exactly one of cve-index and index-dir is needed")
+    status, candidates = analyse(args, transport, now, sleep, downloader, runner)
     out_dir = args.output_dir / PART_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "status.json", status)
     if candidates is not None:
         write_json(out_dir / "candidates.json", candidates)
-    diagnostics = status["diagnostics"]
     if status["status"] == STATUS_OK:
         print(
             f"early warning: {status['records_scanned']} CVE record(s) of the last "
-            f"{status['window_days']} day(s) from {diagnostics['feed_assets']} "
-            f"asset(s) ({diagnostics['feed_bytes'] / 1_000_000:.1f} MB), "
-            f"{diagnostics['packages']} package version(s), "
+            f"{status['window_days']} day(s) from the index of "
+            f"{status['index']['built_at']} and the deltas since, "
+            f"{status['diagnostics']['packages']} package version(s), "
             f"{status['candidates']} candidate(s)"
         )
-        if diagnostics["feed_gaps"]:
+        gaps = status["index"]["gaps"]
+        if gaps:
             print(
-                "::warning title=Early warning feed gaps::no CVE feed asset for "
-                + ", ".join(diagnostics["feed_gaps"])
+                "::warning title=Early warning feed gaps::no CVE feed delta for "
+                + ", ".join(f"{g['from']} to {g['to']}" for g in gaps)
             )
     elif status["status"] == STATUS_FAILED:
         print(
@@ -1799,12 +1921,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="directory to write early-warning/status.json and candidates.json into",
     )
-    parser.add_argument(
-        "--window-days",
-        type=int,
-        default=DEFAULT_WINDOW_DAYS,
-        help="consider CVE records published or updated in this many days "
-        "(default: %(default)s)",
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--cve-index",
+        help="the CVE index artifact to pull with ORAS, e.g. "
+        "ghcr.io/epam/ai-dial-sca-cve-index:1",
+    )
+    source.add_argument(
+        "--index-dir",
+        type=Path,
+        help="a directory with the index files instead (tests, runs by hand)",
     )
     parser.add_argument("--feed-url", default=FEED_URL, help="cvelistV5 release assets")
     parser.add_argument("--depsdev-url", default=DEPSDEV_URL, help="deps.dev API")

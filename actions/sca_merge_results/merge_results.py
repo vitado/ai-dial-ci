@@ -56,8 +56,11 @@ an alias of any record (a database maps them now, so a scanner reports them),
 classifies the rest by exposure like a record and reports them in
 ``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
 section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
-not in the scope table, not in the verdict. A broken or missing part is reported as
-unavailable, never as an empty result.
+not in the scope table, not in the verdict. Every entry carries the ``confidence``
+the part computed (the history of its CNA in the CVE index, or ``name_match``); the
+merge shows it and neither filters nor tiers by it. The part says which CVE index it
+read (``index``: ref, digest, built_at, feed gaps), and the report repeats it. A
+broken or missing part is reported as unavailable, never as an empty result.
 
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
@@ -101,6 +104,7 @@ SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
 UNKNOWN_SEVERITY = "UNKNOWN"
 SCHEMA_VERSION = 1
 SHORT_SHA_LENGTH = 7
+DIGEST_SHORT_LENGTH = 12
 TRIVY_DB_KEYS = ("vulnerability_db_updated_at", "java_db_updated_at")
 MERGE_KEY = (
     "(repo, CVE x package x installed-version), merged across scan_targets and "
@@ -2169,7 +2173,11 @@ EARLY_WARNING_DIR = "early-warning"
 EARLY_WARNING_SCHEMA_VERSION = 1
 CVE_RECORD_URL = "https://www.cve.org/CVERecord?id="
 EARLY_WARNING_COLLAPSE_ABOVE = 5
+EARLY_WARNING_GAPS_LISTED = 5
 ADP_SOURCE_PREFIX = "adp:"
+BASIS_CNA_HISTORY = "cna_history"
+BASIS_NAME_MATCH = "name_match"
+CNA_HISTORY_KEYS = ("basis", "cna", "confirmed", "errors", "pending", "ratio")
 HEADLINE_SEVERITIES = ("CRITICAL", "HIGH")
 # The fields of an entry of _report/early_warning.json
 EARLY_WARNING_ENTRY_KEYS = (
@@ -2182,6 +2190,7 @@ EARLY_WARNING_ENTRY_KEYS = (
     "package",
     "affected_range",
     "rule",
+    "confidence",
     "severity",
     "severity_source",
     "cvss",
@@ -2205,7 +2214,8 @@ class EarlyWarning:
     ``_report/early_warning.json``. ``entries`` are the reported early warnings, one
     per CVE and package version, shaped like records (``pkg``, ``version``,
     ``scan_targets``, ``exposure``) so that the summary can reuse the exposure and
-    location texts; ``sightings`` says where each was seen, as for records.
+    location texts; ``sightings`` says where each was seen, as for records. ``gaps``
+    are the hours of the window for which the CVE feed had no delta, as texts.
     """
 
     report: dict[str, Any]
@@ -2223,6 +2233,7 @@ def early_warning_report(
     candidates: int | None = None,
     reported: int | None = None,
     packages: int | None = None,
+    index: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -2232,7 +2243,30 @@ def early_warning_report(
         "candidates": candidates,
         "reported": reported,
         "packages": packages,
+        "index": index,
     }
+
+
+def early_warning_index(status: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The CVE index the part was made from (``ref``, ``digest``, ``built_at``,
+    ``gaps``: ranges of hours without a feed delta); None if the part has none.
+    """
+    index = status.get("index")
+    if index is None:
+        return None
+    try:
+        return {
+            "ref": str(index["ref"]),
+            "digest": index.get("digest"),
+            "built_at": str(index["built_at"]),
+            "gaps": [
+                {"from": str(g["from"]), "to": str(g["to"])} for g in index["gaps"]
+            ],
+        }
+    except (KeyError, TypeError, AttributeError) as e:
+        raise EarlyWarningPartError(
+            f"the early warning index is not valid ({e!r})"
+        ) from e
 
 
 def early_warning_without_entries(
@@ -2288,6 +2322,21 @@ def load_early_warning_part(part_dir: Path) -> tuple[dict[str, Any], Any, list[A
     return status, document.get("generated_from"), candidates
 
 
+def early_warning_confidence(confidence: Any) -> dict[str, Any]:
+    """The confidence of a candidate as the part wrote it: ``{basis: name_match}``, or
+    ``{basis: cna_history, cna, confirmed, errors, pending, ratio}``. TypeError or
+    KeyError if it is anything else.
+    """
+    if confidence["basis"] == BASIS_NAME_MATCH:
+        return {"basis": BASIS_NAME_MATCH}
+    history = {key: confidence[key] for key in CNA_HISTORY_KEYS}
+    if history["basis"] != BASIS_CNA_HISTORY or not all(
+        isinstance(history[key], int) for key in ("confirmed", "errors", "pending")
+    ):
+        raise TypeError(f"unknown confidence {confidence!r}")
+    return history
+
+
 def early_warning_entry(
     candidate: Mapping[str, Any], target_order: Mapping[str, int]
 ) -> tuple[Record, dict[str, list[str]]]:
@@ -2312,6 +2361,7 @@ def early_warning_entry(
             },
             "affected_range": candidate.get("affected_range"),
             "rule": candidate["rule"],
+            "confidence": early_warning_confidence(candidate["confidence"]),
             "severity": normalize_severity(candidate.get("severity")),
             "severity_source": candidate.get("severity_source"),
             "cvss": candidate.get("cvss"),
@@ -2391,11 +2441,17 @@ def build_early_warning(
         return early_warning_without_entries(repo, generated_utc, report)
     try:
         status, generated_from, candidates = load_early_warning_part(part_dir)
+        index_info = early_warning_index(status)
         if status["status"] != STATUS_OK:
             report = early_warning_report(
-                status["status"], status.get("reason"), status.get("window_days")
+                status["status"],
+                status.get("reason"),
+                status.get("window_days"),
+                index=index_info,
             )
             return early_warning_without_entries(repo, generated_utc, report)
+        if index_info is None:
+            raise EarlyWarningPartError("the early warning part has no index")
         known = {i.upper() for r in records for i in record_ids(r) if i}
         target_order = {t["id"]: index for index, t in enumerate(targets)}
         entries: list[Record] = []
@@ -2419,6 +2475,7 @@ def build_early_warning(
         len(candidates),
         len(entries),
         len(early_warning_groups(entries)),
+        index_info,
     )
     result = early_warning_without_entries(repo, generated_utc, report, generated_from)
     result.document["entries"] = [
@@ -2426,8 +2483,7 @@ def build_early_warning(
     ]
     result.entries = entries
     result.sightings = sightings
-    gaps = generated_from.get("gaps") if isinstance(generated_from, dict) else None
-    result.gaps = [str(g) for g in gaps or []]
+    result.gaps = [f"{g['from']} to {g['to']}" for g in index_info["gaps"]]
     return result
 
 
@@ -4334,6 +4390,7 @@ EARLY_WARNING_HEADER = [
     "Published",
     "Affected",
     "Rule",
+    "Confidence",
     "Exposure",
     "Where",
 ]
@@ -4379,6 +4436,23 @@ def early_warning_severity_text(entry: Record) -> str:
     return text
 
 
+def confidence_text(confidence: Mapping[str, Any]) -> str:
+    """``97% · VulnCheck 119/123 confirmed`` (the claims of the CNA that a
+    vulnerability database confirmed, of those it resolved), ``no history · Google
+    0/0`` without any resolved claim, ``name match`` for a match by names, where the
+    history of the CNA says nothing about our error. The percentage is never 100 while
+    there are errors.
+    """
+    if confidence["basis"] == BASIS_NAME_MATCH:
+        return "name match"
+    confirmed, errors = confidence["confirmed"], confidence["errors"]
+    counts = f"{confidence['cna'] or '?'} {confirmed}/{confirmed + errors}"
+    if not confirmed + errors:
+        return f"no history · {counts}"
+    percent = round(100 * confirmed / (confirmed + errors))
+    return f"{min(percent, 99) if errors else percent}% · {counts} confirmed"
+
+
 def early_warning_row(
     group: Sequence[Record],
     early_warning: EarlyWarning,
@@ -4399,11 +4473,13 @@ def early_warning_row(
     dates: list[str] = []
     ranges: list[str] = []
     rules: list[str] = []
+    confidences: list[str] = []
     for entry in group:
         _append_unique(cnas, entry["cna"])
         _append_unique(dates, (entry["published"] or "?")[:10])
         _append_unique(ranges, entry["affected_range"] or "?")
         _append_unique(rules, entry["rule"])
+        _append_unique(confidences, confidence_text(entry["confidence"]))
     return [
         f"{group[0]['pkg']} {group[0]['version']}" + new_suffix(group),
         early_warning_severity_text(group[0]),
@@ -4412,6 +4488,7 @@ def early_warning_row(
         ", ".join(dates),
         " · ".join(ranges),
         ", ".join(rules),
+        "; ".join(confidences),
         group_exposure_label(group, targets),
         where_cell(group, early_warning.sightings, targets, not_shipped),
     ]
@@ -4456,23 +4533,40 @@ def render_early_warning(
     ]
 
 
+def short_digest(digest: str | None) -> str | None:
+    """``sha256:0123456789ab`` of an OCI digest."""
+    if not digest:
+        return None
+    algorithm, _, value = digest.rpartition(":")
+    return f"{algorithm}:{value[:DIGEST_SHORT_LENGTH]}" if algorithm else digest
+
+
 def early_warning_footer(early_warning: EarlyWarning | None) -> str | None:
-    """Where the early warning looked: the feed window, and the gaps in it."""
+    """Where the early warning looked: the CVE index (its date and digest), the
+    window, and the gaps of the feed in it.
+    """
     if early_warning is None or early_warning.report["status"] != STATUS_OK:
         return None
     report = early_warning.report
+    index = report["index"]
+    built = format_timestamp(index["built_at"]) or index["built_at"]
+    digest = short_digest(index["digest"])
     window = (early_warning.document.get("generated_from") or {}).get("from")
     start = format_timestamp(window)
-    text = (
-        "Early warning: CVE records published or updated in the last "
-        f"{report['window_days']} days"
-    )
+    text = f"Early warning: CVE index of {built}"
+    if digest:
+        text += f" ({digest})"
+    text += f", records published or updated in the last {report['window_days']} days"
     if start:
         text += f" (since {start})"
     if report["records_scanned"] is not None:
         text += f", {report['records_scanned']} checked"
     if early_warning.gaps:
-        text += f" · feed gaps: {', '.join(early_warning.gaps)}"
+        listed = early_warning.gaps[:EARLY_WARNING_GAPS_LISTED]
+        more = len(early_warning.gaps) - len(listed)
+        text += f" · feed gaps: {', '.join(listed)}"
+        if more:
+            text += f" and {more} more"
     return text
 
 

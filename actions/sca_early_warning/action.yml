@@ -1,0 +1,44 @@
+name: Early warning for SCA scan packages
+description: Match the CVE records of the last days (cvelistV5) with the language packages found by Trivy in an SCA scheduled scan, for CVEs that vulnerability databases do not map to packages yet. Informational, never a finding
+
+inputs:
+  targets-file:
+    description: Path to targets.json produced by the sca_resolve_targets action
+    required: true
+  parts-dir:
+    description: Directory with the Trivy scan parts (trivy/<id>.json and trivy/<id>.status.json of every Trivy target)
+    required: true
+  output-dir:
+    description: Directory to write the early warning part into (early-warning/status.json and early-warning/candidates.json)
+    required: true
+  window-days:
+    description: Consider the CVE records published or updated in this many days
+    default: "90"
+
+outputs:
+  status:
+    description: ok, failed or skipped. A failure is reported, but is not a failure of the scan
+    value: ${{ steps.match.outputs.status }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    - name: Match CVE records with packages
+      id: match
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TARGETS_FILE: ${{ inputs.targets-file }}
+        PARTS_DIR: ${{ inputs.parts-dir }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        WINDOW_DAYS: ${{ inputs.window-days }}
+      run: >-
+        python "$ACTION_PATH/early_warning.py"
+        --targets-file "$TARGETS_FILE"
+        --parts-dir "$PARTS_DIR"
+        --output-dir "$OUTPUT_DIR"
+        --window-days "$WINDOW_DAYS"

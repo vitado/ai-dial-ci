@@ -49,6 +49,16 @@ towards the release or development exposure: a finding seen only in lockfiles un
 them is ``source_only`` in every repository, and its locations are marked as not
 shipped. The record stays in ``vulnerabilities.json``.
 
+Early warning (``early-warning/`` part of the sca_early_warning action, when the run
+has one): CVE records whose CNA data matches a language package of the run but that
+no scanner reported. The merge drops the ones whose CVE id or alias is the ``cve`` or
+an alias of any record (a database maps them now, so a scanner reports them),
+classifies the rest by exposure like a record and reports them in
+``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
+section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
+not in the scope table, not in the verdict. A broken or missing part is reported as
+unavailable, never as an empty result.
+
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
 decides about failing the run after the artifact has been uploaded.
@@ -117,6 +127,7 @@ ROOT_PROJECT_DIR = "."
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_NOT_APPLICABLE = "not_applicable"
+STATUS_SKIPPED = "skipped"
 
 SCANNER_TRIVY = "trivy"
 SCANNER_OSV = "osv"
@@ -2142,6 +2153,276 @@ def finalize_records(
 
 
 # --------------------------------------------------------------------------
+# Early warning
+# --------------------------------------------------------------------------
+
+EARLY_WARNING_DIR = "early-warning"
+EARLY_WARNING_SCHEMA_VERSION = 1
+CVE_RECORD_URL = "https://www.cve.org/CVERecord?id="
+EARLY_WARNING_COLLAPSE_ABOVE = 5
+ADP_SOURCE_PREFIX = "adp:"
+HEADLINE_SEVERITIES = ("CRITICAL", "HIGH")
+# The fields of an entry of _report/early_warning.json
+EARLY_WARNING_ENTRY_KEYS = (
+    "cve",
+    "aliases",
+    "cna",
+    "published",
+    "updated",
+    "title",
+    "package",
+    "affected_range",
+    "rule",
+    "severity",
+    "severity_source",
+    "cvss",
+    "cvss_v4",
+    "exploitation",
+    "scan_targets",
+    "locations",
+    "exposure",
+)
+
+
+class EarlyWarningPartError(Exception):
+    """The early warning part does not hold a usable result."""
+
+
+@dataclass
+class EarlyWarning:
+    """The early warning of a run.
+
+    ``report`` is ``scan_report.json: early_warning``, ``document`` is
+    ``_report/early_warning.json``. ``entries`` are the reported early warnings, one
+    per CVE and package version, shaped like records (``pkg``, ``version``,
+    ``scan_targets``, ``exposure``) so that the summary can reuse the exposure and
+    location texts; ``sightings`` says where each was seen, as for records.
+    """
+
+    report: dict[str, Any]
+    document: dict[str, Any]
+    entries: list[Record] = field(default_factory=list)
+    sightings: Sightings = field(default_factory=dict)
+    gaps: list[str] = field(default_factory=list)
+
+
+def early_warning_report(
+    status: str,
+    reason: str | None,
+    window_days: int | None = None,
+    records_scanned: int | None = None,
+    candidates: int | None = None,
+    reported: int | None = None,
+    packages: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "window_days": window_days,
+        "records_scanned": records_scanned,
+        "candidates": candidates,
+        "reported": reported,
+        "packages": packages,
+    }
+
+
+def early_warning_without_entries(
+    repo: str | None,
+    generated_utc: str,
+    report: dict[str, Any],
+    generated_from: Any = None,
+) -> EarlyWarning:
+    document = {
+        "schema_version": EARLY_WARNING_SCHEMA_VERSION,
+        "repo": repo,
+        "generated_utc": generated_utc,
+        "generated_from": generated_from,
+        "status": report["status"],
+        "reason": report["reason"],
+        "entries": [],
+    }
+    return EarlyWarning(report, document)
+
+
+def load_early_warning_part(part_dir: Path) -> tuple[dict[str, Any], Any, list[Any]]:
+    """``(status document, generated_from, candidates)`` of the part; the last two
+    only for an ``ok`` part. Raises EarlyWarningPartError for a part that is missing
+    or does not hold what the action writes.
+    """
+    try:
+        status = read_json(part_dir / "status.json")
+    except (OSError, ValueError) as e:
+        raise EarlyWarningPartError(
+            f"the early warning part is missing or unreadable ({e})"
+        ) from e
+    if not isinstance(status, dict) or status.get("status") not in (
+        STATUS_OK,
+        STATUS_FAILED,
+        STATUS_SKIPPED,
+    ):
+        raise EarlyWarningPartError("the early warning part has no valid status")
+    if status["status"] != STATUS_OK:
+        return status, None, []
+    try:
+        document = read_json(part_dir / "candidates.json")
+    except (OSError, ValueError) as e:
+        raise EarlyWarningPartError(
+            f"the early warning candidates are missing or unreadable ({e})"
+        ) from e
+    candidates = document.get("candidates") if isinstance(document, dict) else None
+    if (
+        document.get("schema_version") != EARLY_WARNING_SCHEMA_VERSION
+        or not isinstance(candidates, list)
+        or not all(isinstance(c, dict) for c in candidates)
+    ):
+        raise EarlyWarningPartError("the early warning candidates are not valid")
+    return status, document.get("generated_from"), candidates
+
+
+def early_warning_entry(
+    candidate: Mapping[str, Any], target_order: Mapping[str, int]
+) -> tuple[Record, dict[str, list[str]]]:
+    """An entry (record-shaped) and its sightings from a candidate of the part."""
+    try:
+        package = candidate["package"]
+        sightings = {
+            str(tid): [str(loc) for loc in locations]
+            for tid, locations in candidate["sightings"].items()
+        }
+        entry: Record = {
+            "cve": candidate["cve"],
+            "aliases": list(candidate.get("aliases") or []),
+            "cna": candidate.get("cna"),
+            "published": candidate.get("published"),
+            "updated": candidate.get("updated"),
+            "title": candidate.get("title"),
+            "package": {
+                "ecosystem": package["ecosystem"],
+                "name": package["name"],
+                "version": package["version"],
+            },
+            "affected_range": candidate.get("affected_range"),
+            "rule": candidate["rule"],
+            "severity": normalize_severity(candidate.get("severity")),
+            "severity_source": candidate.get("severity_source"),
+            "cvss": candidate.get("cvss"),
+            "cvss_v4": candidate.get("cvss_v4"),
+            "exploitation": candidate.get("exploitation"),
+        }
+    except (KeyError, TypeError, AttributeError) as e:
+        raise EarlyWarningPartError(f"a candidate is not valid ({e!r})") from e
+    unknown = [tid for tid in sightings if tid not in target_order]
+    if not sightings or unknown:
+        raise EarlyWarningPartError(
+            "the early warning part does not fit the targets of the run"
+        )
+    scan_targets = sorted(sightings, key=target_order.__getitem__)
+    locations: list[str] = []
+    for tid in scan_targets:
+        for location in sightings[tid]:
+            _append_unique(locations, location)
+    entry.update(
+        scan_targets=scan_targets,
+        locations=locations,
+        exposure=None,
+        # What the shared texts of the summary read from a record
+        pkg=entry["package"]["name"],
+        version=entry["package"]["version"],
+        dev=None,
+    )
+    return entry, sightings
+
+
+def early_warning_sort_key(entry: Record) -> tuple[Any, ...]:
+    """Severity, then CVSS score (highest first, none last)."""
+    score = (entry["cvss"] or {}).get("score")
+    return (
+        SEV_ORDER.get(entry["severity"], len(SEV_ORDER)),
+        score is None,
+        -(score or 0),
+    )
+
+
+def order_early_warning(entries: list[Record]) -> None:
+    """Severity, CVSS score, newest publication, package, CVE (stable sorts, the
+    least significant key first).
+    """
+    entries.sort(key=lambda e: (e["pkg"], e["version"], e["cve"]))
+    entries.sort(key=lambda e: e["published"] or "", reverse=True)
+    entries.sort(key=early_warning_sort_key)
+
+
+def early_warning_groups(entries: Iterable[Record]) -> list[list[Record]]:
+    """The entries per package version, in the order of the first of each."""
+    groups: dict[tuple[Any, Any], list[Record]] = {}
+    for entry in entries:
+        groups.setdefault((entry["pkg"], entry["version"]), []).append(entry)
+    return list(groups.values())
+
+
+def build_early_warning(
+    part_dir: Path,
+    repo: str | None,
+    generated_utc: str,
+    records: Sequence[Record],
+    targets: Sequence[Target],
+    scanned: bool,
+    not_shipped: NotShipped | None = None,
+) -> EarlyWarning:
+    """The early warning of a run whose records are final.
+
+    A candidate whose CVE id or alias is the ``cve`` or an alias of any record is
+    dropped: a scanner reports that vulnerability. The rest are classified by
+    exposure like records. ``scanned`` says whether any Trivy target was scanned; if
+    not there is nothing to check and the early warning is ``skipped``. A part that
+    is missing or broken makes it ``failed``, never an empty result.
+    """
+    if not scanned:
+        report = early_warning_report(STATUS_SKIPPED, "no Trivy target was scanned")
+        return early_warning_without_entries(repo, generated_utc, report)
+    try:
+        status, generated_from, candidates = load_early_warning_part(part_dir)
+        if status["status"] != STATUS_OK:
+            report = early_warning_report(
+                status["status"], status.get("reason"), status.get("window_days")
+            )
+            return early_warning_without_entries(repo, generated_utc, report)
+        known = {i.upper() for r in records for i in record_ids(r) if i}
+        target_order = {t["id"]: index for index, t in enumerate(targets)}
+        entries: list[Record] = []
+        sightings: Sightings = {}
+        for candidate in candidates:
+            entry, seen = early_warning_entry(candidate, target_order)
+            if known & {i.upper() for i in (entry["cve"], *entry["aliases"]) if i}:
+                continue
+            entries.append(entry)
+            sightings[record_identity(entry)] = seen
+    except EarlyWarningPartError as e:
+        report = early_warning_report(STATUS_FAILED, str(e))
+        return early_warning_without_entries(repo, generated_utc, report)
+    assign_exposure(entries, targets, sightings, not_shipped)
+    order_early_warning(entries)
+    report = early_warning_report(
+        STATUS_OK,
+        None,
+        status.get("window_days"),
+        status.get("records_scanned"),
+        len(candidates),
+        len(entries),
+        len(early_warning_groups(entries)),
+    )
+    result = early_warning_without_entries(repo, generated_utc, report, generated_from)
+    result.document["entries"] = [
+        {key: entry[key] for key in EARLY_WARNING_ENTRY_KEYS} for entry in entries
+    ]
+    result.entries = entries
+    result.sightings = sightings
+    gaps = generated_from.get("gaps") if isinstance(generated_from, dict) else None
+    result.gaps = [str(g) for g in gaps or []]
+    return result
+
+
+# --------------------------------------------------------------------------
 # Building the reports
 # --------------------------------------------------------------------------
 
@@ -2246,6 +2527,7 @@ def build_scan_report(
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
     trivy_configs: Mapping[str, Mapping[str, Any]] | None = None,
+    early_warning: EarlyWarning | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
     osv_api_url = None
@@ -2283,6 +2565,7 @@ def build_scan_report(
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
         "osv": {"api_url": osv_api_url} if has_osv else None,
+        "early_warning": early_warning.report if early_warning else None,
         "config": targets_doc.get("config") or default_config(),
         "totals": build_totals(targets, records),
         "targets": targets,
@@ -2641,9 +2924,14 @@ def scope_table(report: Mapping[str, Any], records: Sequence[Record]) -> list[st
 
 
 def totals_line(
-    report: Mapping[str, Any], osv_only: int = 0, packages: int | None = None
+    report: Mapping[str, Any],
+    osv_only: int = 0,
+    packages: int | None = None,
+    early_warning: str | None = None,
 ) -> str:
-    """Coverage of the run: ``8/8 targets scanned · 10 found only by OSV``."""
+    """Coverage of the run: ``8/8 targets scanned · 10 found only by OSV``;
+    ``early_warning`` is the text of the early warning part of the line, if any.
+    """
     counts = report["totals"]["targets"]
     applicable = counts["total"] - counts["not_applicable"]
     line = f"{counts['ok']}/{applicable} targets scanned"
@@ -2651,6 +2939,8 @@ def totals_line(
         line += f" · {packages} packages"
     if osv_only:
         line += f" · {osv_only} found only by OSV"
+    if early_warning:
+        line += f" · {early_warning}"
     if counts["not_applicable"]:
         line += f" · {counts['not_applicable']} not applicable"
     return line
@@ -2660,6 +2950,7 @@ def headline_blocks(
     report: Mapping[str, Any],
     records: Sequence[Record],
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+    early_warning: EarlyWarning | None = None,
 ) -> list[list[str]]:
     """The paragraphs of the headline: failures, the verdict, the scope table and
     the coverage of the run.
@@ -2681,14 +2972,15 @@ def headline_blocks(
         return [*blocks, [text]]
 
     osv_only = sum(is_osv_only(r) for r in records)
+    warning = early_warning_headline(early_warning)
     blocks.append([f"**{verdict_text(report, records, in_place)}**"])
     if records:
         if table := scope_table(report, records):
             blocks.append(table)
-        blocks.append([totals_line(report, osv_only)])
+        blocks.append([totals_line(report, osv_only, early_warning=warning)])
     else:
         packages = sum(t["packages_scanned"] or 0 for t in ok)
-        blocks.append([totals_line(report, osv_only, packages)])
+        blocks.append([totals_line(report, osv_only, packages, warning)])
     return blocks
 
 
@@ -3473,7 +3765,168 @@ def config_text(config: Mapping[str, Any] | None) -> str | None:
     return text
 
 
-def render_footer(report: Mapping[str, Any]) -> list[str]:
+# --------------------------------------------------------------------------
+# summary.md: early warning
+# --------------------------------------------------------------------------
+
+EARLY_WARNING_TITLE = "Early warning — not yet in vulnerability databases"
+EARLY_WARNING_EXPLANATION = (
+    "CVE records of their CNAs match these packages, but no vulnerability database "
+    "maps them to a package yet; verify and upgrade if confirmed."
+)
+EARLY_WARNING_HEADER = [
+    "Package",
+    "Severity",
+    "CVE",
+    "CNA",
+    "Published",
+    "Affected",
+    "Rule",
+    "Exposure",
+    "Where",
+]
+
+
+def early_warning_headline(early_warning: EarlyWarning | None) -> str | None:
+    """The early warning part of the coverage line: ``2 early warnings (1 CRITICAL)``
+    (packages, and how many of them have CRITICAL or HIGH ones), or a note that it
+    is unavailable, so that its absence is not read as "nothing".
+    """
+    if early_warning is None:
+        return None
+    status = early_warning.report["status"]
+    if status == STATUS_FAILED:
+        return "early warning unavailable"
+    if status != STATUS_OK or not early_warning.entries:
+        return None
+    groups = early_warning_groups(early_warning.entries)
+    worst = count_by_severity(
+        min((e["severity"] for e in g), key=lambda s: SEV_ORDER.get(s, len(SEV_ORDER)))
+        for g in groups
+    )
+    text = f"{len(groups)} early warning{'s' if len(groups) != 1 else ''}"
+    urgent = format_severity_counts({s: worst[s] for s in HEADLINE_SEVERITIES})
+    return f"{text} ({urgent})" if urgent else text
+
+
+def early_warning_severity_text(entry: Record) -> str:
+    """``HIGH 7.5``; ``(ADP)`` when the score is not the CNA's, and what is known
+    about exploitation.
+    """
+    text = entry["severity"]
+    score = (entry["cvss"] or {}).get("score")
+    if score is not None:
+        text += f" {score:.1f}"
+    if (entry["severity_source"] or "").startswith(ADP_SOURCE_PREFIX):
+        text += " (ADP)"
+    exploitation = entry["exploitation"] or {}
+    if exploitation.get("kev"):
+        text += " · KEV"
+    elif exploitation.get("ssvc") == "active":
+        text += " · exploited (SSVC)"
+    return text
+
+
+def early_warning_row(
+    group: Sequence[Record],
+    early_warning: EarlyWarning,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None,
+) -> list[Any]:
+    """One package version: the worst severity of its CVEs, and the CVEs (with their
+    own severity if there are several) with the distinct CNAs, publication dates,
+    affected ranges and rules.
+    """
+    links = []
+    for entry in group:
+        link = f"[{entry['cve']}]({CVE_RECORD_URL}{entry['cve']})"
+        if len(group) > 1:
+            link += f" ({early_warning_severity_text(entry)})"
+        links.append(link)
+    cnas: list[str] = []
+    dates: list[str] = []
+    ranges: list[str] = []
+    rules: list[str] = []
+    for entry in group:
+        _append_unique(cnas, entry["cna"])
+        _append_unique(dates, (entry["published"] or "?")[:10])
+        _append_unique(ranges, entry["affected_range"] or "?")
+        _append_unique(rules, entry["rule"])
+    return [
+        f"{group[0]['pkg']} {group[0]['version']}",
+        early_warning_severity_text(group[0]),
+        ", ".join(links),
+        ", ".join(cnas),
+        ", ".join(dates),
+        " · ".join(ranges),
+        ", ".join(rules),
+        group_exposure_label(group, targets),
+        where_cell(group, early_warning.sightings, targets, not_shipped),
+    ]
+
+
+def render_early_warning(
+    early_warning: EarlyWarning | None,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None = None,
+) -> list[str]:
+    """The early warning section: the packages, worst first, collapsed above
+    ``EARLY_WARNING_COLLAPSE_ABOVE``; or the reason it is unavailable. Nothing when
+    it was skipped or has nothing to report.
+    """
+    if early_warning is None:
+        return []
+    report = early_warning.report
+    if report["status"] == STATUS_FAILED:
+        reason = report["reason"] or "unknown reason"
+        return [
+            "",
+            "## Early warning — unavailable",
+            "",
+            f"Early warning unavailable: {md_cell(reason)}",
+        ]
+    groups = early_warning_groups(early_warning.entries)
+    if report["status"] != STATUS_OK or not groups:
+        return []
+    table = md_table(
+        EARLY_WARNING_HEADER,
+        (early_warning_row(g, early_warning, targets, not_shipped) for g in groups),
+    )
+    if len(groups) > EARLY_WARNING_COLLAPSE_ABOVE:
+        table = md_details(f"Show the {len(groups)} packages", table)
+    return [
+        "",
+        f"## {EARLY_WARNING_TITLE} ({len(groups)})",
+        "",
+        EARLY_WARNING_EXPLANATION,
+        "",
+        *table,
+    ]
+
+
+def early_warning_footer(early_warning: EarlyWarning | None) -> str | None:
+    """Where the early warning looked: the feed window, and the gaps in it."""
+    if early_warning is None or early_warning.report["status"] != STATUS_OK:
+        return None
+    report = early_warning.report
+    window = (early_warning.document.get("generated_from") or {}).get("from")
+    start = format_timestamp(window)
+    text = (
+        "Early warning: CVE records published or updated in the last "
+        f"{report['window_days']} days"
+    )
+    if start:
+        text += f" (since {start})"
+    if report["records_scanned"] is not None:
+        text += f", {report['records_scanned']} checked"
+    if early_warning.gaps:
+        text += f" · feed gaps: {', '.join(early_warning.gaps)}"
+    return text
+
+
+def render_footer(
+    report: Mapping[str, Any], early_warning: EarlyWarning | None = None
+) -> list[str]:
     parts = []
     if report["commit_sha"]:
         parts.append(f"commit {report['commit_sha'][:SHORT_SHA_LENGTH]}")
@@ -3503,6 +3956,8 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
         queried_at = format_timestamp(max(queried)) if queried else None
         text = f"{OSV_FOOTER} · queried {queried_at}" if queried_at else OSV_FOOTER
         lines += ["", f"<sub>{text}</sub>"]
+    if text := early_warning_footer(early_warning):
+        lines += ["", f"<sub>{text}</sub>"]
     return lines
 
 
@@ -3512,9 +3967,11 @@ def build_summary_md(
     sightings: Sightings,
     base_os: Mapping[str, str] | None = None,
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+    early_warning: EarlyWarning | None = None,
 ) -> str:
     """``base_os`` is the OS of each scanned image (target id -> ``ubuntu 24.04``),
-    ``in_place`` the findings that are fixed in place (see ``fixed_in_place``).
+    ``in_place`` the findings that are fixed in place (see ``fixed_in_place``),
+    ``early_warning`` the early warning of the run, if it has one.
     """
     records = vulns["records"]
     targets = report["targets"]
@@ -3522,17 +3979,19 @@ def build_summary_md(
     record_targets = trivy_targets(targets)
     not_shipped = report_not_shipped(report)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
-    lines += render_headline(headline_blocks(report, records, in_place))
+    lines += render_headline(headline_blocks(report, records, in_place, early_warning))
     if records:
         fixes = render_what_to_fix(
             records, sightings, record_targets, base_os, in_place, not_shipped
         )
         lines += ["", *fixes] if fixes else []
         lines += render_watch(records, record_targets)
+    lines += render_early_warning(early_warning, record_targets, not_shipped)
+    if records:
         lines += render_severity_sections(records, record_targets)
         lines += render_dependency_paths(records)
     lines += render_coverage(targets)
-    lines += render_footer(report)
+    lines += render_footer(report, early_warning)
     return "\n".join(lines) + "\n"
 
 
@@ -3588,8 +4047,13 @@ def run_merge(
     output_dir: Path,
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
+    early_warning_enabled: bool = False,
 ) -> int:
-    """Write all outputs; return the number of failed targets."""
+    """Write all outputs; return the number of failed targets.
+
+    ``early_warning_enabled``: the run has an early warning part to report (the
+    early-warning job); without it the report has no early warning at all.
+    """
     targets_doc = load_targets_file(targets_file)
     report_dir = output_dir / "_report"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -3648,13 +4112,37 @@ def run_merge(
         targets_doc["config"][KEY_NON_SHIPPED_PATHS], trivy_configs
     )
     records = finalize_records(merged, trivy_only, in_place, sightings, not_shipped)
+    early_warning = None
+    if early_warning_enabled:
+        early_warning = build_early_warning(
+            parts_dir / EARLY_WARNING_DIR,
+            repo,
+            generated_utc,
+            records,
+            trivy_only,
+            bool(ok_scans),
+            not_shipped,
+        )
     scan_report = build_scan_report(
-        targets_doc, results, records, generated_utc, trivy_db, trivy_configs
+        targets_doc,
+        results,
+        records,
+        generated_utc,
+        trivy_db,
+        trivy_configs,
+        early_warning,
     )
     vulns = build_vulnerabilities(repo, generated_utc, records)
 
     dump_json(report_dir / "vulnerabilities.json", vulns)
     dump_json(report_dir / "scan_report.json", scan_report)
+    if early_warning is not None:
+        dump_json(report_dir / "early_warning.json", early_warning.document)
+        if early_warning.report["status"] == STATUS_FAILED:
+            print(
+                "::warning title=Early warning unavailable::"
+                f"{early_warning.report['reason']}"
+            )
     base_os = {
         t["id"]: label
         for t, _, native in results
@@ -3665,7 +4153,9 @@ def run_merge(
     }
     write_text(
         output_dir / "summary.md",
-        build_summary_md(scan_report, vulns, sightings, base_os, in_place),
+        build_summary_md(
+            scan_report, vulns, sightings, base_os, in_place, early_warning
+        ),
     )
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]
@@ -3730,6 +4220,15 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "of the Trivy DB snapshot used by the run (default: unknown)"
         ),
     )
+    parser.add_argument(
+        "--early-warning-enabled",
+        type=parse_bool,
+        default=False,
+        help=(
+            "the run has an early warning part (early-warning/ in --parts-dir) to "
+            "report (true/false, default false)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3743,6 +4242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             generated_utc,
             parse_trivy_db_info(args.trivy_db_info),
+            args.early_warning_enabled,
         )
     except InputError as e:
         print(f"::error title=Invalid merge input::{e}", file=sys.stderr)

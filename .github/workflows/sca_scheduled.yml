@@ -43,6 +43,14 @@ on:
         type: boolean
         description: Also check the language packages found by Trivy against OSV (osv.dev). Its findings are merged into the report
         default: true
+      early-warning-enabled:
+        type: boolean
+        description: Also look for CVE records that match the language packages found by Trivy but that no vulnerability database maps to packages yet. An informational section of the report, not findings; a failure of this check does not fail the run
+        default: true
+      early-warning-days:
+        type: number
+        description: The early warning considers CVE records published or updated in this many days
+        default: 90
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
@@ -347,8 +355,44 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # The early warning matches the CNA data of recent CVE records with the language packages Trivy found, for CVEs that no
+  # scanner of the run reports because no database maps them to a package yet. One job per run, after the Trivy matrix.
+  # A heuristic signal: a feed or deps.dev failure is reported as "unavailable" in the report and does not fail the job
+  early-warning:
+    needs: [targets, trivy]
+    if: ${{ !cancelled() && needs.targets.result == 'success' && inputs.early-warning-enabled && needs.targets.outputs.matrix != '[]' }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      contents: read
+    # About 90 daily deltas of a few MB and one deps.dev request per package name (4 at a time); every request is bounded
+    # by 4 attempts of 60 s each plus backoff, so the job bound only stops a service that is up but crawling
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sca-part-targets
+          path: ${{ runner.temp }}/sca-parts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sca-part-trivy-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/sca-parts
+      - uses: epam/ai-dial-ci/actions/sca_early_warning@4.12.0
+        with:
+          targets-file: ${{ runner.temp }}/sca-parts/targets.json
+          parts-dir: ${{ runner.temp }}/sca-parts
+          output-dir: ${{ runner.temp }}/sca-out
+          window-days: ${{ inputs.early-warning-days }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: sca-part-early-warning
+          path: ${{ runner.temp }}/sca-out/
+          retention-days: 1
+          if-no-files-found: error
+
   report:
-    needs: [targets, trivy-db, trivy, osv]
+    needs: [targets, trivy-db, trivy, osv, early-warning]
     # Without the targets result there is nothing to report on; the run is red anyway because the targets job failed
     if: ${{ always() && needs.targets.result == 'success' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
@@ -368,6 +412,7 @@ jobs:
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca
           trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
+          early-warning-enabled: ${{ inputs.early-warning-enabled }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

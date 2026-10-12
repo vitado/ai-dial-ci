@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ def _load_merge_results():
     path = ROOT / "actions" / "sca_merge_results" / "merge_results.py"
     spec = importlib.util.spec_from_file_location("merge_results", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up here
     spec.loader.exec_module(module)
     return module
 
@@ -195,6 +197,11 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "pkg_type": "os",
         "ecosystem": ["alpine"],
         "relationship": [],
+        "dev": None,
+        "introduced_via": [],
+        "dependency_paths": [],
+        "dependency_paths_total": 0,
+        "dependency_paths_truncated": False,
         "scan_targets": ["app-1.0.0"],
         "locations": ["ghcr.io/example/app:1.0.0 (alpine 3.19)"],
         "pkg_paths": [],
@@ -500,7 +507,7 @@ def test_summary_md_sections(full: Workspace) -> None:
     assert md.startswith("# SCA · example/app\n")
     assert "## What to fix" in md
     assert "<summary>Scan coverage</summary>" in md
-    assert "<summary>No fix available (2)</summary>" in md
+    assert "## No fix available — watch" in md  # a CRITICAL is in it
     # CRITICAL and HIGH are expanded, the others collapsed
     assert "<details open>\n<summary>CRITICAL (1)</summary>" in md
     assert "<details open>\n<summary>HIGH (1)</summary>" in md
@@ -520,21 +527,27 @@ def test_summary_md_sections(full: Workspace) -> None:
         in md
     )
     assert "> **development — image: 1 HIGH · 1 MEDIUM; source: 1 CRITICAL · " in md
-    assert "(2 not in any image)" in md
+    assert "(2 not in images)" in md
     assert "> 5 findings (3 fixable) · 3/3 targets scanned" in md
-    # what to fix
+    # what to fix: only what an upgrade resolves
     assert (
-        "| 1 | Fix in development and backport | zlib · alpine (base image) "
-        "| 1.2.0 → 1.2.1 | 1 MEDIUM | image :development, :1.0.0 |" in md
+        "| 1 | zlib · alpine (base image) | 1.2.0 → 1.2.1 | 1 MEDIUM "
+        "| Released 1.0.0 + development "
+        "| Upgrade in development, backport to release-1.0 "
+        "| image :development, :1.0.0 |" in md
     )
     assert (
-        "| 2 | Release a patch (fixed in development) "
-        "| openssl · alpine (base image) | 3.0.0 → no fix | 1 LOW | image :1.0.0 |"
-        in md
+        "| 3 | org.example:lib · java | 1.0 → 1.1 | 1 MEDIUM "
+        "| Source only · not in images "
+        "| Upgrade in development — not in published images |" in md
     )
+    fix_table = md.split("## What to fix")[1].split("## No fix available")[0]
+    assert "minimist" not in fix_table
+    assert "openssl" not in fix_table
+    # the watch section
     assert (
-        "| 4 | Not in any image (lower priority) | minimist · npm "
-        "| 1.0.0 → no fix | 1 CRITICAL | source package-lock.json |" in md
+        "| 1 | openssl 3.0.0 · alpine | 1 LOW | - | - | Released 1.0.0 only "
+        "| Mitigate or replace the package; re-check on next scan |" in md
     )
     # coverage
     assert "| source @ development fedcba9 | ok | 0 | 1 | 1 | 1 | 0 | - |" in md
@@ -1062,9 +1075,9 @@ def test_release_headline_suffix() -> None:
 
 
 def test_development_headline() -> None:
-    low = {"severity": "LOW", "exposure": "source_only"}
+    low = {"severity": "LOW", "exposure": "source_only", "dev": True}
     assert mr.development_headline([], [low]) == (
-        "**development — image: clean; source: 1 LOW (not in any image)**"
+        "**development — image: clean; source: 1 LOW (dev dependencies)**"
     )
     assert mr.development_headline([], None) == "**development — image: clean**"
     assert mr.development_headline(None, None) is None
@@ -1174,8 +1187,9 @@ def test_upgrade_to_is_shared_by_all_records_of_a_package_version(
     recs = records_by_cve(ws)
     assert recs["CVE-1"]["upgrade_to"] == recs["CVE-2"]["upgrade_to"] == "2.9.1"
     assert recs["CVE-2"]["fixed_versions"] == ["2.9.1", "3.0.0"]
-    assert recs["CVE-3"]["upgrade_to"] is None  # CVE-4 has no fix
+    assert recs["CVE-3"]["upgrade_to"] == "9.9"  # the unfixable CVE-4 does not count
     assert recs["CVE-3"]["fix_available"] is True
+    assert recs["CVE-4"]["upgrade_to"] is None
     assert recs["CVE-4"]["fixed_versions"] == []
     assert recs["CVE-4"]["fix_available"] is False
 
@@ -1297,8 +1311,8 @@ def test_relationship_pkg_paths_and_aliases_are_extracted(tmp_path: Path) -> Non
 
 
 def test_relationship_unknown_is_left_out() -> None:
-    result = {"Packages": [{"Name": "a", "Version": "1", "Relationship": "unknown"}]}
-    assert mr.relationship_index(result) == {}
+    packages = [{"Name": "a", "Version": "1", "Relationship": "unknown"}]
+    assert mr.package_relationships(packages) == set()
 
 
 def test_unknown_severity_is_normalized(tmp_path: Path) -> None:
@@ -1401,8 +1415,10 @@ def test_python_package_names_are_one_package_across_ecosystems(
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "not in any image" not in md
     assert (
-        "| 1 | Fix in development and backport | Mako · python | 1.3.12 → 1.4.2 "
-        "| 1 HIGH | image :development, :1.0.0 · source poetry.lock |" in md
+        "| 1 | Mako · python | 1.3.12 → 1.4.2 | 1 HIGH "
+        "| Released 1.0.0 + development "
+        "| Upgrade in development, backport to release-1.0 "
+        "| image :development, :1.0.0 · source poetry.lock |" in md
     )
 
 
@@ -1465,3 +1481,437 @@ def test_strip_package_prefix(
     title: str | None, pkg: str, expected: str | None
 ) -> None:
     assert mr.strip_package_prefix(title, pkg) == expected
+
+
+# ---------------------------------------------------------------- v3
+
+
+def pkg(
+    name: str,
+    relationship: str = "indirect",
+    deps: tuple[str, ...] = (),
+    dev: bool | None = None,
+    version: str = "1.0.0",
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "ID": f"{name}@{version}",
+        "Name": name,
+        "Version": version,
+        "Identifier": {"UID": f"uid-{name}"},
+        "Relationship": relationship,
+        "DependsOn": [f"{d}@1.0.0" for d in deps],
+    }
+    if dev is not None:
+        body["Dev"] = dev
+    return body
+
+
+def info_for(packages: list[dict[str, Any]], name: str) -> Any:
+    index = mr.PackageIndex(packages, "npm")
+    return index.dependency_info(next(p for p in packages if p["Name"] == name))
+
+
+def test_dependency_chain_deeper_than_three_levels() -> None:
+    packages = [
+        pkg("jest", "direct", ("@jest/core",)),
+        pkg("@jest/core", deps=("micromatch",)),
+        pkg("micromatch", deps=("braces",)),
+        pkg("braces"),
+    ]
+    info = info_for(packages, "braces")
+    assert info.paths == [("jest", "@jest/core", "micromatch", "braces")]
+    assert (info.total, info.truncated) == (1, False)
+    assert info.roots == {"jest"}
+
+
+def test_dependency_paths_of_a_diamond_shortest_then_alphabetical() -> None:
+    packages = [
+        pkg("a", "direct", ("c", "b", "long")),
+        pkg("e", "direct", ("d",)),
+        pkg("b", deps=("d",)),
+        pkg("c", deps=("d",)),
+        pkg("long", deps=("longer",)),
+        pkg("longer", deps=("d",)),
+        pkg("d"),
+    ]
+    info = info_for(packages, "d")
+    assert info.paths == [
+        ("e", "d"),
+        ("a", "b", "d"),
+        ("a", "c", "d"),
+        ("a", "long", "longer", "d"),
+    ]
+    assert info.total == 4
+    assert info.roots == {"a", "e"}
+
+
+def test_dependency_paths_stop_at_the_nearest_direct_package() -> None:
+    packages = [
+        pkg("outer", "direct", ("inner",)),
+        pkg("inner", "direct", ("leaf",)),
+        pkg("leaf"),
+    ]
+    info = info_for(packages, "leaf")
+    assert info.paths == [("inner", "leaf")]
+    assert info.roots == {"inner"}
+
+
+def test_dependency_paths_survive_a_cycle() -> None:
+    packages = [
+        pkg("a", "direct", ("b",)),
+        pkg("b", deps=("c",)),
+        pkg("c", deps=("b", "t")),
+        pkg("t"),
+    ]
+    info = info_for(packages, "t")
+    assert info.paths == [("a", "b", "c", "t")]
+    assert info.total == 1
+
+
+def ladder(layers: int) -> list[dict[str, Any]]:
+    """root -> (x1, y1) -> (x2, y2) -> ... -> t: 2**layers paths."""
+    packages = [pkg("root", "direct", ("x1", "y1"))]
+    for n in range(1, layers + 1):
+        nxt = ("t",) if n == layers else (f"x{n + 1}", f"y{n + 1}")
+        packages += [pkg(f"x{n}", deps=nxt), pkg(f"y{n}", deps=nxt)]
+    return [*packages, pkg("t")]
+
+
+def test_dependency_paths_are_capped_but_counted_exactly() -> None:
+    info = info_for(ladder(4), "t")
+    assert info.total == 16
+    assert info.truncated is False
+    assert len(info.paths) == mr.MAX_DEPENDENCY_PATHS
+    assert info.paths[0] == ("root", "x1", "x2", "x3", "x4", "t")
+    assert list(info.paths) == sorted(info.paths, key=lambda p: (len(p), p))
+
+
+def test_dependency_path_count_is_bounded_and_marked_truncated() -> None:
+    info = info_for(ladder(14), "t")  # 16384 paths
+    assert info.total == mr.PATH_COUNT_LIMIT
+    assert info.truncated is True
+    assert len(info.paths) == mr.MAX_DEPENDENCY_PATHS
+
+
+def test_introduced_via_lists_all_roots_not_just_the_stored_paths() -> None:
+    names = [f"r{n}" for n in range(7)]
+    packages = [pkg(n, "direct", ("t",)) for n in names] + [pkg("t")]
+    info = info_for(packages, "t")
+    assert info.total == 7
+    assert len(info.paths) == 5
+    assert info.roots == set(names)
+    paths, total, truncated, via = mr.combine_dependency_info([info])
+    assert (total, truncated) == (7, False)
+    assert via == names[:5]
+    assert len(paths) == 5
+
+
+def test_direct_and_graphless_packages() -> None:
+    direct = info_for([pkg("lodash", "direct")], "lodash")
+    assert (list(direct.paths), direct.total, set(direct.roots)) == (
+        [("lodash",)],
+        1,
+        set(),
+    )
+    lonely = info_for([pkg("x")], "x")  # indirect, nothing depends on it
+    assert (list(lonely.paths), lonely.total, set(lonely.roots)) == ([], 0, set())
+    unknown = info_for([pkg("x", "unknown")], "x")
+    assert (list(unknown.paths), unknown.total) == ([], 0)
+
+
+def test_combine_dependency_info_dedupes_paths_and_sums_totals() -> None:
+    one = mr.DependencyInfo([("a", "t")], 1, False, frozenset({"a"}))
+    two = mr.DependencyInfo([("a", "t"), ("b", "t")], 2, False, frozenset({"a", "b"}))
+    paths, total, truncated, via = mr.combine_dependency_info([one, two])
+    assert paths == [["a", "t"], ["b", "t"]]
+    assert (total, truncated, via) == (3, False, ["a", "b"])
+    assert mr.combine_dependency_info([]) == ([], 0, False, [])
+
+
+def test_package_index_matches_by_uid_then_id_then_name() -> None:
+    packages = [
+        {"ID": "mako@1", "Name": "mako", "Version": "1", "Identifier": {"UID": "u"}},
+    ]
+    index = mr.PackageIndex(packages, "poetry")
+    assert index.match({"PkgIdentifier": {"UID": "u"}}) == packages
+    assert index.match({"PkgID": "mako@1"}) == packages
+    assert index.match({"PkgName": "Mako", "InstalledVersion": "1"}) == packages
+    assert index.match({"PkgName": "Mako", "InstalledVersion": "2"}) == []
+
+
+def graph_source(tmp_path: Path, *targets: dict[str, Any]) -> Workspace:
+    """Source targets whose lockfile has a dev chain jest > core > braces"""
+    packages = [
+        pkg("jest", "direct", ("core",), dev=True),
+        pkg("core", deps=("braces",), dev=True),
+        pkg("braces", dev=True, version="3.0.3"),
+        pkg("react", "direct", (), dev=False),
+    ]
+    packages[2]["ID"] = "braces@3.0.3"
+    packages[1]["DependsOn"] = ["braces@3.0.3"]
+    native = native_with(
+        vuln(
+            "CVE-1",
+            None,
+            PkgName="braces",
+            InstalledVersion="3.0.3",
+            PkgID="braces@3.0.3",
+        ),
+        vuln("CVE-2", "9.9", PkgName="react", InstalledVersion="1.0.0"),
+        packages=packages,
+    )
+    native["Results"][0]["Type"] = "npm"
+    ws = Workspace(tmp_path, make_targets_doc(*targets))
+    for target in targets:
+        ws.add_part(target["id"], None)
+        (ws.trivy_parts / f"{target['id']}.json").write_text(
+            json.dumps(native), encoding="utf-8"
+        )
+    return ws
+
+
+def test_dev_flag_and_chains_end_to_end(tmp_path: Path) -> None:
+    other = {**SOURCE, "id": "source-release", "git_ref": "release/1.0"}
+    ws = graph_source(tmp_path, SOURCE, other)
+    ws.run()
+    recs = records_by_cve(ws)
+    braces, react = recs["CVE-1"], recs["CVE-2"]
+    assert braces["dev"] is True
+    assert braces["relationship"] == ["indirect"]
+    assert braces["introduced_via"] == ["jest"]
+    assert braces["dependency_paths"] == [["jest", "core", "braces"]]
+    # the same lockfile seen by two targets counts once
+    assert braces["dependency_paths_total"] == 1
+    assert braces["dependency_paths_truncated"] is False
+    assert react["dev"] is False  # a package without Dev is a runtime one
+    assert react["dependency_paths"] == [["react"]]
+    assert react["introduced_via"] == []
+
+
+def test_dev_flag_is_null_without_package_entry_and_false_if_any_is_runtime(
+    tmp_path: Path,
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE, DEV))
+    ws.add_part("source-development", None)
+    ws.add_part("app-development", None)
+    shared = vuln("CVE-1", None)
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps(
+            native_with(
+                shared, packages=[pkg("urllib3", "direct", dev=True, version="2.7.0")]
+            )
+        ),
+        encoding="utf-8",
+    )
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps(native_with(shared, vuln("CVE-2", None))), encoding="utf-8"
+    )
+    ws.run()
+    recs = records_by_cve(ws)
+    assert recs["CVE-1"]["dev"] is True  # the image has no package entry: unknown
+    assert recs["CVE-2"]["dev"] is None
+    assert recs["CVE-2"]["dependency_paths"] == []
+    assert recs["CVE-2"]["dependency_paths_total"] == 0
+
+
+# ---- markdown
+
+
+def test_shortest_path_text_and_more_paths() -> None:
+    def record(paths: list[list[str]], total: int, truncated: bool = False) -> Record:
+        return {
+            "dependency_paths": paths,
+            "dependency_paths_total": total,
+            "dependency_paths_truncated": truncated,
+        }
+
+    one = record([["jest", "core", "braces"]], 1)
+    assert mr.shortest_path_text([one]) == "jest › core › braces"
+    two = record([["b", "t"], ["a", "x", "t"]], 2)
+    assert mr.shortest_path_text([two]) == "b › t (+1 more path)"
+    many = record([["a", "t"]], 7)
+    assert mr.shortest_path_text([many]) == "a › t (+6 more paths)"
+    cut = record([["a", "t"]], 1000, True)
+    assert mr.shortest_path_text([cut]) == "a › t (+999+ more paths)"
+    assert mr.shortest_path_text([record([], 0)]) == ""
+
+
+def test_summary_md_shows_chains_in_actions_watch_and_paths_section(
+    tmp_path: Path,
+) -> None:
+    ws = graph_source(tmp_path, SOURCE, DEV)
+    # the unfixable CVE-1 sits in a lockfile; add a development image without it
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps({"Results": []}), encoding="utf-8"
+    )
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "(1 dev dependency, 1 not in images)" in md
+    # braces has no fix: watch section, the chain in "Introduced via"
+    assert (
+        "| 1 | braces 3.0.3 · npm | 1 HIGH | dev, indirect | jest › core › braces "
+        "| Source only · dev dependency |" in md
+    )
+    assert "## No fix available — watch" in md
+    assert "<summary>Dependency paths (1)</summary>" in md
+    assert "- **braces 3.0.3** (1 path)\n  - jest › core › braces" in md
+    # react is a runtime dependency with a fix and a direct one: no chain in Action
+    assert "| react · npm | 1.0.0 → 9.9 | 1 HIGH | Source only · not in images " in md
+    assert "| Upgrade in development — not in published images |" in md
+
+
+def test_what_to_fix_action_names_the_chain_of_a_fixable_indirect_package(
+    tmp_path: Path,
+) -> None:
+    ws = graph_source(tmp_path, SOURCE, DEV)
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps({"Results": []}), encoding="utf-8"
+    )
+    native = json.loads((ws.trivy_parts / "source-development.json").read_text("utf-8"))
+    native["Results"][0]["Vulnerabilities"][0]["FixedVersion"] = "3.0.4"
+    (ws.trivy_parts / "source-development.json").write_text(
+        json.dumps(native), encoding="utf-8"
+    )
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "| braces · npm, indirect | 3.0.3 → 3.0.4 | 1 HIGH "
+        "| Source only · dev dependency "
+        "| Upgrade in development via jest › core › braces "
+        "— dev dependency, not shipped |" in md
+    )
+    assert "No fix available" not in md
+
+
+def test_summary_md_without_indirect_packages_has_no_paths_section(
+    full: Workspace,
+) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "Dependency paths" not in md
+
+
+def test_watch_section_is_collapsed_without_high_or_critical(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(DEV))
+    ws.add_part("app-development", None)
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps(native_with(vuln("CVE-1", None, Severity="LOW"))), encoding="utf-8"
+    )
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "<details>\n<summary>No fix available — watch (1)</summary>" in md
+    assert "## No fix available — watch" not in md
+    assert "## What to fix" not in md  # nothing can be fixed by an upgrade
+
+
+def test_watch_section_is_open_with_high_or_critical(full: Workspace) -> None:
+    full.run()
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "\n## No fix available — watch\n\n| # | Package |" in md
+    assert "<summary>No fix available" not in md
+
+
+def test_watch_suggestion_for_dev_only_packages(tmp_path: Path) -> None:
+    ws = graph_source(tmp_path, SOURCE, DEV)
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert "Accept as dev-only risk or replace the parent; re-check on next scan" in md
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [("1.1.14", "release-1.1"), ("v2.10.0", "release-2.10"), ("rc", "release-rc")],
+)
+def test_release_line(tag: str, expected: str) -> None:
+    assert mr.release_line(tag) == expected
+
+
+def test_action_texts() -> None:
+    both, only = "release_and_development", "release_only"
+    assert mr.action_text(both, None, ["1.1.14"]) == (
+        "Upgrade in development, backport to release-1.1"
+    )
+    assert mr.action_text(both, None, ["1.1.14", "1.0.3", "1.0.4"]) == (
+        "Upgrade in development, backport to release-1.1, release-1.0"
+    )
+    assert mr.action_text(only, None, ["0.12.0"]) == (
+        "Release a patch from release-0.12 (already fixed in development)"
+    )
+    assert mr.action_text("development_only", None, []) == (
+        "Upgrade in development before the next release"
+    )
+    assert mr.action_text("source_only", True, [], "jest › braces") == (
+        "Upgrade in development via jest › braces — dev dependency, not shipped"
+    )
+    assert mr.action_text("source_only", False, []) == (
+        "Upgrade in development — not in published images"
+    )
+    assert mr.action_text(both, None, ["1.0.0"], "a › b") == (
+        "Upgrade in development via a › b, backport to release-1.0"
+    )
+
+
+def test_exposure_labels() -> None:
+    label = mr.exposure_label
+    assert label("release_and_development", None, ["1.1.14", "1.0.3"], True) == (
+        "Released 1.1.14, 1.0.3 + development"
+    )
+    assert label("release_only", None, ["0.12.0"], True) == "Released 0.12.0 only"
+    assert label("development_only", None, [], True) == "development only"
+    assert label("development_only", None, [], False) == "development (source)"
+    assert label("source_only", True, [], True) == "Source only · dev dependency"
+    assert label("source_only", None, [], True) == "Source only · not in images"
+
+
+def test_exposure_label_lists_the_release_tags_of_the_images_it_was_found_in() -> None:
+    other = {**REL, "id": "app-0.9.0", "tag": "0.9.0"}
+    targets = [SOURCE, DEV, REL, other]
+    record = {"scan_targets": ["source-development", "app-0.9.0", "app-1.0.0"]}
+    assert mr.release_tags_of([record], targets) == ["1.0.0", "0.9.0"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "extra_shared", "expected"),
+    [
+        ([True], 0, " (dev dependencies)"),
+        ([False], 0, " (not in images)"),
+        ([None, False], 0, " (not in images)"),
+        ([True, False], 0, " (1 dev dependency, 1 not in images)"),
+        ([True, True], 0, " (dev dependencies)"),
+        ([True, True], 1, " (2 dev dependencies)"),
+        ([False], 1, " (1 not in images)"),
+        ([], 1, ""),
+    ],
+)
+def test_source_only_note(
+    flags: list[bool | None], extra_shared: int, expected: str
+) -> None:
+    records = [{"exposure": "source_only", "dev": flag} for flag in flags]
+    records += [{"exposure": "development_only", "dev": None}] * extra_shared
+    assert mr.source_only_note(records) == expected
+
+
+def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(DEV))
+    ws.add_part("app-development", None)
+    native = native_with(
+        vuln("CVE-1", "2.8.0"),
+        vuln("CVE-2", None, Severity="MEDIUM"),
+        vuln("CVE-3", "2.9.1", Severity="LOW"),
+    )
+    (ws.trivy_parts / "app-development.json").write_text(
+        json.dumps(native), encoding="utf-8"
+    )
+    ws.run()
+    recs = records_by_cve(ws)
+    assert recs["CVE-1"]["upgrade_to"] == recs["CVE-3"]["upgrade_to"] == "2.9.1"
+    assert recs["CVE-2"]["upgrade_to"] is None
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    fix = md.split("## What to fix")[1].split("<details")[0]
+    assert (
+        "| 1 | urllib3 · python | 2.7.0 → 2.9.1 | 1 HIGH, 1 LOW "
+        "· 1 without fix (see watch) "
+        "| development only |" in fix
+    )
+    assert "No fix available — watch (1)" in md  # collapsed: only a MEDIUM
+    assert "| 1 | urllib3 2.7.0 · python | 1 MEDIUM |" in md

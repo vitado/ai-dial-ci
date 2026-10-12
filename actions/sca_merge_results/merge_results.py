@@ -42,9 +42,10 @@ import re
 import shutil
 import sys
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
@@ -84,18 +85,14 @@ EXPOSURES = (
     EXPOSURE_SOURCE_ONLY,
 )
 EXPOSURE_ORDER = {name: index for index, name in enumerate(EXPOSURES)}
-EXPOSURE_ACTIONS = {
-    EXPOSURE_RELEASE_AND_DEVELOPMENT: "Fix in development and backport",
-    EXPOSURE_RELEASE_ONLY: "Release a patch (fixed in development)",
-    EXPOSURE_DEVELOPMENT_ONLY: "Fix before next release",
-    EXPOSURE_SOURCE_ONLY: "Not in any image (lower priority)",
-}
-EXPOSURE_SHORT = {
-    EXPOSURE_RELEASE_AND_DEVELOPMENT: "release + development",
-    EXPOSURE_RELEASE_ONLY: "release only",
-    EXPOSURE_DEVELOPMENT_ONLY: "development only",
-    EXPOSURE_SOURCE_ONLY: "source only",
-}
+MAX_INTRODUCED_VIA = 5
+MAX_DEPENDENCY_PATHS = 5
+# Counting stops here (the count is then "at least this many") and so does the
+# enumeration of candidate paths of one length; the walk has a step budget too.
+PATH_COUNT_LIMIT = 1000
+PATH_WALK_BUDGET = 50_000
+PATH_SEPARATOR = " › "
+RELEASE_LINE_RE = re.compile(r"^v?(\d+)\.(\d+)")
 
 # Trivy result types by ecosystem family. The family decides how a package name
 # is compared (Python names are case-insensitive, PEP 503) and what the summary
@@ -233,30 +230,239 @@ def load_target_result(
 # --------------------------------------------------------------------------
 
 
-def relationship_index(result: Mapping[str, Any]) -> dict[tuple[Any, Any], set[str]]:
-    """``(name, version) -> relationships`` from the Packages of one trivy Result.
-
-    ``unknown`` carries no information and is left out.
+@dataclass
+class PackageIndex:
+    """The Packages inventory of one trivy Result: finds the package of a finding
+    and walks the dependency graph (``DependsOn`` holds package IDs).
     """
-    index: dict[tuple[Any, Any], set[str]] = {}
-    for package in result.get("Packages") or []:
-        relationship = package.get("Relationship")
-        if relationship and relationship != "unknown":
-            key = (package.get("Name"), package.get("Version"))
-            index.setdefault(key, set()).add(relationship)
-    return index
+
+    packages: Sequence[Mapping[str, Any]]
+    result_type: str | None = None
+    by_uid: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False)
+    by_id: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False)
+    by_name: dict[tuple[Any, Any], list[Mapping[str, Any]]] = field(
+        default_factory=dict, init=False
+    )
+    parents: dict[str, list[str]] = field(default_factory=dict, init=False)
+    _info: dict[str, DependencyInfo] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        for package in self.packages:
+            uid = (package.get("Identifier") or {}).get("UID")
+            if uid:
+                self.by_uid.setdefault(uid, package)
+            if package.get("ID"):
+                self.by_id.setdefault(package["ID"], package)
+            name = canonical_package_name(package.get("Name"), self.result_type)
+            self.by_name.setdefault((name, package.get("Version")), []).append(package)
+            for child in package.get("DependsOn") or []:
+                if package.get("ID"):
+                    self.parents.setdefault(child, []).append(package["ID"])
+
+    def match(self, vuln: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """The package of a finding: by UID, else by package ID, else by name and
+        version (the name compared as ``canonical_package_name`` does).
+        """
+        uid = (vuln.get("PkgIdentifier") or {}).get("UID")
+        if uid in self.by_uid:
+            return [self.by_uid[uid]]
+        if vuln.get("PkgID") in self.by_id:
+            return [self.by_id[vuln["PkgID"]]]
+        name = canonical_package_name(vuln.get("PkgName"), self.result_type)
+        return self.by_name.get((name, vuln.get("InstalledVersion")), [])
+
+    def _is_direct(self, package_id: str) -> bool:
+        return self.by_id[package_id].get("Relationship") == "direct"
+
+    def _ancestors(self, target_id: str) -> dict[str, int]:
+        """Packages the target is reachable from, with their distance to it.
+
+        A reverse breadth-first walk over ``DependsOn`` that stops at direct
+        packages (the nearest direct dependency is the one that matters); the
+        visited set makes it safe against cycles.
+        """
+        depth = {target_id: 0}
+        queue = [target_id]
+        for node in queue:
+            if node != target_id and self._is_direct(node):
+                continue
+            for parent in sorted(self.parents.get(node, ())):
+                if parent in self.by_id and parent not in depth:
+                    depth[parent] = depth[node] + 1
+                    queue.append(parent)
+        return depth
+
+    def _count_paths(self, target_id: str, scope: Mapping[str, int]) -> int:
+        """Number of paths from a direct package down to the target, at most
+        ``PATH_COUNT_LIMIT``: a memoized count over the graph (never an
+        enumeration), where the edges that close a cycle are ignored.
+        """
+        memo: dict[str, int] = {}
+        total = {target_id: 0}
+        on_path = {target_id}
+        stack = [(target_id, iter(sorted(self.parents.get(target_id, ()))))]
+        while stack:
+            node, parents = stack[-1]
+            for parent in parents:
+                if parent not in scope or parent in on_path:
+                    continue
+                if parent in memo:
+                    total[node] += memo[parent]
+                elif self._is_direct(parent):
+                    memo[parent] = 1
+                    total[node] += 1
+                else:
+                    on_path.add(parent)
+                    total[parent] = 0
+                    stack.append((parent, iter(sorted(self.parents.get(parent, ())))))
+                    break
+            else:
+                stack.pop()
+                on_path.discard(node)
+                memo[node] = min(total.pop(node), PATH_COUNT_LIMIT)
+                if stack:
+                    total[stack[-1][0]] += memo[node]
+        return memo[target_id]
+
+    def _shortest_paths(
+        self, target_id: str, depth: Mapping[str, int]
+    ) -> list[tuple[str, ...]]:
+        """Up to ``MAX_DEPENDENCY_PATHS`` shortest paths (as names), shortest
+        first, equal lengths in alphabetical order.
+
+        Paths are enumerated by increasing length, walking down from every direct
+        package and pruning with the distance to the target; the step budget keeps
+        a dense graph from blowing up.
+        """
+        roots = sorted(n for n in depth if n != target_id and self._is_direct(n))
+        names = {n: self.by_id[n].get("Name") or n for n in depth}
+        found: set[tuple[str, ...]] = set()
+        budget = PATH_WALK_BUDGET
+
+        def walk(path: list[str], remaining: int) -> None:
+            nonlocal budget
+            budget -= 1
+            node = path[-1]
+            if budget < 0 or len(found) >= PATH_COUNT_LIMIT:
+                return
+            if remaining == 0:
+                if node == target_id:
+                    found.add(tuple(names[n] for n in path))
+                return
+            children = self.by_id[node].get("DependsOn") or []
+            for child in sorted(children, key=lambda c: (names.get(c, ""), c)):
+                if child in depth and child not in path and depth[child] < remaining:
+                    if child == target_id or not self._is_direct(child):
+                        path.append(child)
+                        walk(path, remaining - 1)
+                        path.pop()
+
+        for length in range(min(depth[r] for r in roots), len(depth)):
+            for root in roots:
+                if depth[root] <= length:
+                    walk([root], length)
+            if len(found) >= MAX_DEPENDENCY_PATHS or budget < 0:
+                break
+        return sorted(found, key=lambda path: (len(path), path))[:MAX_DEPENDENCY_PATHS]
+
+    def dependency_info(self, package: Mapping[str, Any]) -> DependencyInfo:
+        """How a package got into the project: the chains of dependencies from a
+        direct package to it. A direct package is its own chain; without graph
+        information (no ``DependsOn``, unknown relationship) there is none.
+        """
+        package_id = package.get("ID")
+        if package_id in self._info:
+            return self._info[package_id]
+        name = package.get("Name")
+        info = DependencyInfo()
+        if package.get("Relationship") == "direct":
+            info = DependencyInfo([(name,)], 1, False, frozenset())
+        elif package.get("Relationship") == "indirect" and package_id in self.by_id:
+            depth = self._ancestors(package_id)
+            roots = {self.by_id[n].get("Name") for n in depth if self._is_direct(n)}
+            roots.discard(None)
+            if roots - {name}:
+                scope = depth
+                count = self._count_paths(package_id, scope)
+                info = DependencyInfo(
+                    self._shortest_paths(package_id, depth),
+                    count,
+                    count >= PATH_COUNT_LIMIT,
+                    frozenset(roots),
+                )
+        self._info[package_id] = info
+        return info
 
 
-def iter_findings(
-    native: Mapping[str, Any],
-) -> Iterator[tuple[Mapping[str, Any], Mapping[str, Any], set[str]]]:
-    """Yield (trivy Result, vulnerability, relationships of its package)."""
+@dataclass(frozen=True)
+class DependencyInfo:
+    """Dependency chains of one package: the shortest ones (as package names), the
+    number of all of them, whether that number was cut at ``PATH_COUNT_LIMIT`` and
+    the direct packages they start from.
+    """
+
+    paths: Sequence[tuple[str, ...]] = ()
+    total: int = 0
+    truncated: bool = False
+    roots: frozenset[str] = frozenset()
+
+
+def combine_dependency_info(
+    infos: Iterable[DependencyInfo],
+) -> tuple[list[list[str]], int, bool, list[str]]:
+    """Merge the chains of all sightings of a finding: ``(paths, total,
+    truncated, introduced_via)`` with the shortest distinct paths first.
+    """
+    infos = list(infos)
+    paths: set[tuple[str, ...]] = set()
+    roots: set[str] = set()
+    total = 0
+    for info in infos:
+        paths.update(info.paths)
+        roots.update(info.roots)
+        total += info.total
+    truncated = total >= PATH_COUNT_LIMIT or any(i.truncated for i in infos)
+    ordered = sorted(paths, key=lambda path: (len(path), path))
+    return (
+        [list(path) for path in ordered[:MAX_DEPENDENCY_PATHS]],
+        min(total, PATH_COUNT_LIMIT),
+        truncated,
+        sorted(roots)[:MAX_INTRODUCED_VIA],
+    )
+
+
+class Finding(NamedTuple):
+    """One vulnerability of a trivy Result with its package from the inventory."""
+
+    result: Mapping[str, Any]
+    vuln: Mapping[str, Any]
+    packages: list[Mapping[str, Any]]
+    index: PackageIndex
+
+
+def package_relationships(packages: Iterable[Mapping[str, Any]]) -> set[str]:
+    """``direct`` / ``indirect`` / ...; ``unknown`` carries no information."""
+    return {
+        p["Relationship"]
+        for p in packages
+        if p.get("Relationship") and p["Relationship"] != "unknown"
+    }
+
+
+def package_dev_flag(packages: Iterable[Mapping[str, Any]]) -> bool | None:
+    """True if all given packages are dev-only, False if one is not, None if empty."""
+    flags = [p.get("Dev") is True for p in packages]
+    return all(flags) if flags else None
+
+
+def iter_findings(native: Mapping[str, Any]) -> Iterator[Finding]:
     for result in native.get("Results") or []:
         vulns = result.get("Vulnerabilities") or []
-        index = relationship_index(result) if vulns else {}
+        if not vulns:
+            continue
+        index = PackageIndex(result.get("Packages") or [], result.get("Type"))
         for vuln in vulns:
-            pkg_key = (vuln.get("PkgName"), vuln.get("InstalledVersion"))
-            yield result, vuln, index.get(pkg_key, set())
+            yield Finding(result, vuln, index.match(vuln), index)
 
 
 def canonical_package_name(name: str | None, result_type: str | None) -> str | None:
@@ -487,6 +693,17 @@ def new_record(
         # ...); a list because one finding can surface under several types
         "ecosystem": [],
         "relationship": [],
+        # True: a dev dependency (not shipped) in every sighting; False: not; None:
+        # no package entry (image results)
+        "dev": None,
+        # the direct dependencies an indirect package comes from (at most 5) and
+        # the chains from a direct dependency down to the package: the shortest
+        # ones, how many there are in all (counted up to 1000) and whether that
+        # count was cut
+        "introduced_via": [],
+        "dependency_paths": [],
+        "dependency_paths_total": 0,
+        "dependency_paths_truncated": False,
         "scan_targets": [],
         "locations": [],
         "pkg_paths": [],
@@ -566,8 +783,11 @@ def merge_records(
     by_key: dict[FindingKey, Record] = {}
     sightings: dict[FindingKey, dict[str, list[str]]] = {}
     named_by_image: set[FindingKey] = set()
+    dev_packages: dict[FindingKey, list[Mapping[str, Any]]] = {}
+    chains: dict[FindingKey, dict[tuple[Any, Any], DependencyInfo]] = {}
     for tid, scanner, native in scans:
-        for result, vuln, relationships in iter_findings(native):
+        for result, vuln, packages, index in iter_findings(native):
+            relationships = package_relationships(packages)
             key = finding_key(result, vuln)
             record = by_key.get(key)
             if record is None:
@@ -576,14 +796,29 @@ def merge_records(
                 named_by_image.add(key)
                 record["pkg"] = vuln.get("PkgName")
             absorb_finding(record, tid, scanner, result, vuln, relationships)
+            dev_packages.setdefault(key, []).extend(packages)
+            for package in packages:
+                # one chain set per package of a lockfile, however many targets saw it
+                sighting = (
+                    result.get("Target"),
+                    package.get("ID") or package.get("Name"),
+                )
+                chains.setdefault(key, {})[sighting] = index.dependency_info(package)
             _append_unique(
                 sightings.setdefault(key, {}).setdefault(tid, []),
                 result.get("Target", ""),
             )
-    for record in by_key.values():
-        for field in ("locations", "scanners", "ecosystem", "relationship", "aliases"):
-            record[field].sort()
+    for key, record in by_key.items():
+        for name in ("locations", "scanners", "ecosystem", "relationship", "aliases"):
+            record[name].sort()
         record["pkg_paths"].sort()
+        record["dev"] = package_dev_flag(dev_packages.get(key, []))
+        (
+            record["dependency_paths"],
+            record["dependency_paths_total"],
+            record["dependency_paths_truncated"],
+            record["introduced_via"],
+        ) = combine_dependency_info(chains.get(key, {}).values())
     by_record = {
         (r["cve"], r["pkg"], r["version"]): sightings[key] for key, r in by_key.items()
     }
@@ -633,16 +868,23 @@ def assign_exposure(records: Iterable[Record], targets: Sequence[Target]) -> Non
 
 
 def assign_upgrades(records: Sequence[Record]) -> None:
-    """Set ``upgrade_to`` (same value on every record of one package version)."""
+    """Set ``upgrade_to`` on the fixable records of each package version.
+
+    It is the version that resolves all of the package's fixable CVEs (the same
+    on all of them); records without a fix keep ``None``.
+    """
     fixed_by_package: dict[tuple[Any, Any], list[list[str]]] = {}
     for record in records:
-        key = (record["pkg"], record["version"])
-        fixed_by_package.setdefault(key, []).append(record["fixed_versions"])
+        if record["fix_available"]:
+            key = (record["pkg"], record["version"])
+            fixed_by_package.setdefault(key, []).append(record["fixed_versions"])
     for record in records:
         installed = record["version"]
-        fixed = fixed_by_package[(record["pkg"], installed)]
+        fixed = fixed_by_package.get((record["pkg"], installed))
         record["upgrade_to"] = (
-            upgrade_target(installed, fixed) if isinstance(installed, str) else None
+            upgrade_target(installed, fixed)
+            if fixed and record["fix_available"] and isinstance(installed, str)
+            else None
         )
 
 
@@ -699,7 +941,7 @@ def finding_stats(items: Iterable[tuple[str, bool]]) -> dict[str, Any]:
 def target_findings(native: Mapping[str, Any]) -> dict[FindingKey, tuple[str, bool]]:
     """Unique findings of one target: key -> (severity, has a fix in any copy)."""
     found: dict[FindingKey, tuple[str, bool]] = {}
-    for result, vuln, _ in iter_findings(native):
+    for result, vuln, _, _ in iter_findings(native):
         key = finding_key(result, vuln)
         severity, fixable = found.get(
             key, (normalize_severity(vuln.get("Severity")), False)
@@ -951,11 +1193,30 @@ def release_headline(
     return f"{line}, {suffix}"
 
 
+def source_only_note(source_records: Sequence[Record]) -> str:
+    """What the source-only findings are: ``(dev dependencies)``, ``(not in images)``
+    or counts when mixed or when other source findings are also in an image.
+    """
+    outside = [r for r in source_records if r["exposure"] == EXPOSURE_SOURCE_ONLY]
+    if not outside:
+        return ""
+    dev = sum(r["dev"] is True for r in outside)
+    other = len(outside) - dev
+    if len(outside) == len(source_records) and not (dev and other):
+        return " (dev dependencies)" if dev else " (not in images)"
+    parts = []
+    if dev:
+        parts.append(f"{dev} dev {'dependency' if dev == 1 else 'dependencies'}")
+    if other:
+        parts.append(f"{other} not in images")
+    return f" ({', '.join(parts)})"
+
+
 def development_headline(
     image_records: Sequence[Record] | None,
     source_records: Sequence[Record] | None,
 ) -> str | None:
-    """``development — image: clean; source: 1 LOW (not in any image)``.
+    """``development — image: clean; source: 1 LOW (dev dependencies)``.
 
     ``None`` for a part means it was not scanned, so it is left out.
     """
@@ -966,12 +1227,7 @@ def development_headline(
     if source_records is not None:
         counts = count_by_severity(r["severity"] for r in source_records)
         text = f"source: {format_severity_counts(counts) or 'clean'}"
-        outside = sum(r["exposure"] == EXPOSURE_SOURCE_ONLY for r in source_records)
-        if outside == len(source_records) and outside:
-            text += " (not in any image)"
-        elif outside:
-            text += f" ({outside} not in any image)"
-        parts.append(text)
+        parts.append(text + source_only_note(source_records))
     return f"**development — {'; '.join(parts)}**" if parts else None
 
 
@@ -1082,28 +1338,133 @@ def group_fixes(records: Iterable[Record]) -> list[list[Record]]:
 def package_cell(group: Sequence[Record]) -> str:
     first = group[0]
     text = str(first["pkg"])
-    families = sorted(
-        {ECOSYSTEM_FAMILIES.get(e, e) for r in group for e in r["ecosystem"]}
-    )
+    families = package_families(group)
     if families:
-        text += f" · {'/'.join(families)}"
-    relationships = {rel for r in group for rel in r["relationship"]}
-    if "indirect" in relationships and "direct" not in relationships:
+        text += f" · {families}"
+    if group_relationship(group) == "indirect":
         text += ", indirect"
     if first["pkg_type"] == "os":
         text += " (base image)"
     return text
 
 
-def upgrade_cell(group: Sequence[Record]) -> str:
-    version = group[0]["version"]
-    upgrade = group[0]["upgrade_to"]
+def package_families(group: Iterable[Record]) -> str:
+    return "/".join(
+        sorted({ECOSYSTEM_FAMILIES.get(e, e) for r in group for e in r["ecosystem"]})
+    )
+
+
+def group_relationship(group: Iterable[Record]) -> str | None:
+    """``direct`` if any record says so, ``indirect`` if all that know are indirect."""
+    relationships = {rel for r in group for rel in r["relationship"]}
+    if "direct" in relationships:
+        return "direct"
+    return "indirect" if "indirect" in relationships else None
+
+
+def group_dev(group: Iterable[Record]) -> bool | None:
+    flags = [r["dev"] for r in group if r["dev"] is not None]
+    return all(flags) if flags else None
+
+
+def group_paths(group: Iterable[Record]) -> tuple[list[list[str]], int, bool]:
+    """Chains of a package version (the same on all its records) as stored."""
+    paths: list[list[str]] = []
+    total, truncated = 0, False
+    for r in group:
+        for path in r["dependency_paths"]:
+            if path not in paths:
+                paths.append(path)
+        total = max(total, r["dependency_paths_total"])
+        truncated = truncated or r["dependency_paths_truncated"]
+    paths.sort(key=lambda path: (len(path), path))
+    return paths, total, truncated
+
+
+def shortest_path_text(group: Iterable[Record]) -> str:
+    """``jest › micromatch › braces (+3 more paths)``; empty without a chain."""
+    paths, total, truncated = group_paths(group)
+    if not paths:
+        return ""
+    text = PATH_SEPARATOR.join(paths[0])
+    more = total - 1
+    if more > 0:
+        plus = f"{more}+" if truncated else str(more)
+        text += f" (+{plus} more {'path' if more == 1 and not truncated else 'paths'})"
+    return text
+
+
+def upgrade_cell(fixable: Sequence[Record]) -> str:
+    version = fixable[0]["version"]
+    upgrade = fixable[0]["upgrade_to"]
     if upgrade:
         return f"{version} → {upgrade}"
-    if all(r["fix_available"] for r in group):
-        fixed = sorted({f for r in group for f in r["fixed_versions"]})
-        return f"{version} → {', '.join(fixed)}"
-    return f"{version} → no fix"
+    fixed = sorted({f for r in fixable for f in r["fixed_versions"]})
+    return f"{version} → {', '.join(fixed)}"
+
+
+def resolves_cell(group: Sequence[Record]) -> str:
+    """Severities an upgrade resolves, and how many CVEs of the package it does not."""
+    fixable = [r for r in group if r["fix_available"]]
+    counts = count_by_severity(r["severity"] for r in fixable)
+    text = format_severity_counts(counts, ", ")
+    unfixed = len(group) - len(fixable)
+    return f"{text} · {unfixed} without fix (see watch)" if unfixed else text
+
+
+def release_tags_of(
+    group: Iterable[Record], targets: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Release tags (in targets order) of the images a group was found in."""
+    found = {tid for r in group for tid in r["scan_targets"]}
+    tags: list[str] = []
+    for target in targets:
+        if target["id"] in found and target_class(target) == CLASS_RELEASE:
+            _append_unique(tags, target["tag"])
+    return tags
+
+
+def release_line(tag: str) -> str:
+    """Release branch of a tag: ``1.1.14`` -> ``release-1.1``."""
+    match = RELEASE_LINE_RE.match(tag)
+    return f"release-{match.group(1)}.{match.group(2)}" if match else f"release-{tag}"
+
+
+def release_lines(tags: Iterable[str]) -> list[str]:
+    lines: list[str] = []
+    for tag in tags:
+        _append_unique(lines, release_line(tag))
+    return lines
+
+
+def exposure_label(
+    exposure: str, dev: bool | None, tags: Sequence[str], has_images: bool
+) -> str:
+    """Where the finding lives (a state, not an action)."""
+    released = ", ".join(tags)
+    if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
+        return f"Released {released} + development"
+    if exposure == EXPOSURE_RELEASE_ONLY:
+        return f"Released {released} only"
+    if exposure == EXPOSURE_SOURCE_ONLY:
+        return "Source only · dev dependency" if dev else "Source only · not in images"
+    return "development only" if has_images else "development (source)"
+
+
+def action_text(
+    exposure: str, dev: bool | None, tags: Sequence[str], via: str = ""
+) -> str:
+    """What to do, verb first; ``via`` is the dependency chain to upgrade through."""
+    lines = ", ".join(release_lines(tags))
+    via_text = f" via {via}" if via else ""
+    if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
+        return f"Upgrade in development{via_text}, backport to {lines}"
+    if exposure == EXPOSURE_RELEASE_ONLY:
+        return f"Release a patch from {lines} (already fixed in development){via_text}"
+    if exposure == EXPOSURE_SOURCE_ONLY:
+        note = "dev dependency, not shipped" if dev else "not in published images"
+        return f"Upgrade in development{via_text} — {note}"
+    return f"Upgrade in development{via_text} before the next release"
 
 
 def where_cell(
@@ -1139,26 +1500,124 @@ def where_cell(
     return " · ".join(parts)
 
 
+def group_exposure_label(
+    group: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+) -> str:
+    has_images = any(t.get("kind") == KIND_IMAGE for t in targets)
+    return exposure_label(
+        group[0]["exposure"],
+        group_dev(group),
+        release_tags_of(group, targets),
+        has_images,
+    )
+
+
 def render_what_to_fix(
     records: Sequence[Record],
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
 ) -> list[str]:
+    """Packages with at least one CVE an upgrade resolves; empty if there are none."""
     rows = []
-    for number, group in enumerate(group_fixes(records), start=1):
-        counts = count_by_severity(r["severity"] for r in group)
+    for group in group_fixes(records):
+        fixable = [r for r in group if r["fix_available"]]
+        if not fixable:
+            continue
         rows.append(
             [
-                number,
-                EXPOSURE_ACTIONS[group[0]["exposure"]],
+                len(rows) + 1,
                 package_cell(group),
-                upgrade_cell(group),
-                format_severity_counts(counts, ", "),
-                where_cell(group, sightings, targets),
+                upgrade_cell(fixable),
+                resolves_cell(group),
+                group_exposure_label(group, targets),
+                action_text(
+                    group[0]["exposure"],
+                    group_dev(group),
+                    release_tags_of(group, targets),
+                    shortest_path_text(group)
+                    if group_relationship(group) == "indirect"
+                    else "",
+                ),
+                where_cell(fixable, sightings, targets),
             ]
         )
-    header = ["#", "Action", "Package", "Upgrade", "Resolves", "Where"]
+    if not rows:
+        return []
+    header = ["#", "Package", "Upgrade", "Resolves", "Exposure", "Action", "Where"]
     return ["## What to fix", "", *md_table(header, rows, right=(0,))]
+
+
+def render_dependency_paths(records: Sequence[Record]) -> list[str]:
+    """One collapsible block with the stored chains of every package that has them."""
+    items: list[str] = []
+    seen: set[tuple[Any, Any]] = set()
+    for group in group_fixes(records):
+        key = (group[0]["pkg"], group[0]["version"])
+        paths, total, truncated = group_paths(group)
+        if key in seen or not paths or group_relationship(group) != "indirect":
+            continue
+        seen.add(key)
+        count = f"{total}+" if truncated else str(total)
+        shown = f", showing {len(paths)}" if len(paths) < total else ""
+        noun = "path" if total == 1 and not truncated else "paths"
+        label = f"{group[0]['pkg']} {group[0]['version']}"
+        items.append(f"- **{label}** ({count} {noun}{shown})")
+        items += [f"  - {PATH_SEPARATOR.join(path)}" for path in paths]
+    if not items:
+        return []
+    return ["", *md_details(f"Dependency paths ({len(seen)})", items)]
+
+
+def scope_cell(group: Sequence[Record]) -> str:
+    dev = group_dev(group)
+    scope = "-" if dev is None else ("dev" if dev else "runtime")
+    relationship = group_relationship(group)
+    return f"{scope}, {relationship}" if relationship else scope
+
+
+def render_watch(
+    records: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Findings without a fix: nothing to upgrade to, so watch, mitigate or replace.
+
+    Open if anything HIGH or CRITICAL is in it, else collapsed.
+    """
+    unfixed = [r for r in records if not r["fix_available"]]
+    if not unfixed:
+        return []
+    rows = []
+    for group in group_fixes(unfixed):
+        counts = count_by_severity(r["severity"] for r in group)
+        family = package_families(group)
+        suggested = (
+            "Accept as dev-only risk or replace the parent; re-check on next scan"
+            if group_dev(group)
+            else "Mitigate or replace the package; re-check on next scan"
+        )
+        rows.append(
+            [
+                f"{group[0]['pkg']} {group[0]['version']}"
+                + (f" · {family}" if family else ""),
+                format_severity_counts(counts, ", "),
+                scope_cell(group),
+                shortest_path_text(group),
+                group_exposure_label(group, targets),
+                suggested,
+            ]
+        )
+    header = [
+        "Package",
+        "Severity",
+        "Scope",
+        "Introduced via",
+        "Exposure",
+        "Suggested",
+    ]
+    table = md_table(["#", *header], ([i, *row] for i, row in enumerate(rows, 1)))
+    title = "No fix available — watch"
+    if any(r["severity"] in ("CRITICAL", "HIGH") for r in unfixed):
+        return ["", f"## {title}", "", *table]
+    return ["", *md_details(f"{title} ({len(unfixed)})", table)]
 
 
 # --------------------------------------------------------------------------
@@ -1181,7 +1640,11 @@ def installed_to_fixed_cell(record: Record) -> str:
     return f"{record['version']} → {fixed}"
 
 
-def render_severity_section(severity: str, records: Sequence[Record]) -> list[str]:
+def render_severity_section(
+    severity: str,
+    records: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+) -> list[str]:
     rows = (
         [
             cve_cell(r),
@@ -1189,7 +1652,7 @@ def render_severity_section(severity: str, records: Sequence[Record]) -> list[st
             installed_to_fixed_cell(r),
             cvss_cell(r),
             (r["published"] or "")[:10],
-            EXPOSURE_SHORT[r["exposure"]],
+            group_exposure_label([r], targets),
             short_title(r),
         ]
         for r in records
@@ -1208,34 +1671,15 @@ def render_severity_section(severity: str, records: Sequence[Record]) -> list[st
     return md_details(summary, body, is_open=severity in ("CRITICAL", "HIGH"))
 
 
-def render_severity_sections(records: Sequence[Record]) -> list[str]:
+def render_severity_sections(
+    records: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+) -> list[str]:
     lines: list[str] = []
     for severity in SEVERITIES:
         selected = [r for r in records if r["severity"] == severity]
         if selected:
-            lines += ["", *render_severity_section(severity, selected)]
+            lines += ["", *render_severity_section(severity, selected, targets)]
     return lines
-
-
-def render_no_fix(records: Sequence[Record]) -> list[str]:
-    unfixed = [r for r in records if not r["fix_available"]]
-    if not unfixed:
-        return []
-    rows = (
-        [
-            r["cve"],
-            r["pkg"],
-            r["version"],
-            r["severity"],
-            r["status"],
-            short_title(r),
-        ]
-        for r in unfixed
-    )
-    body = md_table(
-        ["CVE", "Package", "Installed", "Severity", "Status", "Title"], rows
-    )
-    return ["", *md_details(f"No fix available ({len(unfixed)})", body)]
 
 
 def severity_cells(findings: Mapping[str, Any] | None) -> list[Any]:
@@ -1293,9 +1737,11 @@ def build_summary_md(
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
     lines += render_headline(headline_lines(report, records))
     if records:
-        lines += ["", *render_what_to_fix(records, sightings, targets)]
-        lines += render_severity_sections(records)
-        lines += render_no_fix(records)
+        fixes = render_what_to_fix(records, sightings, targets)
+        lines += ["", *fixes] if fixes else []
+        lines += render_watch(records, targets)
+        lines += render_severity_sections(records, targets)
+        lines += render_dependency_paths(records)
     lines += render_coverage(targets)
     lines += render_footer(report)
     return "\n".join(lines) + "\n"

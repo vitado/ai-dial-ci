@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ORAS_VERSION: "1.3.4"
+  ORAS_VERSION: "1.3.3"
   ARTIFACT_TYPE: application/vnd.ai-dial.sca-cve-index.v1+json
 
 jobs:

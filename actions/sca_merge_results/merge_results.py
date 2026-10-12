@@ -63,9 +63,17 @@ import re
 import shutil
 import sys
 import urllib.parse
-from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -442,6 +450,8 @@ class PackageIndex:
     by_name: dict[tuple[Any, Any], list[Mapping[str, Any]]] = field(
         default_factory=dict, init=False
     )
+    # (file, canonical name) -> versions the package has in that file
+    by_file: dict[tuple[str, Any], list[Any]] = field(default_factory=dict, init=False)
     parents: dict[str, list[str]] = field(default_factory=dict, init=False)
     _info: dict[str, DependencyInfo] = field(default_factory=dict, init=False)
 
@@ -454,6 +464,10 @@ class PackageIndex:
                 self.by_id.setdefault(package["ID"], package)
             name = canonical_package_name(package.get("Name"), self.result_type)
             self.by_name.setdefault((name, package.get("Version")), []).append(package)
+            if package.get("FilePath"):
+                self.by_file.setdefault((package["FilePath"], name), []).append(
+                    package.get("Version")
+                )
             for child in package.get("DependsOn") or []:
                 if package.get("ID"):
                     self.parents.setdefault(child, []).append(package["ID"])
@@ -469,6 +483,18 @@ class PackageIndex:
             return [self.by_id[vuln["PkgID"]]]
         name = canonical_package_name(vuln.get("PkgName"), self.result_type)
         return self.by_name.get((name, vuln.get("InstalledVersion")), [])
+
+    def other_versions_in_file(self, package: Mapping[str, Any]) -> list[str]:
+        """The other versions this inventory lists for the package in its own file.
+
+        Only a package with a ``FilePath`` (a jar, a Python distribution) has any: a
+        lockfile lists one version per package.
+        """
+        name = canonical_package_name(package.get("Name"), self.result_type)
+        versions = self.by_file.get((package.get("FilePath") or "", name), [])
+        return [
+            v for v in versions if isinstance(v, str) and v != package.get("Version")
+        ]
 
     def _is_direct(self, package_id: str) -> bool:
         return self.by_id[package_id].get("Relationship") == "direct"
@@ -713,6 +739,13 @@ def image_digest(native: Mapping[str, Any]) -> str | None:
     return digests[0] if digests else None
 
 
+def image_os(native: Mapping[str, Any]) -> str | None:
+    """``ubuntu 24.04``: the OS of an image, as Trivy detected it."""
+    detected = (native.get("Metadata") or {}).get("OS") or {}
+    parts = (detected.get("Family"), detected.get("Name"))
+    return " ".join(p for p in parts if p) or None
+
+
 def package_type(result: Mapping[str, Any]) -> str:
     """'os' for OS packages (base image layer), 'library' for dependencies."""
     return "os" if result.get("Class") == CLASS_OS_PACKAGES else "library"
@@ -866,6 +899,36 @@ def upgrade_target(
     return target
 
 
+def fixed_in_place(
+    packages: Sequence[Mapping[str, Any]],
+    fixed_versions: Sequence[str],
+    index: PackageIndex,
+) -> bool:
+    """Whether the file of each of the packages already holds a fixed version of it.
+
+    Trivy can list one artifact under two version strings, e.g. a jar whose manifest
+    says ``12.10.2`` and whose POM says ``12.10.2.jre11`` (Maven orders the second
+    above the first). The advisory then matches the first, but the file ships the
+    second, which is the fix: there is nothing to upgrade to. The comparison is the
+    one of ``minimal_fix``, so it is as tolerant as the rest of the module.
+    """
+    if not packages:
+        return False
+    for package in packages:
+        installed = package.get("Version")
+        minimal = (
+            minimal_fix(installed, fixed_versions)
+            if isinstance(installed, str)
+            else None
+        )
+        if minimal is None or not any(
+            compare_versions(other, minimal) in (0, 1)
+            for other in index.other_versions_in_file(package)
+        ):
+            return False
+    return True
+
+
 # --------------------------------------------------------------------------
 # Records: merging and enrichment
 # --------------------------------------------------------------------------
@@ -1003,6 +1066,16 @@ def record_ids(record: Mapping[str, Any]) -> set[str]:
     return {record["cve"], *record["aliases"]}
 
 
+class MergeResult(NamedTuple):
+    """What the merge knows: the records, where each was seen and which are fixed in
+    place (see ``fixed_in_place``); the last two are keyed by ``(cve, pkg, version)``.
+    """
+
+    records: list[Record]
+    sightings: Sightings
+    fixed_in_place: frozenset[tuple[Any, Any, Any]]
+
+
 class RecordSet:
     """The records of one repository while the scans are merged into them.
 
@@ -1022,6 +1095,8 @@ class RecordSet:
         self._named_by_image: set[FindingKey] = set()
         self._dev_packages: dict[FindingKey, list[Mapping[str, Any]]] = {}
         self._chains: dict[FindingKey, dict[tuple[Any, Any], DependencyInfo]] = {}
+        # key -> whether every sighting found the fix in the package's own file
+        self._in_place: dict[FindingKey, bool] = {}
 
     def _add_record(self, key: FindingKey, record: Record) -> None:
         self.by_key[key] = record
@@ -1042,6 +1117,9 @@ class RecordSet:
         if tid in self.image_ids and key not in self._named_by_image:
             self._named_by_image.add(key)
             self.by_key[key]["pkg"] = pkg_name
+        self._in_place[key] = self._in_place.get(key, True) and fixed_in_place(
+            packages, self.by_key[key]["fixed_versions"], index
+        )
         self._dev_packages.setdefault(key, []).extend(packages)
         for package in packages:
             # one chain set per package of a lockfile, however many targets saw it
@@ -1122,8 +1200,8 @@ class RecordSet:
             )
             self._note_packages(key, tid, package.get("Name"), result, packages, index)
 
-    def finish(self) -> tuple[list[Record], Sightings]:
-        """The records, completed, and where each was seen (see ``merge_records``)."""
+    def finish(self) -> MergeResult:
+        """The records, completed, and what is known of them (see ``merge_records``)."""
         for key, record in self.by_key.items():
             for name in (
                 "locations",
@@ -1147,7 +1225,12 @@ class RecordSet:
             (r["cve"], r["pkg"], r["version"]): self.sightings[key]
             for key, r in self.by_key.items()
         }
-        return list(self.by_key.values()), by_record
+        in_place = frozenset(
+            (r["cve"], r["pkg"], r["version"])
+            for key, r in self.by_key.items()
+            if self._in_place.get(key)
+        )
+        return MergeResult(list(self.by_key.values()), by_record, in_place)
 
 
 def merge_records(
@@ -1155,16 +1238,16 @@ def merge_records(
     scans: Iterable[tuple[str, str, Mapping[str, Any]]],
     image_ids: Collection[str] = (),
     osv_scans: Iterable[OsvScan] = (),
-) -> tuple[list[Record], Sightings]:
+) -> MergeResult:
     """Deduplicate findings across lockfiles and merge them across targets.
 
     ``scans`` is ``(target id, scanner, native JSON)`` of the Trivy targets in
     targets-file order, which is also the order of each record's ``scan_targets``;
     ``osv_scans`` are the OSV targets, merged into the Trivy records. Returns the
-    records (unordered, not enriched yet) and where each finding was seen, keyed
-    by ``(cve, pkg, version)`` of the record. A package seen under several
-    spellings (see ``canonical_package_name``) is shown under the spelling of its
-    first image record, else of its first record.
+    records (unordered, not enriched yet), where each finding was seen and which
+    findings are fixed in place, keyed by ``(cve, pkg, version)`` of the record. A
+    package seen under several spellings (see ``canonical_package_name``) is shown
+    under the spelling of its first image record, else of its first record.
     """
     record_set = RecordSet(repo, image_ids)
     for tid, scanner, native in scans:
@@ -1724,15 +1807,25 @@ def assign_exposure(records: Iterable[Record], targets: Sequence[Target]) -> Non
         record["exposure"] = classify_exposure(classes, has_images)  # type: ignore[arg-type]
 
 
-def assign_upgrades(records: Sequence[Record]) -> None:
+def assign_upgrades(
+    records: Sequence[Record],
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+) -> None:
     """Set ``upgrade_to`` on the fixable records of each package version.
 
-    It is the version that resolves all of the package's fixable CVEs (the same
-    on all of them); records without a fix keep ``None``.
+    It is the version that resolves all of the package's fixable CVEs; records
+    without a fix keep ``None``, and so do the ``in_place`` ones (see
+    ``fixed_in_place``): no upgrade is needed, so none is named, and they do not
+    count for the upgrade of the other records of the package.
     """
+
+    def needs_upgrade(record: Record) -> bool:
+        identity = (record["cve"], record["pkg"], record["version"])
+        return record["fix_available"] and identity not in in_place
+
     fixed_by_package: dict[tuple[Any, Any], list[list[str]]] = {}
     for record in records:
-        if record["fix_available"]:
+        if needs_upgrade(record):
             key = (record["pkg"], record["version"])
             fixed_by_package.setdefault(key, []).append(record["fixed_versions"])
     for record in records:
@@ -1740,7 +1833,7 @@ def assign_upgrades(records: Sequence[Record]) -> None:
         fixed = fixed_by_package.get((record["pkg"], installed))
         record["upgrade_to"] = (
             upgrade_target(installed, fixed)
-            if fixed and record["fix_available"] and isinstance(installed, str)
+            if fixed and needs_upgrade(record) and isinstance(installed, str)
             else None
         )
 
@@ -1760,12 +1853,14 @@ def record_sort_key(record: Record) -> tuple[Any, ...]:
 
 
 def finalize_records(
-    records: Iterable[Record], targets: Sequence[Target]
+    records: Iterable[Record],
+    targets: Sequence[Target],
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
 ) -> list[Record]:
     """Enrich the merged records (exposure, upgrade_to) and put them in report order."""
     records = list(records)
     assign_exposure(records, targets)
-    assign_upgrades(records)
+    assign_upgrades(records, in_place)
     return sorted(records, key=record_sort_key)
 
 
@@ -2060,72 +2155,172 @@ def records_in(records: Iterable[Record], target_ids: Collection[str]) -> list[R
     return [r for r in records if not target_ids.isdisjoint(r["scan_targets"])]
 
 
-def release_headline(
-    tag: str, group_records: Sequence[Record], development_scanned: bool
+def release_subjects(targets: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
+    """The scanned targets that stand for a release, by tag in targets order: the
+    images of the tag or, in a run without images, its source (``source-<tag>``).
+    """
+    targets = list(targets)
+    kind = release_class(any(t.get("kind") == KIND_IMAGE for t in targets))
+    subjects: dict[str, set[str]] = {}
+    for target in trivy_targets(targets):
+        if target["status"] == STATUS_OK and target_class(target) == kind:
+            subjects.setdefault(target["tag"], set()).add(target["id"])
+    return subjects
+
+
+def development_scanned(targets: Iterable[Mapping[str, Any]]) -> bool:
+    """Whether the development images or the default branch source were scanned."""
+    return any(
+        t["status"] == STATUS_OK
+        and target_class(t) in (CLASS_DEVELOPMENT, CLASS_SOURCE)
+        for t in trivy_targets(targets)
+    )
+
+
+def join_names(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def severity_phrase(records: Sequence[Record]) -> str:
+    """``46 CRITICAL/HIGH``: the findings that matter, else the rest, by count."""
+    counts = count_by_severity(r["severity"] for r in records)
+    tier = SEVERITIES[:2] if counts["CRITICAL"] + counts["HIGH"] else SEVERITIES[2:]
+    present = [s for s in tier if counts[s]]
+    return f"{sum(counts[s] for s in present)} {'/'.join(present)}"
+
+
+def record_identity(record: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+    return (record["cve"], record["pkg"], record["version"])
+
+
+def verdict_text(
+    report: Mapping[str, Any],
+    records: Sequence[Record],
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
 ) -> str:
-    if not group_records:
-        return f"**Released {tag} — no known vulnerabilities**"
-    counts = count_by_severity(r["severity"] for r in group_records)
-    line = f"**Released {tag} — exposed: {format_severity_counts(counts)}**"
-    if not development_scanned:
-        return line
-    also_open = sum(
-        r["exposure"] == EXPOSURE_RELEASE_AND_DEVELOPMENT for r in group_records
-    )
-    suffix = (
-        f"{also_open} also open in development"
-        if also_open
-        else "all fixed in development"
-    )
-    return f"{line}, {suffix}"
-
-
-def source_only_note(source_records: Sequence[Record]) -> str:
-    """What the source-only findings are: ``(dev dependencies)``, ``(not in images)``
-    or counts when mixed or when other source findings are also in an image.
+    """What to do, derived from the exposure of the (unique) records: one clause per
+    action, in at most two sentences, the most severe first (then the larger, then
+    the more urgent exposure). Records fixed in place need no action, so they do
+    not make a clause.
     """
-    outside = [r for r in source_records if r["exposure"] == EXPOSURE_SOURCE_ONLY]
-    if not outside:
-        return ""
-    dev = sum(r["dev"] is True for r in outside)
-    other = len(outside) - dev
-    if len(outside) == len(source_records) and not (dev and other):
-        return " (dev dependencies)" if dev else " (not in images)"
-    parts = []
-    if dev:
-        parts.append(f"{dev} dev {'dependency' if dev == 1 else 'dependencies'}")
-    if other:
-        parts.append(f"{other} not in images")
-    return f" ({', '.join(parts)})"
+    targets = report["targets"]
+    by_exposure: dict[str, list[Record]] = {}
+    for record in records:
+        by_exposure.setdefault(record["exposure"], []).append(record)
+    actionable = {
+        exposure: [r for r in group if record_identity(r) not in in_place]
+        for exposure, group in by_exposure.items()
+    }
+
+    def lines_of(group: Sequence[Record]) -> str:
+        return ", ".join(release_lines(release_tags_of(group, trivy_targets(targets))))
+
+    patch_suffix = (
+        " already fixed in development" if development_scanned(targets) else ""
+    )
+    texts = {
+        EXPOSURE_RELEASE_AND_DEVELOPMENT: lambda g: (
+            f"Fix {severity_phrase(g)} in development and backport to {lines_of(g)}"
+        ),
+        EXPOSURE_RELEASE_ONLY: lambda g: (
+            f"Release a patch from {lines_of(g)} — {severity_phrase(g)}{patch_suffix}"
+        ),
+        EXPOSURE_DEVELOPMENT_ONLY: lambda g: (
+            f"Fix {severity_phrase(g)} in development before the next release"
+        ),
+    }
+    ranked = sorted(
+        (
+            (
+                min(SEV_ORDER.get(r["severity"], len(SEV_ORDER)) for r in group),
+                -len(group),
+                EXPOSURE_ORDER[exposure],
+                texts[exposure](group),
+            )
+            for exposure, group in actionable.items()
+            if group and exposure in texts
+        )
+    )
+    clauses = [text for *_, text in ranked]
+    if not clauses:
+        names = [*release_subjects(targets)]
+        if development_scanned(targets):
+            names.append(DEVELOPMENT_TAG)
+        text = (
+            f"No known vulnerabilities in {join_names(names) or 'the scanned targets'}"
+        )
+        if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
+            text += f" — {only_sources} only in build / test dependencies"
+        return text
+    # The first action is a sentence, the others follow in a second: "…; fix …"
+    rest = "; ".join(c[0].lower() + c[1:] for c in clauses[2:])
+    sentences = clauses[:2]
+    if rest:
+        sentences[-1] += f"; {rest}"
+    return ". ".join(sentences)
 
 
-def development_headline(
-    image_records: Sequence[Record] | None,
-    source_records: Sequence[Record] | None,
-) -> str | None:
-    """``development — image: clean; source: 1 LOW (dev dependencies)``.
+def scope_row(
+    label: str,
+    records: Sequence[Record],
+    severities: Sequence[str],
+    base_column: bool = True,
+) -> list[Any]:
+    """Unique records by severity, those with a fix, and those of the base image."""
+    counts = count_by_severity(r["severity"] for r in records)
+    return [
+        label,
+        *(counts[s] for s in severities),
+        sum(r["fix_available"] for r in records),
+        sum(is_base_image(r) for r in records) if base_column else "—",
+    ]
 
-    ``None`` for a part means it was not scanned, so it is left out.
+
+def scope_table(report: Mapping[str, Any], records: Sequence[Record]) -> list[str]:
+    """The findings by scope: each release, development and what is only in sources.
+
+    A record is counted once per row: in a release if it is in the release's images
+    (its source in a run without images), in development if it is in development
+    (see ``classify_exposure``), and in the last row only if it is in no shipped
+    artifact. Rows without records are left out.
     """
-    parts = []
-    if image_records is not None:
-        counts = count_by_severity(r["severity"] for r in image_records)
-        parts.append(f"image: {format_severity_counts(counts) or 'clean'}")
-    if source_records is not None:
-        counts = count_by_severity(r["severity"] for r in source_records)
-        text = f"source: {format_severity_counts(counts) or 'clean'}"
-        parts.append(text + source_only_note(source_records))
-    return f"**development — {'; '.join(parts)}**" if parts else None
+    targets = report["targets"]
+    scopes: list[tuple[str, list[Record], bool]] = []
+    in_release = (EXPOSURE_RELEASE_AND_DEVELOPMENT, EXPOSURE_RELEASE_ONLY)
+    for tag, ids in release_subjects(targets).items():
+        found = [r for r in records_in(records, ids) if r["exposure"] in in_release]
+        scopes.append((f"{tag} (released)", found, True))
+    if development_scanned(targets):
+        in_development = (EXPOSURE_RELEASE_AND_DEVELOPMENT, EXPOSURE_DEVELOPMENT_ONLY)
+        found = [r for r in records if r["exposure"] in in_development]
+        scopes.append((DEVELOPMENT_TAG, found, True))
+    found = [r for r in records if r["exposure"] == EXPOSURE_SOURCE_ONLY]
+    scopes.append(("Source only (build / test)", found, False))
+    scopes = [scope for scope in scopes if scope[1]]
+    if not scopes:
+        return []
+    # UNKNOWN has a column only if some record has no usable severity
+    has_unknown = any(
+        r["severity"] == UNKNOWN_SEVERITY for _, group, _ in scopes for r in group
+    )
+    severities = SEVERITIES if has_unknown else SEVERITIES[:-1]
+    header = ["Scope", *severities, "Fixable", "Base image"]
+    rows = [scope_row(label, group, severities, base) for label, group, base in scopes]
+    return md_table(header, rows, right=range(1, len(header)))
 
 
-def totals_line(report: Mapping[str, Any], osv_only: int = 0) -> str:
-    totals = report["totals"]
-    findings, counts = totals["findings"], totals["targets"]
+def totals_line(
+    report: Mapping[str, Any], osv_only: int = 0, packages: int | None = None
+) -> str:
+    """Coverage of the run: ``8/8 targets scanned · 10 found only by OSV``."""
+    counts = report["totals"]["targets"]
     applicable = counts["total"] - counts["not_applicable"]
-    line = (
-        f"{findings['total']} findings ({findings['fixable']} fixable) · "
-        f"{counts['ok']}/{applicable} targets scanned"
-    )
+    line = f"{counts['ok']}/{applicable} targets scanned"
+    if packages is not None:
+        line += f" · {packages} packages"
     if osv_only:
         line += f" · {osv_only} found only by OSV"
     if counts["not_applicable"]:
@@ -2133,70 +2328,49 @@ def totals_line(report: Mapping[str, Any], osv_only: int = 0) -> str:
     return line
 
 
-def no_findings_line(report: Mapping[str, Any]) -> str:
-    ok_targets = [
-        t for t in trivy_targets(report["targets"]) if t["status"] == STATUS_OK
-    ]
-    packages = sum(t["packages_scanned"] or 0 for t in ok_targets)
-    return (
-        f"No known vulnerabilities · {packages} packages in {len(ok_targets)} targets"
-    )
-
-
-def headline_lines(report: Mapping[str, Any], records: Sequence[Record]) -> list[str]:
-    """One line per group: failures, each released tag, development, totals."""
+def headline_blocks(
+    report: Mapping[str, Any],
+    records: Sequence[Record],
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+) -> list[list[str]]:
+    """The paragraphs of the headline: failures, the verdict, the scope table and
+    the coverage of the run.
+    """
     targets = report["targets"]
-    lines: list[str] = []
+    blocks: list[list[str]] = []
     failed = [target_name(t) for t in targets if t["status"] == STATUS_FAILED]
     if failed:
-        lines.append(
-            f"**Incomplete: {len(failed)} target(s) failed** — {', '.join(failed)} "
-            "(their findings are missing)"
+        blocks.append(
+            [
+                f"**Incomplete: {len(failed)} target(s) failed** — {', '.join(failed)} "
+                "(their findings are missing)"
+            ]
         )
     ok = [t for t in trivy_targets(targets) if t["status"] == STATUS_OK]
     if not ok:
         scanned = any(t["status"] == STATUS_OK for t in targets)
-        return [
-            *lines,
-            "No Trivy target was scanned" if scanned else "No target was scanned",
-        ]
-    if not records:
-        return [*lines, no_findings_line(report)]
+        text = "No Trivy target was scanned" if scanned else "No target was scanned"
+        return [*blocks, [text]]
 
-    by_class: dict[str, list[Mapping[str, Any]]] = {}
-    for target in ok:
-        by_class.setdefault(target_class(target) or "", []).append(target)
-    development_images = by_class.get(CLASS_DEVELOPMENT)
-    sources = by_class.get(CLASS_SOURCE)
-    development_scanned = bool(development_images or sources)
-
-    # the verdict of a release is the one of its images; without images, of its source
-    has_images = any(t.get("kind") == KIND_IMAGE for t in targets)
-    release_tags: dict[str, set[str]] = {}
-    for target in by_class.get(release_class(has_images), []):
-        release_tags.setdefault(target["tag"], set()).add(target["id"])
-    for tag, tids in release_tags.items():
-        lines.append(
-            release_headline(tag, records_in(records, tids), development_scanned)
-        )
-
-    def part(group: list[Mapping[str, Any]] | None) -> list[Record] | None:
-        return None if not group else records_in(records, {t["id"] for t in group})
-
-    development = development_headline(part(development_images), part(sources))
-    if development:
-        lines.append(development)
-    lines.append(totals_line(report, sum(is_osv_only(r) for r in records)))
-    return lines
+    osv_only = sum(is_osv_only(r) for r in records)
+    blocks.append([f"**{verdict_text(report, records, in_place)}**"])
+    if records:
+        if table := scope_table(report, records):
+            blocks.append(table)
+        blocks.append([totals_line(report, osv_only)])
+    else:
+        packages = sum(t["packages_scanned"] or 0 for t in ok)
+        blocks.append([totals_line(report, osv_only, packages)])
+    return blocks
 
 
-def render_headline(lines: Sequence[str]) -> list[str]:
-    """A blockquote with one paragraph per line (a plain newline would merge them)."""
+def render_headline(blocks: Sequence[Sequence[str]]) -> list[str]:
+    """A blockquote with one paragraph per block (a plain newline would merge them)."""
     quoted: list[str] = []
-    for line in lines:
+    for block in blocks:
         if quoted:
             quoted.append(">")
-        quoted.append(f"> {line}")
+        quoted.extend(f"> {line}" for line in block)
     return quoted
 
 
@@ -2211,26 +2385,65 @@ def max_cvss_score(records: Iterable[Record]) -> float | None:
     return max(scores) if scores else None
 
 
+def is_base_image(record: Mapping[str, Any]) -> bool:
+    """Whether the package is an OS package, so the fix is a new base image."""
+    return record["pkg_type"] == "os"
+
+
+def urgency_key(group: Sequence[Record], name: str, version: str) -> tuple[Any, ...]:
+    """Order of a group of records of one exposure: urgency, worst severity, highest
+    CVSS score (none last), then its name.
+    """
+    score = max_cvss_score(group)
+    return (
+        EXPOSURE_ORDER.get(group[0]["exposure"], len(EXPOSURES)),
+        min(SEV_ORDER.get(r["severity"], len(SEV_ORDER)) for r in group),
+        score is None,
+        -(score or 0),
+        name,
+        version,
+    )
+
+
 def group_fixes(records: Iterable[Record]) -> list[list[Record]]:
     """One group per (exposure, package, installed version), most urgent first."""
     groups: dict[tuple[Any, Any, Any], list[Record]] = {}
     for record in records:
         key = (record["exposure"], record["pkg"], record["version"])
         groups.setdefault(key, []).append(record)
+    return sorted(
+        groups.values(),
+        key=lambda group: urgency_key(
+            group, group[0]["pkg"] or "", group[0]["version"] or ""
+        ),
+    )
 
-    def sort_key(group: list[Record]) -> tuple[Any, ...]:
-        first = group[0]
-        score = max_cvss_score(group)
-        return (
-            EXPOSURE_ORDER.get(first["exposure"], len(EXPOSURES)),
-            min(SEV_ORDER.get(r["severity"], len(SEV_ORDER)) for r in group),
-            score is None,
-            -(score or 0),
-            first["pkg"] or "",
-            first["version"] or "",
-        )
 
-    return sorted(groups.values(), key=sort_key)
+def base_image_label(group: Iterable[Record], base_os: Mapping[str, str]) -> str:
+    """The base image line of OS records: ``ubuntu 24.04`` (the OS of the images they
+    were found in), ``alpine`` (the package manager) if no image reports its OS.
+    """
+    group = list(group)
+    labels = {
+        base_os[tid] for r in group for tid in r["scan_targets"] if tid in base_os
+    }
+    labels = labels or {e for r in group for e in r["ecosystem"]}
+    return " / ".join(sorted(labels)) or "unknown"
+
+
+def base_image_groups(
+    records: Iterable[Record], base_os: Mapping[str, str]
+) -> list[tuple[str, list[Record]]]:
+    """One group per (exposure, base image line), most urgent first."""
+    groups: dict[tuple[str, str], list[Record]] = {}
+    for record in records:
+        label = base_image_label([record], base_os)
+        groups.setdefault((record["exposure"], label), []).append(record)
+    ordered = sorted(
+        ((label, group) for (_, label), group in groups.items()),
+        key=lambda item: urgency_key(item[1], item[0], ""),
+    )
+    return ordered
 
 
 def package_cell(group: Sequence[Record]) -> str:
@@ -2292,13 +2505,36 @@ def shortest_path_text(group: Iterable[Record]) -> str:
     return text
 
 
+def fixed_versions_text(
+    versions: Iterable[str], installed: str | None = None, limit: int = 3
+) -> str:
+    """``1.2, 1.3, 2.0 +4 more``: the fixed versions above the installed one (all of
+    them if it is unknown or they cannot be compared), lowest first.
+    """
+
+    def order(a: str, b: str) -> int:
+        return compare_versions(a, b) or 0
+
+    # versions that cannot be compared keep their alphabetical order
+    candidates = sorted(sorted(set(versions)), key=cmp_to_key(order))
+    if installed:
+        above = [v for v in candidates if compare_versions(v, installed) != -1]
+        candidates = above or candidates
+    text = ", ".join(candidates[:limit])
+    return (
+        f"{text} +{len(candidates) - limit} more" if len(candidates) > limit else text
+    )
+
+
 def upgrade_cell(fixable: Sequence[Record]) -> str:
     version = fixable[0]["version"]
     upgrade = fixable[0]["upgrade_to"]
     if upgrade:
         return f"{version} → {upgrade}"
-    fixed = sorted({f for r in fixable for f in r["fixed_versions"]})
-    return f"{version} → {', '.join(fixed)}"
+    fixed = fixed_versions_text(
+        (f for r in fixable for f in r["fixed_versions"]), version
+    )
+    return f"{version} → no upgrade computed (fixed in {fixed})"
 
 
 def resolves_cell(group: Sequence[Record]) -> str:
@@ -2366,14 +2602,27 @@ def action_text(
     tags: Sequence[str],
     via: str = "",
     open_in_development: bool = True,
+    base_image: bool = False,
 ) -> str:
     """What to do, verb first; ``via`` is the dependency chain to upgrade through.
 
     ``open_in_development`` is False for a finding that sits only in the source of
     a release tag: the default branch is clear of it, so there is nothing to upgrade.
+    A ``base_image`` finding is fixed by rebuilding on an updated base image.
     """
     lines = ", ".join(release_lines(tags))
     via_text = f" via {via}" if via else ""
+    if base_image:
+        if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
+            return (
+                f"Rebuild on an updated base image in development, backport to {lines}"
+            )
+        if exposure == EXPOSURE_RELEASE_ONLY:
+            return (
+                f"Release a patch from {lines} rebuilt on an updated base image "
+                "(already fixed in development)"
+            )
+        return "Rebuild on an updated base image in development before the next release"
     if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
         return f"Upgrade in development{via_text}, backport to {lines}"
     if exposure == EXPOSURE_RELEASE_ONLY:
@@ -2434,40 +2683,135 @@ def group_exposure_label(
     )
 
 
+WHAT_TO_FIX_HEADER = [
+    "#",
+    "Package",
+    "Upgrade",
+    "Resolves",
+    "Exposure",
+    "Action",
+    "Where",
+]
+BASE_IMAGE_UPGRADE = "rebuild on an updated base image"
+
+
+def verify_action(fixable: Sequence[Record]) -> str:
+    """The action for a package whose file already holds the fix (see
+    ``fixed_in_place``): look at it, there is nothing to upgrade.
+    """
+    first = fixable[0]
+    where = (first["pkg_paths"] or first["locations"] or ["the file"])[0]
+    fixed = minimal_fix(first["version"], first["fixed_versions"]) or "a fixed version"
+    return (
+        f"Verify — {where} is already at {fixed}; "
+        "the scanner reports it under two versions"
+    )
+
+
+def package_fix_row(
+    group: Sequence[Record],
+    sightings: Sightings,
+    targets: Sequence[Mapping[str, Any]],
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+) -> list[Any]:
+    """A package version with a fixable CVE: what resolves it, and what to do."""
+    fixable = [r for r in group if r["fix_available"]]
+    base_image = is_base_image(group[0])
+    if all(record_identity(r) in in_place for r in fixable):
+        action = verify_action(fixable)
+    else:
+        action = action_text(
+            group[0]["exposure"],
+            group_dev(group),
+            release_tags_of(group, targets),
+            shortest_path_text(group)
+            if group_relationship(group) == "indirect"
+            else "",
+            found_in_default_source(group, targets),
+            base_image,
+        )
+    return [
+        package_cell(group),
+        upgrade_cell(fixable),
+        resolves_cell(group),
+        group_exposure_label(group, targets),
+        action,
+        where_cell(fixable, sightings, targets),
+    ]
+
+
+def base_image_row(
+    label: str,
+    group: Sequence[Record],
+    sightings: Sightings,
+    targets: Sequence[Mapping[str, Any]],
+) -> list[Any]:
+    """The OS packages of one exposure and base image line that a rebuild fixes."""
+    packages = len({(r["pkg"], r["version"]) for r in group})
+    noun = "package" if packages == 1 else "packages"
+    counts = count_by_severity(r["severity"] for r in group)
+    return [
+        f"Base image · {label} ({packages} {noun})",
+        BASE_IMAGE_UPGRADE,
+        format_severity_counts(counts, ", "),
+        group_exposure_label(group, targets),
+        action_text(
+            group[0]["exposure"],
+            None,
+            release_tags_of(group, targets),
+            base_image=True,
+        ),
+        where_cell(group, sightings, targets),
+    ]
+
+
 def render_what_to_fix(
     records: Sequence[Record],
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
+    base_os: Mapping[str, str] | None = None,
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
 ) -> list[str]:
-    """Packages with at least one CVE an upgrade resolves; empty if there are none."""
-    rows = []
-    for group in group_fixes(records):
-        fixable = [r for r in group if r["fix_available"]]
-        if not fixable:
-            continue
-        rows.append(
-            [
-                len(rows) + 1,
-                package_cell(group),
-                upgrade_cell(fixable),
-                resolves_cell(group),
-                group_exposure_label(group, targets),
-                action_text(
-                    group[0]["exposure"],
-                    group_dev(group),
-                    release_tags_of(group, targets),
-                    shortest_path_text(group)
-                    if group_relationship(group) == "indirect"
-                    else "",
-                    found_in_default_source(group, targets),
-                ),
-                where_cell(fixable, sightings, targets),
-            ]
-        )
+    """Packages with at least one CVE an upgrade resolves; empty if there are none.
+
+    The OS packages of a base image are one row per base image line (they are all
+    fixed by the same rebuild), with the packages themselves in a collapsed block
+    below the table.
+    """
+    base_os = base_os or {}
+    dependencies = [r for r in records if not is_base_image(r)]
+    os_records = [r for r in records if is_base_image(r) and r["fix_available"]]
+    rows: list[tuple[tuple[Any, ...], list[Any]]] = []
+    for group in group_fixes(dependencies):
+        if any(r["fix_available"] for r in group):
+            key = urgency_key(group, group[0]["pkg"] or "", group[0]["version"] or "")
+            rows.append((key, package_fix_row(group, sightings, targets, in_place)))
+    for label, group in base_image_groups(os_records, base_os):
+        key = urgency_key(group, label, "")
+        rows.append((key, base_image_row(label, group, sightings, targets)))
     if not rows:
         return []
-    header = ["#", "Package", "Upgrade", "Resolves", "Exposure", "Action", "Where"]
-    return ["## What to fix", "", *md_table(header, rows, right=(0,))]
+    rows.sort(key=lambda row: row[0])
+    table = md_table(
+        WHAT_TO_FIX_HEADER,
+        ([i, *row] for i, (_, row) in enumerate(rows, 1)),
+        right=(0,),
+    )
+    lines = ["## What to fix", "", *table]
+    packages = [
+        package_fix_row(group, sightings, targets, in_place)
+        for group in group_fixes(r for r in records if is_base_image(r))
+        if any(r["fix_available"] for r in group)
+    ]
+    if packages:
+        body = md_table(
+            WHAT_TO_FIX_HEADER,
+            ([i, *row] for i, row in enumerate(packages, 1)),
+            right=(0,),
+        )
+        summary = f"Base image packages ({len(packages)})"
+        lines += ["", *md_details(summary, body)]
+    return lines
 
 
 def render_dependency_paths(records: Sequence[Record]) -> list[str]:
@@ -2503,11 +2847,23 @@ def render_watch(
 ) -> list[str]:
     """Findings without a fix: nothing to upgrade to, so watch, mitigate or replace.
 
-    Open if anything HIGH or CRITICAL is in it, else collapsed.
+    The dependencies are open if anything HIGH or CRITICAL is in them, else
+    collapsed; the OS packages of the base image are always collapsed.
     """
     unfixed = [r for r in records if not r["fix_available"]]
-    if not unfixed:
-        return []
+    dependencies = [r for r in unfixed if not is_base_image(r)]
+    os_records = [r for r in unfixed if is_base_image(r)]
+    lines: list[str] = []
+    if dependencies:
+        lines += render_watch_dependencies(dependencies, targets)
+    if os_records:
+        lines += ["", *render_watch_base_image(os_records, targets)]
+    return lines
+
+
+def render_watch_dependencies(
+    unfixed: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+) -> list[str]:
     rows = []
     for group in group_fixes(unfixed):
         counts = count_by_severity(r["severity"] for r in group)
@@ -2543,6 +2899,28 @@ def render_watch(
     return ["", *md_details(f"{title} ({len(unfixed)})", table)]
 
 
+def render_watch_base_image(
+    unfixed: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """OS packages without a fix: a new base image may bring one, and so may a wait."""
+    rows = []
+    for group in group_fixes(unfixed):
+        counts = count_by_severity(r["severity"] for r in group)
+        rows.append(
+            [
+                f"{group[0]['pkg']} {group[0]['version']}",
+                format_severity_counts(counts, ", "),
+                group_exposure_label(group, targets),
+                "Wait for a distribution fix or change the base image; "
+                "re-check on next scan",
+            ]
+        )
+    header = ["#", "Package", "Severity", "Exposure", "Suggested"]
+    table = md_table(header, ([i, *row] for i, row in enumerate(rows, 1)))
+    title = f"No fix available — base image (OS packages) ({len(unfixed)})"
+    return md_details(title, table)
+
+
 # --------------------------------------------------------------------------
 # summary.md: details
 # --------------------------------------------------------------------------
@@ -2569,7 +2947,11 @@ def cvss_cell(record: Record) -> str | None:
 
 
 def installed_to_fixed_cell(record: Record) -> str:
-    fixed = record["upgrade_to"] or ", ".join(record["fixed_versions"]) or "no fix"
+    fixed = (
+        record["upgrade_to"]
+        or fixed_versions_text(record["fixed_versions"], record["version"])
+        or "no fix"
+    )
     return f"{record['version']} → {fixed}"
 
 
@@ -2607,47 +2989,79 @@ def render_severity_section(
 def render_severity_sections(
     records: Sequence[Record], targets: Sequence[Mapping[str, Any]]
 ) -> list[str]:
+    """The findings by severity: the dependencies, then the OS packages of the base
+    image in one collapsed block (a base image is hundreds of lines of noise).
+    """
+
+    def sections(group: Sequence[Record]) -> list[list[str]]:
+        return [
+            render_severity_section(severity, selected, targets)
+            for severity in SEVERITIES
+            if (selected := [r for r in group if r["severity"] == severity])
+        ]
+
     lines: list[str] = []
-    for severity in SEVERITIES:
-        selected = [r for r in records if r["severity"] == severity]
-        if selected:
-            lines += ["", *render_severity_section(severity, selected, targets)]
+    for section in sections([r for r in records if not is_base_image(r)]):
+        lines += ["", *section]
+    os_records = [r for r in records if is_base_image(r)]
+    if os_records:
+        body: list[str] = []
+        for section in sections(os_records):
+            body += ["", *section] if body else section
+        summary = f"Base image (OS packages) ({len(os_records)})"
+        lines += ["", *md_details(summary, body)]
     return lines
 
 
-def severity_cells(findings: Mapping[str, Any] | None) -> list[Any]:
-    by_severity = (findings or {}).get("by_severity")
-    return [by_severity[s] if by_severity else None for s in SEVERITIES[:4]]
+def scan_cell(
+    target: Mapping[str, Any] | None, describe: Callable[[Mapping[str, Any]], str]
+) -> str:
+    """``ok · 556 pkgs · <findings>`` of a scanned target, else its status and
+    reason, ``—`` without a target.
+    """
+    if target is None:
+        return "—"
+    if target["status"] != STATUS_OK:
+        reason = f" · {target['reason']}" if target["reason"] else ""
+        return f"{target['status']}{reason}"
+    return f"ok · {target['packages_scanned']} pkgs · {describe(target['findings'])}"
+
+
+def trivy_findings_text(findings: Mapping[str, Any]) -> str:
+    """``5/31/190/55``: CRITICAL/HIGH/MEDIUM/LOW, plus the unknown ones if any."""
+    by_severity = findings["by_severity"]
+    text = "/".join(str(by_severity[s]) for s in SEVERITIES[:4])
+    unknown = by_severity[UNKNOWN_SEVERITY]
+    return f"{text} · {unknown} UNKNOWN" if unknown else text
 
 
 def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One row per scanned subject (the id Trivy and OSV share), a cell per scanner."""
     several = has_several_images(targets)
-    # Only a run with another scanner needs the column: Trivy-only reports stay as is
-    with_scanner = any(t["scanner"] != SCANNER_TRIVY for t in targets)
-    rows = (
-        [
-            target_label(t, several),
-            *([t["scanner"]] if with_scanner else []),
-            t["status"],
-            t["packages_scanned"],
-            *severity_cells(t["findings"]),
-            t["reason"],
-        ]
-        for t in targets
-    )
-    header = [
-        "Target",
-        *(["Scanner"] if with_scanner else []),
-        "Status",
-        "Packages",
-        "C",
-        "H",
-        "M",
-        "L",
-        "Note",
-    ]
-    first_number = 3 if with_scanner else 2
-    body = md_table(header, rows, right=range(first_number, first_number + 5))
+    subjects: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for target in targets:
+        subjects.setdefault(target["id"], {})[target["scanner"]] = target
+    # Only a run with OSV targets needs the column: Trivy-only reports stay as is
+    with_osv = any(t["scanner"] == SCANNER_OSV for t in targets)
+    rows = []
+    for scanners in subjects.values():
+        trivy = scanners.get(SCANNER_TRIVY)
+        osv = scanners.get(SCANNER_OSV)
+        scanned = [t for t in (trivy, osv) if t and t["status"] == STATUS_OK]
+        empty = any(t["packages_scanned"] == 0 for t in scanned)
+        rows.append(
+            [
+                target_label(trivy or osv, several),  # type: ignore[arg-type]
+                scan_cell(trivy, trivy_findings_text),
+                *([scan_cell(osv, lambda f: str(f["total"]))] if with_osv else []),
+                "no packages seen" if empty else None,
+            ]
+        )
+    header = ["Target", "Trivy", *(["OSV"] if with_osv else []), "Note"]
+    legend = "Trivy: status · packages · CRITICAL/HIGH/MEDIUM/LOW findings"
+    if with_osv:
+        legend += "; OSV: status · packages · findings"
+    body = [f"<sub>{legend}</sub>", "", *md_table(header, rows)]
     return ["", *md_details("Scan coverage", body)]
 
 
@@ -2683,16 +3097,25 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
 
 
 def build_summary_md(
-    report: Mapping[str, Any], vulns: Mapping[str, Any], sightings: Sightings
+    report: Mapping[str, Any],
+    vulns: Mapping[str, Any],
+    sightings: Sightings,
+    base_os: Mapping[str, str] | None = None,
+    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
 ) -> str:
+    """``base_os`` is the OS of each scanned image (target id -> ``ubuntu 24.04``),
+    ``in_place`` the findings that are fixed in place (see ``fixed_in_place``).
+    """
     records = vulns["records"]
     targets = report["targets"]
     # The findings sections are about the records, so about the Trivy targets only
     record_targets = trivy_targets(targets)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
-    lines += render_headline(headline_lines(report, records))
+    lines += render_headline(headline_blocks(report, records, in_place))
     if records:
-        fixes = render_what_to_fix(records, sightings, record_targets)
+        fixes = render_what_to_fix(
+            records, sightings, record_targets, base_os, in_place
+        )
         lines += ["", *fixes] if fixes else []
         lines += render_watch(records, record_targets)
         lines += render_severity_sections(records, record_targets)
@@ -2793,8 +3216,8 @@ def run_merge(
     osv_scans = resolve_osv_targets(results, {tid: n for tid, _, n in ok_scans})
     repo = targets_doc.get("repo")
     image_ids = {t["id"] for t in trivy_only if t.get("kind") == KIND_IMAGE}
-    merged, sightings = merge_records(repo, ok_scans, image_ids, osv_scans)
-    records = finalize_records(merged, trivy_only)
+    merged, sightings, in_place = merge_records(repo, ok_scans, image_ids, osv_scans)
+    records = finalize_records(merged, trivy_only, in_place)
     scan_report = build_scan_report(
         targets_doc, results, records, generated_utc, trivy_db
     )
@@ -2802,8 +3225,17 @@ def run_merge(
 
     dump_json(report_dir / "vulnerabilities.json", vulns)
     dump_json(report_dir / "scan_report.json", scan_report)
+    base_os = {
+        t["id"]: label
+        for t, _, native in results
+        if native is not None
+        and t["scanner"] == SCANNER_TRIVY
+        and t.get("kind") == KIND_IMAGE
+        and (label := image_os(native))
+    }
     write_text(
-        output_dir / "summary.md", build_summary_md(scan_report, vulns, sightings)
+        output_dir / "summary.md",
+        build_summary_md(scan_report, vulns, sightings, base_os, in_place),
     )
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]

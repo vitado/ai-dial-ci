@@ -81,6 +81,7 @@ jobs:
             cves.jsonl.gz:application/gzip \
             reputation.json:application/json \
             evidence.jsonl.gz:application/gzip \
+            hints.json:application/json \
             metadata.json:application/json \
             > "$RUNNER_TEMP/push.json"
           digest=$(jq -r .digest "$RUNNER_TEMP/push.json")

@@ -19,7 +19,8 @@ Inputs:
   * the central CVE index (see sca_build_cve_index), an OCI artifact pulled with
     ORAS (``--cve-index``), or a directory that holds one (``--index-dir``, for
     tests and for running the script by hand with no registry): the CVE records of
-    the last 180 days and the reputation of their CNAs. The deltas of the cvelistV5
+    the last 180 days, the reputation of their CNAs and the curated hints (see
+    "Hints" below). The deltas of the cvelistV5
     releases since the index was built are applied to its records, with the code of
     the builder (the ``end_of_day`` delta of each past day, the hourly deltas of
     today, the delta log for what they lack), so the records are hours old and not
@@ -45,7 +46,8 @@ records in the window, how many a vulnerability database confirmed
 (``basis: cna_history``, ``cna``, ``confirmed``, ``errors``, ``pending`` and
 ``ratio = confirmed / (confirmed + errors)``, null with no resolved claim). For T3
 and repo-level, where the CVE only matches by names, the history of the CNA says
-nothing about our matching error, so there is none (``basis: name_match``).
+nothing about our matching error, so there is none (``basis: name_match``). For a
+hint, which is a judgement of ours, it names the hint (``basis: hint``, ``hint_id``).
 
 Matching (the narrow form recommended by the study of the CVE feed; only npm, PyPI,
 Maven and Cargo packages, OS packages are out of scope like in OSV):
@@ -61,7 +63,23 @@ Maven and Cargo packages, OS packages are out of scope like in OSV):
       of the CVE points at the repository of the package and, for a scoped npm
       package, the scope is the vendor or owner;
   repo-level  ``product`` is the repository (and not the artifact) and the CVE
-      text names the artifact itself.
+      text names the artifact itself;
+  hint        a curated hint of the index (below) says the CVE is about the package.
+      It ranks after T1 and T2 and before T3 and repo-level, and never touches a
+      package that T1 or T2 matched.
+
+Hints (``cve-hints.yml`` of ``sca_build_cve_index``, shipped in the index as
+``hints.json``). The CNA data of some CVEs does not say which package is meant:
+Spring's CNA names the product ``Spring Framework`` and not an artifact, Apache's
+``Apache Tomcat``. A ``product`` hint maps such a product (and optionally its vendor
+and CNA) to the packages of an ecosystem by exact names or by names with ``*``, and
+the versions of the CVE then apply to the versions of those packages (the hint says
+that they are the same numbers); ``module_from_text`` keeps only the artifacts whose
+module (what ``*`` stands for) the title or description names, for an umbrella
+product such as ``netty``. A ``cve`` hint names the packages of one CVE and,
+if the CNA's ranges are wrong or missing, its ranges. Hints are checked strictly
+(``parse_hints``); an index with an invalid ``hints.json`` is unusable, one without
+the file has no hints.
 
 The affected versions are checked with the version scheme of the package
 ecosystem. A version that cannot be parsed or compared never makes a match
@@ -81,6 +99,7 @@ network. Python standard library only (and the ``oras`` command).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -94,7 +113,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -139,8 +165,9 @@ MAX_LOCATIONS = 50
 RULE_T1 = "T1"
 RULE_T2 = "T2"
 RULE_T3 = "T3"
+RULE_HINT = "hint"
 RULE_REPO_LEVEL = "repo-level"
-RULE_PRIORITY = {RULE_T1: 0, RULE_T2: 1, RULE_T3: 2, RULE_REPO_LEVEL: 3}
+RULE_PRIORITY = {RULE_T1: 0, RULE_T2: 1, RULE_HINT: 2, RULE_T3: 3, RULE_REPO_LEVEL: 4}
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 UNKNOWN_SEVERITY = "UNKNOWN"
@@ -1235,6 +1262,8 @@ def hourly_asset(day: date, hour: int) -> str:
 REPUTATION_FILE = "reputation.json"
 BASIS_CNA_HISTORY = "cna_history"
 BASIS_NAME_MATCH = "name_match"
+BASIS_HINT = "hint"
+HINTS_FILE = "hints.json"
 STATE_PUBLISHED = "PUBLISHED"
 _BUILDER_DIR = Path(__file__).resolve().parents[1] / "sca_build_cve_index"
 
@@ -1258,8 +1287,9 @@ def builder() -> Any:
 class IndexData:
     """The CVE index as read: the records (the latest version of each), the reputation
     of the CNAs (``cnas``: name -> ``{confirmed, errors, pending}``), its metadata and
-    the gaps of the feed in its window (``{from, to}`` ranges of hours). ``ref`` and
-    ``digest`` say which artifact it is (no digest for a directory).
+    the gaps of the feed in its window (``{from, to}`` ranges of hours), the curated
+    hints (none in an index built before there were hints) and the sha256 of their
+    file. ``ref`` and ``digest`` say which artifact it is (no digest for a directory).
     """
 
     records: dict[str, dict[str, Any]]
@@ -1268,6 +1298,8 @@ class IndexData:
     ref: str
     digest: str | None = None
     gaps: list[dict[str, str]] = field(default_factory=list)
+    hints: tuple[Hint, ...] = ()
+    hints_sha256: str | None = None
 
 
 def pull_index(ref: str, dest: Path, run: Runner = subprocess.run) -> str:
@@ -1335,9 +1367,34 @@ def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
         raise IndexUnavailable(f"the index {ref} cannot be read: {err}") from err
     if not _valid_reputation(reputation, bci.SCHEMA_VERSION):
         raise IndexUnavailable(f"the index {ref}: {REPUTATION_FILE} is not valid")
+    hints, hints_sha256 = read_hints(directory, ref)
     return IndexData(
-        previous.records, reputation["cnas"], previous.metadata, ref, digest, gaps
+        previous.records,
+        reputation["cnas"],
+        previous.metadata,
+        ref,
+        digest,
+        gaps,
+        hints,
+        hints_sha256,
     )
+
+
+def read_hints(directory: Path, ref: str) -> tuple[tuple[Hint, ...], str | None]:
+    """The hints of an index and the sha256 of their file. An index without the file
+    was built before there were hints and has none; a file that is not valid makes
+    the index unusable, as the early warning must not match with hints it cannot
+    check.
+    """
+    path = directory / HINTS_FILE
+    if not path.is_file():
+        return (), None
+    try:
+        data = path.read_bytes()
+        hints = parse_hints(json.loads(data))
+    except (OSError, ValueError, HintsError) as err:
+        raise IndexUnavailable(f"the index {ref}: {HINTS_FILE}: {err}") from err
+    return hints, hashlib.sha256(data).hexdigest()
 
 
 def catch_up(
@@ -1398,12 +1455,18 @@ def index_document(index: IndexData) -> dict[str, Any]:
 
 
 def confidence_of(
-    rule: str, cna: str | None, cnas: Mapping[str, Mapping[str, int]]
+    rule: str,
+    cna: str | None,
+    cnas: Mapping[str, Mapping[str, int]],
+    hint_id: str | None = None,
 ) -> dict[str, Any]:
     """How far a match can be believed. T1 and T2 rest on what the CNA claimed, so
     its history in the index is the confidence; T3 and repo-level match by names,
-    where the history of the CNA says nothing about our error.
+    where the history of the CNA says nothing about our error; a hint is a curated
+    judgement of ours, so the confidence names the hint.
     """
+    if rule == RULE_HINT:
+        return {"basis": BASIS_HINT, "hint_id": hint_id}
     if rule not in (RULE_T1, RULE_T2):
         return {"basis": BASIS_NAME_MATCH}
     counts = cnas.get(cna or "") or {}
@@ -1520,6 +1583,7 @@ class Hit:
     rule: str
     status: str
     entry: Mapping[str, Any]
+    hint_id: str | None = None
 
 
 def entry_hits(
@@ -1641,6 +1705,398 @@ def ghsa_aliases(record: Mapping[str, Any]) -> list[str]:
     return sorted(found)
 
 
+# --------------------------------------------------------------------------
+# Hints
+# --------------------------------------------------------------------------
+
+HINTS_SCHEMA_VERSION = 1
+HINT_KIND_PRODUCT = "product"
+HINT_KIND_CVE = "cve"
+MAX_HINT_TEXT_CHARS = 500
+_HINT_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}")
+_HINT_NAME_RE = re.compile(r"[A-Za-z0-9._@/:*-]+")
+_MODULE_SPLIT_RE = re.compile(r"[-._]")
+_HINT_COMMON_KEYS = ("id", "kind", "reason", "source", "added", "ecosystem", "packages")
+_HINT_PRODUCT_KEYS = (
+    "product",
+    "vendor",
+    "assigner",
+    "exclude",
+    "module_from_text",
+    "versions_are_artifact_versions",
+)
+_HINT_PRODUCT_REQUIRED = ("product", "versions_are_artifact_versions")
+_HINT_CVE_KEYS = ("cve", "ranges")
+_RANGE_KEYS = ("from", "before", "through")
+
+
+class HintsError(Exception):
+    """The hints are not valid; the message says where and what."""
+
+
+@dataclass(frozen=True)
+class Hint:
+    """One curated hint (see ``parse_hints``). ``packages`` and ``exclude`` are
+    normalized names (``*`` stands for any characters); ``ranges`` are dicts with
+    ``from`` (default ``0``) and ``before`` or ``through``.
+    """
+
+    id: str
+    kind: str
+    reason: str
+    source: str
+    added: str
+    ecosystem: str
+    packages: tuple[str, ...]
+    product: str | None = None
+    vendor: str | None = None
+    assigner: str | None = None
+    exclude: tuple[str, ...] = ()
+    module_from_text: bool = False
+    cve: str | None = None
+    ranges: tuple[Mapping[str, str], ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        """The hint as ``hints.json`` and the YAML file spell it (what is unset is
+        left out), so that ``parse_hints`` reads it back to the same hint.
+        """
+        document: dict[str, Any] = {
+            "id": self.id,
+            "kind": self.kind,
+            "reason": self.reason,
+            "source": self.source,
+            "added": self.added,
+            "ecosystem": self.ecosystem,
+            "packages": list(self.packages),
+        }
+        if self.kind == HINT_KIND_PRODUCT:
+            document["product"] = self.product
+            document["versions_are_artifact_versions"] = True
+            for key in ("vendor", "assigner"):
+                if getattr(self, key):
+                    document[key] = getattr(self, key)
+            if self.exclude:
+                document["exclude"] = list(self.exclude)
+            if self.module_from_text:
+                document["module_from_text"] = True
+        else:
+            document["cve"] = self.cve
+            if self.ranges:
+                document["ranges"] = [dict(r) for r in self.ranges]
+        return document
+
+
+def _hint_text(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HintsError(f"{where}: must be a non-empty string")
+    if (
+        value != value.strip()
+        or len(value) > MAX_HINT_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise HintsError(
+            f"{where}: must be one line of at most {MAX_HINT_TEXT_CHARS} characters "
+            "with no leading or trailing whitespace"
+        )
+    return value
+
+
+def _hint_names(
+    value: Any, ecosystem: str, where: str, patterns: bool
+) -> tuple[str, ...]:
+    """Package names of a hint: exact, or with ``*`` (any characters) if ``patterns``.
+    A Maven name is ``group:artifact`` and its group is literal, so that a pattern
+    cannot reach beyond one group.
+    """
+    if not isinstance(value, list) or not value:
+        raise HintsError(f"{where}: must be a non-empty list")
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _HINT_NAME_RE.fullmatch(item):
+            raise HintsError(f"{where}: {item!r} is not a package name")
+        if "*" in item and not patterns:
+            raise HintsError(f"{where}: {item!r}: no '*' here, give exact names")
+        if not item.replace("*", ""):
+            raise HintsError(f"{where}: {item!r} matches everything")
+        if ecosystem == "maven":
+            group, _, artifact = item.partition(":")
+            if not group or "*" in group or not artifact:
+                raise HintsError(
+                    f"{where}: {item!r}: a Maven name is group:artifact with a "
+                    "literal group"
+                )
+        name = normalize_name(ecosystem, item)
+        if name in names:
+            raise HintsError(f"{where}: {item!r} is listed twice")
+        names.append(name)
+    return tuple(names)
+
+
+def _hint_ranges(
+    value: Any, ecosystem: str, where: str
+) -> tuple[Mapping[str, str], ...]:
+    if not isinstance(value, list) or not value:
+        raise HintsError(f"{where}: must be a non-empty list")
+    ranges = []
+    for number, item in enumerate(value, 1):
+        here = f"{where}[{number}]"
+        if not isinstance(item, dict) or set(item) - set(_RANGE_KEYS):
+            raise HintsError(f"{here}: must be a mapping of {', '.join(_RANGE_KEYS)}")
+        if ("before" in item) == ("through" in item):
+            raise HintsError(f"{here}: exactly one of 'before' and 'through'")
+        checked = {key: str(item[key]).strip() for key in item}
+        checked.setdefault("from", "0")
+        for key, version in checked.items():
+            if (
+                _is_wildcard(version)
+                or compare_versions(ecosystem, version, version) != 0
+            ):
+                raise HintsError(
+                    f"{here}.{key}: {version!r} is not a {ecosystem} version"
+                )
+        ranges.append(dict(sorted(checked.items())))
+    return tuple(ranges)
+
+
+def _hint_added(value: Any, where: str) -> str:
+    if isinstance(value, datetime) or not isinstance(value, (date, str)):
+        raise HintsError(f"{where}: must be a date, YYYY-MM-DD")
+    text = value.isoformat() if isinstance(value, date) else value
+    try:
+        if date.fromisoformat(text).isoformat() != text:
+            raise ValueError(text)
+    except ValueError as err:
+        raise HintsError(f"{where}: {text!r} is not a date, YYYY-MM-DD") from err
+    return text
+
+
+def parse_hint(raw: Any, where: str) -> Hint:
+    if not isinstance(raw, dict):
+        raise HintsError(f"{where}: must be a mapping")
+    kind = raw.get("kind")
+    if kind not in (HINT_KIND_PRODUCT, HINT_KIND_CVE):
+        raise HintsError(
+            f"{where}: kind must be '{HINT_KIND_PRODUCT}' or '{HINT_KIND_CVE}'"
+        )
+    allowed = _HINT_COMMON_KEYS + (
+        _HINT_PRODUCT_KEYS if kind == HINT_KIND_PRODUCT else _HINT_CVE_KEYS
+    )
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise HintsError(
+            f"{where}: unknown key(s) {', '.join(unknown)} for a {kind} hint"
+        )
+    required = _HINT_COMMON_KEYS + (
+        _HINT_PRODUCT_REQUIRED if kind == HINT_KIND_PRODUCT else ("cve",)
+    )
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise HintsError(f"{where}: missing {', '.join(missing)}")
+    hint_id = raw["id"]
+    if not isinstance(hint_id, str) or not _HINT_ID_RE.fullmatch(hint_id):
+        raise HintsError(f"{where}.id: must be lower case words joined by '-'")
+    where = f"hint {hint_id}"
+    source = _hint_text(raw["source"], f"{where}.source")
+    if urllib.parse.urlsplit(source).scheme != "https":
+        raise HintsError(f"{where}.source: must be an https link")
+    ecosystem = raw["ecosystem"]
+    if ecosystem not in ECOSYSTEMS:
+        raise HintsError(f"{where}.ecosystem: one of {', '.join(ECOSYSTEMS)}")
+    common: dict[str, Any] = {
+        "id": hint_id,
+        "kind": kind,
+        "reason": _hint_text(raw["reason"], f"{where}.reason"),
+        "source": source,
+        "added": _hint_added(raw["added"], f"{where}.added"),
+        "ecosystem": ecosystem,
+    }
+    if kind == HINT_KIND_CVE:
+        cve = raw["cve"]
+        if not isinstance(cve, str) or not _CVE_ID_RE.fullmatch(cve):
+            raise HintsError(f"{where}.cve: must be a CVE id like CVE-2026-12345")
+        ranges = (
+            _hint_ranges(raw["ranges"], ecosystem, f"{where}.ranges")
+            if "ranges" in raw
+            else ()
+        )
+        packages = _hint_names(raw["packages"], ecosystem, f"{where}.packages", False)
+        return Hint(**common, packages=packages, cve=cve, ranges=ranges)
+    if raw["versions_are_artifact_versions"] is not True:
+        raise HintsError(
+            f"{where}.versions_are_artifact_versions: must be true; a product whose "
+            "version is not the version of its artifacts gets no hint"
+        )
+    optional: dict[str, Any] = {}
+    for key in ("vendor", "assigner"):
+        if key in raw:
+            optional[key] = _hint_text(raw[key], f"{where}.{key}")
+    packages = _hint_names(raw["packages"], ecosystem, f"{where}.packages", True)
+    exclude = (
+        _hint_names(raw["exclude"], ecosystem, f"{where}.exclude", True)
+        if "exclude" in raw
+        else ()
+    )
+    module_from_text = raw.get("module_from_text", False)
+    if not isinstance(module_from_text, bool):
+        raise HintsError(f"{where}.module_from_text: must be true or false")
+    if module_from_text and not any("*" in name for name in packages):
+        raise HintsError(
+            f"{where}.module_from_text: needs a pattern with '*' in packages, the "
+            "module is what the '*' stands for"
+        )
+    return Hint(
+        **common,
+        packages=packages,
+        product=_hint_text(raw["product"], f"{where}.product"),
+        exclude=exclude,
+        module_from_text=module_from_text,
+        **optional,
+    )
+
+
+def parse_hints(document: Any) -> tuple[Hint, ...]:
+    """The hints of a document (the YAML file of the repository, or ``hints.json`` of
+    the index), strictly: unknown keys, wrong types, a duplicate id or CVE and a
+    wrong ``schema_version`` are errors, never skipped.
+    """
+    if not isinstance(document, dict) or set(document) != {"schema_version", "hints"}:
+        raise HintsError("must be a mapping of schema_version and hints")
+    version = document["schema_version"]
+    if version != HINTS_SCHEMA_VERSION or isinstance(version, bool):
+        raise HintsError(f"schema_version must be {HINTS_SCHEMA_VERSION}")
+    if not isinstance(document["hints"], list):
+        raise HintsError("hints must be a list")
+    hints = [
+        parse_hint(raw, f"hints[{number}]")
+        for number, raw in enumerate(document["hints"], 1)
+    ]
+    for key in ("id", "cve"):
+        seen: set[str] = set()
+        for hint in hints:
+            value = getattr(hint, key)
+            if value is None:
+                continue
+            if value in seen:
+                raise HintsError(f"duplicate {key} {value}")
+            seen.add(value)
+    return tuple(hints)
+
+
+def hints_document(hints: Iterable[Hint]) -> dict[str, Any]:
+    """``hints.json`` of the index."""
+    return {
+        "schema_version": HINTS_SCHEMA_VERSION,
+        "hints": [hint.to_json() for hint in hints],
+    }
+
+
+def _name_pattern(pattern: str) -> re.Pattern[str]:
+    return re.compile(".*".join(re.escape(part) for part in pattern.split("*")))
+
+
+def hint_packages(hint: Hint, packages: Iterable[Package]) -> list[Package]:
+    """The packages (of the inventory) a hint is about: by name, not excluded."""
+    wanted = [_name_pattern(p) for p in hint.packages]
+    excluded = [_name_pattern(p) for p in hint.exclude]
+    found = []
+    for package in packages:
+        name = normalize_name(package.ecosystem, package.name)
+        if (
+            package.ecosystem == hint.ecosystem
+            and any(p.fullmatch(name) for p in wanted)
+            and not any(p.fullmatch(name) for p in excluded)
+        ):
+            found.append(package)
+    return found
+
+
+def module_named_in_text(hint: Hint, package: Package, text: str) -> bool:
+    """Whether the text names the package (as ``named_in_text`` does), or its module:
+    what the ``*`` of the pattern stands for in the name (``codec-http`` for
+    ``netty-codec-http`` and ``io.netty:netty-*``), whole, its words separated by
+    ``-``, ``.`` or ``_`` (``io.netty.handler.codec.http.cors``). A name that an
+    exact entry gives needs no text.
+    """
+    if named_in_text(package, text):
+        return True
+    name = normalize_name(package.ecosystem, package.name)
+    for pattern in hint.packages:
+        if not _name_pattern(pattern).fullmatch(name):
+            continue
+        if "*" not in pattern:
+            return True
+        module = name[len(pattern.split("*")[0]) :]
+        words = [word for word in _MODULE_SPLIT_RE.split(module) if word]
+        needle = "[-._]".join(re.escape(word) for word in words)
+        if words and re.search(_BOUNDARY.format(needle), text, re.IGNORECASE):
+            return True
+    return False
+
+
+def hint_hits(
+    hints: Sequence[Hint],
+    candidates: Mapping[str, Sequence[Package]],
+    record: Mapping[str, Any],
+    skip: Collection[Package],
+    outcomes: Counter,
+) -> Iterator[Hit]:
+    """The packages the hints say a record is about, with the verdict of the versions
+    (``skip``: the packages that T1 or T2 matched, which a hint does not touch).
+    A ``product`` hint takes the versions of the entry of the record that names the
+    product; a ``cve`` hint, its own ranges, or else those of the entries.
+    """
+    text = f"{record['title'] or ''} {record['description']}"
+    for hint in hints:
+        if hint.kind == HINT_KIND_CVE:
+            if record["cve"] != hint.cve:
+                continue
+            entries: Sequence[Mapping[str, Any]] = record["affected"]
+            if hint.ranges:
+                entries = [hint_entry(hint)]
+        else:
+            if (
+                hint.assigner
+                and (record["assigner"] or "").lower() != hint.assigner.lower()
+            ):
+                continue
+            entries = [
+                entry
+                for entry in record["affected"]
+                if squash(entry.get("product")) == squash(hint.product)
+                and (
+                    not hint.vendor
+                    or squash(entry.get("vendor")) == squash(hint.vendor)
+                )
+            ]
+        for package in candidates[hint.id]:
+            if package in skip or not entries:
+                continue
+            if hint.module_from_text and not module_named_in_text(hint, package, text):
+                outcomes["hint_module_not_in_text"] += 1
+                continue
+            for entry in entries:
+                status = entry_status(package.ecosystem, package.version, entry)
+                yield Hit(package, RULE_HINT, status, entry, hint.id)
+
+
+def hint_entry(hint: Hint) -> dict[str, Any]:
+    """The ranges of a ``cve`` hint as an ``affected`` entry of a CVE record."""
+    versions = []
+    for item in hint.ranges:
+        upper = {"lessThan": item["before"]} if "before" in item else {}
+        upper = upper or {"lessThanOrEqual": item["through"]}
+        versions.append(
+            {
+                "version": item["from"],
+                "status": STATUS_AFFECTED,
+                "versionType": "custom",
+                **upper,
+            }
+        )
+    return {"defaultStatus": "unaffected", "versions": versions}
+
+
 @dataclass
 class MatchResult:
     candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -1652,18 +2108,28 @@ def match_records(
     index: Index,
     inventory: Inventory,
     cnas: Mapping[str, Mapping[str, int]],
+    hints: Sequence[Hint] = (),
 ) -> MatchResult:
     """Candidates: one per CVE and package version that the CNA data says is
-    affected. When several entries or rules say so, the strongest rule (T1, T2, T3,
-    repo-level) and its entry are kept. ``cnas`` is the reputation of the CNAs, for
-    the confidence of each candidate.
+    affected. When several entries or rules say so, the strongest rule (T1, T2,
+    hint, T3, repo-level) and its entry are kept. ``cnas`` is the reputation of the
+    CNAs, for the confidence of each candidate; ``hints`` are the curated hints of
+    the index (a package that T1 or T2 matched is not matched by a hint).
     """
     result = MatchResult()
+    candidates = {hint.id: hint_packages(hint, index.repos) for hint in hints}
     for record in sorted(records, key=lambda r: r["cve"]):
         hits: dict[Package, list[Hit]] = {}
         for entry in record["affected"]:
             for hit in entry_hits(index, record, entry, result.outcomes):
                 hits.setdefault(hit.package, []).append(hit)
+        claimed = {
+            package
+            for package, package_hits in hits.items()
+            if any(h.rule in (RULE_T1, RULE_T2) for h in package_hits)
+        }
+        for hit in hint_hits(hints, candidates, record, claimed, result.outcomes):
+            hits.setdefault(hit.package, []).append(hit)
         for package, package_hits in hits.items():
             affecting = [
                 h for h in package_hits if h.status in (STATUS_AFFECTED, STATUS_ALL)
@@ -1703,7 +2169,7 @@ def candidate_document(
         },
         "affected_range": describe_range(hit.entry),
         "rule": hit.rule,
-        "confidence": confidence_of(hit.rule, record["assigner"], cnas),
+        "confidence": confidence_of(hit.rule, record["assigner"], cnas, hit.hint_id),
         **select_severity(record["metrics"]),
         "exploitation": record["metrics"]["exploitation"],
         "sightings": {
@@ -1820,8 +2286,11 @@ def analyse(
         ), None
     window_days = index.metadata["window_days"]
     match_index = build_index(inventory, lookup.repos)
-    matched = match_records(index.records.values(), match_index, inventory, index.cnas)
+    matched = match_records(
+        index.records.values(), match_index, inventory, index.cnas, index.hints
+    )
     diagnostics.update(
+        hints={"count": len(index.hints), "sha256": index.hints_sha256},
         index_records=len(index.records),
         depsdev_requests=lookup.requests,
         depsdev_names_without_repo=lookup.without_repo,

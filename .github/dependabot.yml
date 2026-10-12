@@ -21,11 +21,12 @@ updates:
         group-by: "dependency-name"
         patterns:
           - "*"
-  # PyYAML of the SCA actions (pinned with hashes); the two requirements files are identical, see test/sca
+  # PyYAML of the SCA actions (pinned with hashes); the three requirements files are identical, see test/sca
   - package-ecosystem: "pip"
     directories:
       - "/actions/sca_resolve_targets"
       - "/actions/sca_prepare_trivy_config"
+      - "/actions/sca_build_cve_index"
     schedule:
       interval: "weekly"
       day: "wednesday"

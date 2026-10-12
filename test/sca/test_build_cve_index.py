@@ -5,6 +5,7 @@ download layer).
 from __future__ import annotations
 
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -1316,3 +1317,124 @@ def test_main_warns_about_the_gaps_of_the_feed(
 def test_main_rejects_a_window_out_of_range(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         b.main(["--output-dir", "o", "--work-dir", "w", "--window-days", "0"])
+
+
+# --- the hints ----------------------------------
+
+HINTS_YAML = """\
+# a comment
+schema_version: 1
+hints:
+  - id: apache-tomcat
+    kind: product
+    reason: The CNA names the product and no artifact
+    source: https://tomcat.apache.org/security.html
+    added: 2030-01-01
+    product: Apache Tomcat
+    assigner: apache
+    ecosystem: maven
+    packages: ["org.apache.tomcat.embed:tomcat-embed-core"]
+    versions_are_artifact_versions: true
+"""
+
+
+def hints_file(tmp_path: Path, text: str = HINTS_YAML) -> Path:
+    path = tmp_path / "hints.yml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_hints_of_the_repository_are_valid() -> None:
+    hints = b.read_hints_file(b.DEFAULT_HINTS_FILE)
+    assert len({h.id for h in hints}) == len(hints)
+    assert b.DEFAULT_HINTS_FILE.parent == Path(b.__file__).parent
+
+
+def test_a_hints_file_is_read_strictly(tmp_path: Path) -> None:
+    (hint,) = b.read_hints_file(hints_file(tmp_path))
+    assert (hint.id, hint.added, hint.packages) == (
+        "apache-tomcat",
+        "2030-01-01",
+        ("org.apache.tomcat.embed:tomcat-embed-core",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("schema_version: 1\nhints: [", "hints"),
+        ("schema_version: 1\nschema_version: 1\nhints: []\n", "duplicate key"),
+        ("schema_version: 1\nhints: []\nx: &a 1\ny: *a\n", "aliases"),
+        ("schema_version: 1\nhints: [*a]\n", "aliases"),
+        ("- a\n", "mapping of"),
+        ("", "mapping of"),
+        (HINTS_YAML + "    extra: 1\n", "unknown key"),
+        (HINTS_YAML.replace("true", "false"), "must be true"),
+    ],
+)
+def test_a_hints_file_that_is_not_valid_fails(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    with pytest.raises(b.FormatError, match=message):
+        b.read_hints_file(hints_file(tmp_path, text))
+
+
+def test_a_hints_file_that_is_too_large_fails(tmp_path: Path) -> None:
+    text = HINTS_YAML + "#" * b.MAX_HINTS_BYTES
+    with pytest.raises(b.FormatError, match="larger than"):
+        b.read_hints_file(hints_file(tmp_path, text))
+
+
+def test_a_missing_hints_file_fails(tmp_path: Path) -> None:
+    with pytest.raises(b.FormatError, match="hints"):
+        b.read_hints_file(tmp_path / "nothing.yml")
+
+
+def test_the_index_ships_the_hints_and_the_radar_reads_them_back(
+    net: FakeDownloader, tmp_path: Path
+) -> None:
+    hints = b.read_hints_file(hints_file(tmp_path))
+    built = b.build(net, tmp_path / "work", NOW, WINDOW, hints=hints)
+    out = tmp_path / "index"
+    b.write_index(built, out)
+    shipped = (out / b.HINTS_FILE).read_bytes()
+    assert shipped == b.hints_bytes(hints)
+    assert ew.parse_hints(json.loads(shipped)) == hints
+    assert built.metadata["hints"] == {
+        "count": 1,
+        "sha256": hashlib.sha256(shipped).hexdigest(),
+    }
+    # the radar's own reader takes the same files
+    assert ew.read_hints(out, "ref")[0] == hints
+
+
+def test_an_index_without_hints_ships_an_empty_file(
+    net: FakeDownloader, tmp_path: Path
+) -> None:
+    built = run_build(net, tmp_path)
+    out = tmp_path / "index"
+    b.write_index(built, out)
+    assert json.loads((out / b.HINTS_FILE).read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "hints": [],
+    }
+    assert built.metadata["hints"]["count"] == 0
+
+
+def test_main_ships_the_hints_of_the_file_it_is_given(
+    net: FakeDownloader, tmp_path: Path
+) -> None:
+    args = main_args(tmp_path, "--hints-file", str(hints_file(tmp_path)))
+    assert b.main(args, net, NOW) == 0
+    shipped = (tmp_path / "index" / b.HINTS_FILE).read_text(encoding="utf-8")
+    assert [h["id"] for h in json.loads(shipped)["hints"]] == ["apache-tomcat"]
+
+
+def test_main_fails_on_invalid_hints_before_it_downloads(
+    net: FakeDownloader, tmp_path: Path, capsys: Any
+) -> None:
+    bad = hints_file(tmp_path, HINTS_YAML + "    extra: 1\n")
+    assert b.main(main_args(tmp_path, "--hints-file", str(bad)), net, NOW) == 1
+    assert net.requested == []
+    assert not (tmp_path / "index").exists()
+    assert "unknown key" in capsys.readouterr().err

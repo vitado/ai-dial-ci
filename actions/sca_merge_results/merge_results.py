@@ -57,10 +57,11 @@ classifies the rest by exposure like a record and reports them in
 ``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
 section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
 not in the scope table, not in the verdict. Every entry carries the ``confidence``
-the part computed (the history of its CNA in the CVE index, or ``name_match``); the
-merge shows it and neither filters nor tiers by it. The part says which CVE index it
-read (``index``: ref, digest, built_at, feed gaps), and the report repeats it. A
-broken or missing part is reported as unavailable, never as an empty result.
+the part computed (the history of its CNA in the CVE index, ``name_match``, or the
+id of the curated hint that matched it); the merge shows it and neither filters nor
+tiers by it. The part says which CVE index it read (``index``: ref, digest,
+built_at, feed gaps), and the report repeats it. A broken or missing part is
+reported as unavailable, never as an empty result.
 
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
@@ -2177,6 +2178,7 @@ EARLY_WARNING_GAPS_LISTED = 5
 ADP_SOURCE_PREFIX = "adp:"
 BASIS_CNA_HISTORY = "cna_history"
 BASIS_NAME_MATCH = "name_match"
+BASIS_HINT = "hint"
 CNA_HISTORY_KEYS = ("basis", "cna", "confirmed", "errors", "pending", "ratio")
 HEADLINE_SEVERITIES = ("CRITICAL", "HIGH")
 # The fields of an entry of _report/early_warning.json
@@ -2323,12 +2325,16 @@ def load_early_warning_part(part_dir: Path) -> tuple[dict[str, Any], Any, list[A
 
 
 def early_warning_confidence(confidence: Any) -> dict[str, Any]:
-    """The confidence of a candidate as the part wrote it: ``{basis: name_match}``, or
-    ``{basis: cna_history, cna, confirmed, errors, pending, ratio}``. TypeError or
-    KeyError if it is anything else.
+    """The confidence of a candidate as the part wrote it: ``{basis: name_match}``,
+    ``{basis: hint, hint_id}`` or ``{basis: cna_history, cna, confirmed, errors,
+    pending, ratio}``. TypeError or KeyError if it is anything else.
     """
     if confidence["basis"] == BASIS_NAME_MATCH:
         return {"basis": BASIS_NAME_MATCH}
+    if confidence["basis"] == BASIS_HINT:
+        if not isinstance(confidence["hint_id"], str):
+            raise TypeError(f"unknown confidence {confidence!r}")
+        return {"basis": BASIS_HINT, "hint_id": confidence["hint_id"]}
     history = {key: confidence[key] for key in CNA_HISTORY_KEYS}
     if history["basis"] != BASIS_CNA_HISTORY or not all(
         isinstance(history[key], int) for key in ("confirmed", "errors", "pending")
@@ -4440,11 +4446,14 @@ def confidence_text(confidence: Mapping[str, Any]) -> str:
     """``97% · VulnCheck 119/123 confirmed`` (the claims of the CNA that a
     vulnerability database confirmed, of those it resolved), ``no history · Google
     0/0`` without any resolved claim, ``name match`` for a match by names, where the
-    history of the CNA says nothing about our error. The percentage is never 100 while
-    there are errors.
+    history of the CNA says nothing about our error, ``hint: <id>`` for a match by a
+    curated hint (the hint is the judgement, not the CNA). The percentage is never 100
+    while there are errors.
     """
     if confidence["basis"] == BASIS_NAME_MATCH:
         return "name match"
+    if confidence["basis"] == BASIS_HINT:
+        return f"hint: {confidence['hint_id']}"
     confirmed, errors = confidence["confirmed"], confidence["errors"]
     counts = f"{confidence['cna'] or '?'} {confirmed}/{confirmed + errors}"
     if not confirmed + errors:

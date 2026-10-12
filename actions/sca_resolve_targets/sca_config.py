@@ -68,7 +68,7 @@ class ConfigError(Exception):
     """The configuration is unusable; the message says where and what."""
 
 
-class _StrictLoader(yaml.SafeLoader):
+class StrictLoader(yaml.SafeLoader):
     """SafeLoader that refuses duplicate keys and aliases.
 
     PyYAML keeps the last of two equal keys, so a duplicated ``non_shipped_paths``
@@ -161,7 +161,7 @@ def _parse_document(text: str, origin: str) -> Any:
     if len(text.encode("utf-8")) > MAX_CONFIG_BYTES:
         raise ConfigError(f"{origin}: larger than {MAX_CONFIG_BYTES // 1024} KiB")
     try:
-        return yaml.load(text, Loader=_StrictLoader)
+        return yaml.load(text, Loader=StrictLoader)
     except yaml.YAMLError as err:
         # One line: the text ends up in a workflow command
         raise ConfigError(

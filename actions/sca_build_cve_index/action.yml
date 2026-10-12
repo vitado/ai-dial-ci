@@ -1,9 +1,9 @@
 name: Build the CVE index of the SCA early warning
-description: Build the index of the CVE records of the last days and of the reputation of their CNAs from the cvelistV5 releases and the OSV exports, on top of the previous index if there is one. Writes the files; publishing them is up to the caller
+description: Build the index of the CVE records of the last days, of the reputation of their CNAs and of the curated hints (cve-hints.yml next to the action) from the cvelistV5 releases and the OSV exports, on top of the previous index if there is one. Writes the files; publishing them is up to the caller
 
 inputs:
   output-dir:
-    description: Directory to write the index into (cves.jsonl.gz, reputation.json, evidence.jsonl.gz, metadata.json)
+    description: Directory to write the index into (cves.jsonl.gz, reputation.json, evidence.jsonl.gz, hints.json, metadata.json)
     required: true
   previous-dir:
     description: Directory with the previous index. Empty means none, and the build starts from the whole CVE list
@@ -19,6 +19,15 @@ runs:
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.12"
+    # PyYAML for the hints file; pinned with hashes, wheels only (nothing is built or executed on install)
+    - name: Install dependencies
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: >-
+        python -m pip install --disable-pip-version-check --no-input
+        --require-hashes --only-binary=:all:
+        --requirement "$ACTION_PATH/requirements.txt"
     - name: Build the index
       shell: bash
       env:

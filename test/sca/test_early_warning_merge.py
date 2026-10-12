@@ -499,6 +499,7 @@ def history(confirmed: int, errors: int, cna: str | None = "VulnCheck") -> dict:
         (history(0, 5), "0% · VulnCheck 0/5 confirmed"),
         (history(4, 0, None), "100% · ? 4/4 confirmed"),
         ({"basis": "name_match"}, "name match"),
+        ({"basis": "hint", "hint_id": "apache-tomcat"}, "hint: apache-tomcat"),
     ],
 )
 def test_confidence_text(confidence: dict[str, Any], expected: str) -> None:
@@ -508,13 +509,31 @@ def test_confidence_text(confidence: dict[str, Any], expected: str) -> None:
 def test_a_candidate_with_an_unknown_or_missing_confidence_is_unavailable(
     ws: Workspace,
 ) -> None:
-    for confidence in ({"basis": "magic"}, {"basis": "cna_history"}, None, "high"):
+    bad = (
+        {"basis": "magic"},
+        {"basis": "cna_history"},
+        {"basis": "hint"},
+        {"basis": "hint", "hint_id": 3},
+        None,
+        "high",
+    )
+    for confidence in bad:
         write_part(ws, [candidate(confidence=confidence)])
         assert merge(ws)["status"] == "failed"
     broken = candidate()
     del broken["confidence"]
     write_part(ws, [broken])
     assert merge(ws)["status"] == "failed"
+
+
+def test_a_hint_candidate_shows_its_hint_in_the_report_and_the_summary(
+    ws: Workspace,
+) -> None:
+    confidence = {"basis": "hint", "hint_id": "apache-tomcat"}
+    write_part(ws, [candidate(rule="hint", confidence=confidence)])
+    merge(ws)
+    assert [(e["rule"], e["confidence"]) for e in entries(ws)] == [("hint", confidence)]
+    assert "| hint | hint: apache-tomcat |" in summary(ws)
 
 
 def test_the_confidence_does_not_filter_or_reorder_the_entries(ws: Workspace) -> None:

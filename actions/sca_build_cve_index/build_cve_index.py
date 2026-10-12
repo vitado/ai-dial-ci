@@ -18,7 +18,11 @@ the right package (its reputation). Bulk data only, no per-CVE request:
     bring (such a hole, or a delta that is missing) is fetched on its own;
   * what the vulnerability databases say: the OSV exports of npm, PyPI, Maven and
     crates.io (``<ecosystem>/all.zip``; the reviewed GitHub advisories are in them);
-  * the previous index (``--previous-dir``), to which the new deltas are applied.
+  * the previous index (``--previous-dir``), to which the new deltas are applied;
+  * the curated hints (``--hints-file``, ``cve-hints.yml`` next to this script by
+    default): validated here, strictly, and shipped as ``hints.json``, so that the
+    early warning of a run uses the hints of the index it read, which are in its
+    digest.
 
 Outputs (``--output-dir``), ``schema_version: 1``:
   * ``cves.jsonl.gz`` - one slim CVE record per line (what the matcher of the early
@@ -27,8 +31,10 @@ Outputs (``--output-dir``), ``schema_version: 1``:
   * ``reputation.json`` - per CNA, over the claims of the records published in the
     window: ``confirmed``, ``errors``, ``pending`` (see below);
   * ``evidence.jsonl.gz`` - one line per evaluated claim: why it counts as it does;
+  * ``hints.json`` - the hints of ``cve-hints.yml`` in the form of
+    ``early_warning.hints_document``;
   * ``metadata.json`` - when it was built, what it covers, the gaps of the feed,
-    the OSV exports used, the counts.
+    the OSV exports used, the counts, the number and sha256 of the hints.
 
 Claims. A CNA entry claims a package (``packageName``, with ``collectionURL``
 naming the registry when it does) or a repository (``repo`` of a code host) for
@@ -68,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import http.client
 import json
 import re
@@ -132,8 +139,11 @@ REASON_OTHER_PACKAGE = "other_package"
 RECORDS_FILE = "cves.jsonl.gz"
 REPUTATION_FILE = "reputation.json"
 EVIDENCE_FILE = "evidence.jsonl.gz"
+HINTS_FILE = ew.HINTS_FILE
 METADATA_FILE = "metadata.json"
-INDEX_FILES = (RECORDS_FILE, REPUTATION_FILE, EVIDENCE_FILE, METADATA_FILE)
+INDEX_FILES = (RECORDS_FILE, REPUTATION_FILE, EVIDENCE_FILE, HINTS_FILE, METADATA_FILE)
+DEFAULT_HINTS_FILE = Path(__file__).with_name("cve-hints.yml")
+MAX_HINTS_BYTES = 256 * 1024
 
 
 class IndexBuildError(Exception):
@@ -837,11 +847,40 @@ def read_previous(directory: Path) -> Previous:
     return Previous(records, metadata)
 
 
+def read_hints_file(path: Path) -> tuple[ew.Hint, ...]:
+    """The curated hints of a YAML file, validated strictly (``early_warning.
+    parse_hints``). A file that is missing, too large, not valid YAML, or not valid
+    hints fails the build: an index must not ship hints nobody checked.
+
+    PyYAML is imported here and not at the top: the early warning imports this module
+    for the deltas and does not have it, and it has no need to read YAML.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sca_resolve_targets"))
+    import sca_config  # its strict loader: no duplicate keys, no aliases
+    import yaml
+
+    try:
+        data = path.read_bytes()
+        if len(data) > MAX_HINTS_BYTES:
+            raise FormatError(f"{path}: larger than {MAX_HINTS_BYTES // 1024} KiB")
+        document = yaml.load(data.decode("utf-8"), Loader=sca_config.StrictLoader)
+        return ew.parse_hints(document)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ew.HintsError) as err:
+        raise FormatError(f"hints {path}: {' '.join(str(err).split())}") from err
+
+
 @dataclass
 class Built:
     records: dict[str, dict[str, Any]]
     reputation: Reputation
     metadata: dict[str, Any]
+    hints: tuple[ew.Hint, ...] = ()
+
+
+def hints_bytes(hints: Iterable[ew.Hint]) -> bytes:
+    """``hints.json``, the same bytes for the same hints."""
+    text = json.dumps(ew.hints_document(hints), indent=2, sort_keys=True) + "\n"
+    return text.encode("utf-8")
 
 
 def build(
@@ -852,6 +891,7 @@ def build(
     previous: Previous | None = None,
     feed_url: str = FEED_URL,
     osv_url: str = OSV_URL,
+    hints: Sequence[ew.Hint] = (),
 ) -> Built:
     now = now.astimezone(UTC).replace(microsecond=0)
     cutoff = now - timedelta(days=window_days)
@@ -936,8 +976,12 @@ def build(
             "cnas": len(reputation.cnas),
             "reconciled": reconciled,
         },
+        "hints": {
+            "count": len(hints),
+            "sha256": hashlib.sha256(hints_bytes(hints)).hexdigest(),
+        },
     }
-    return Built(records, reputation, metadata)
+    return Built(records, reputation, metadata, tuple(hints))
 
 
 def write_index(built: Built, out_dir: Path) -> None:
@@ -956,6 +1000,7 @@ def write_index(built: Built, out_dir: Path) -> None:
             "cnas": built.reputation.cnas,
         },
     )
+    (out_dir / HINTS_FILE).write_bytes(hints_bytes(built.hints))
     write_json(out_dir / METADATA_FILE, meta)
 
 
@@ -976,6 +1021,7 @@ def summary_markdown(built: Built, out_dir: Path, seconds: float) -> str:
         f"{counts['claims']} claims: {counts['confirmed']} confirmed, "
         f"{counts['errors']} errors, {counts['pending']} pending, "
         f"{counts['cnas']} CNAs",
+        f"- hints: {meta['hints']['count']} (sha256 {meta['hints']['sha256'][:12]})",
         f"- sizes: {sizes}",
         f"- feed gaps: {len(gaps)}" + (f" ({listed})" if gaps else ""),
     ]
@@ -1001,12 +1047,21 @@ def main(
         help="the previous index; without it the build starts from the whole CVE list",
     )
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
+    parser.add_argument(
+        "--hints-file",
+        type=Path,
+        default=DEFAULT_HINTS_FILE,
+        help="the curated hints (YAML, see early_warning.parse_hints); "
+        "cve-hints.yml next to this script by default",
+    )
     parser.add_argument("--summary-file", type=Path, help="append a markdown summary")
     args = parser.parse_args(argv)
     if not 1 <= args.window_days <= MAX_WINDOW_DAYS:
         parser.error(f"--window-days must be 1 to {MAX_WINDOW_DAYS}")
     started = time.monotonic()
     try:
+        # the hints first: a file that is not valid costs no download
+        hints = read_hints_file(args.hints_file)
         previous = read_previous(args.previous_dir) if args.previous_dir else None
         built = build(
             downloader or UrllibDownloader(),
@@ -1014,6 +1069,7 @@ def main(
             now or datetime.now(UTC),
             args.window_days,
             previous,
+            hints=hints,
         )
         write_index(built, args.output_dir)
     except IndexBuildError as err:

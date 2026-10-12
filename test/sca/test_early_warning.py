@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -1206,10 +1207,15 @@ def write_index(
     directory: Path,
     records: list[dict[str, Any]],
     cnas: Mapping[str, Mapping[str, int]] | None = None,
+    hints: list[dict[str, Any]] | None = None,
     **metadata: Any,
 ) -> Path:
     bci = ew.builder()
     directory.mkdir(parents=True, exist_ok=True)
+    if hints is not None:
+        (directory / "hints.json").write_text(
+            json.dumps({"schema_version": 1, "hints": hints}), encoding="utf-8"
+        )
     bci.write_jsonl_gz(directory / "cves.jsonl.gz", records)
     bci.write_json(
         directory / "reputation.json",
@@ -1304,6 +1310,56 @@ def test_an_index_is_read_with_its_reputation(tmp_path: Path) -> None:
         "built_at": BUILT,
         "gaps": [],
     }
+
+
+TOMCAT_HINT = {
+    "id": "apache-tomcat",
+    "kind": "product",
+    "reason": "The CNA names the product and no artifact",
+    "source": "https://tomcat.apache.org/security.html",
+    "added": "2030-01-01",
+    "ecosystem": "maven",
+    "packages": ["org.apache.tomcat.embed:tomcat-embed-core"],
+    "product": "Apache Tomcat",
+    "versions_are_artifact_versions": True,
+}
+TOMCAT_ENTRY = cna(
+    vendor="Apache Software Foundation",
+    product="Apache Tomcat",
+    **affected(below("11.0.25", "11.0.0-M1")),
+)
+
+
+def test_an_index_is_read_with_its_hints(tmp_path: Path) -> None:
+    directory = write_index(tmp_path / "index", [], hints=[TOMCAT_HINT])
+    index = loaded(directory)
+    assert [h.id for h in index.hints] == ["apache-tomcat"]
+    expected = hashlib.sha256((directory / "hints.json").read_bytes()).hexdigest()
+    assert index.hints_sha256 == expected
+
+
+def test_an_index_built_before_there_were_hints_has_none(tmp_path: Path) -> None:
+    index = loaded(write_index(tmp_path / "index", []))
+    assert (index.hints, index.hints_sha256) == ((), None)
+
+
+@pytest.mark.parametrize(
+    "hints_file",
+    [
+        "{",
+        "[]",
+        '{"schema_version": 2, "hints": []}',
+        json.dumps({"schema_version": 1, "hints": [{**TOMCAT_HINT, "extra": 1}]}),
+        json.dumps({"schema_version": 1, "hints": [TOMCAT_HINT, TOMCAT_HINT]}),
+    ],
+)
+def test_an_index_with_hints_that_are_not_valid_is_unavailable(
+    tmp_path: Path, hints_file: str
+) -> None:
+    directory = write_index(tmp_path / "index", [])
+    (directory / "hints.json").write_text(hints_file, encoding="utf-8")
+    with pytest.raises(ew.IndexUnavailable, match="hints.json"):
+        loaded(directory)
 
 
 @pytest.mark.parametrize(
@@ -1843,6 +1899,57 @@ def test_run_writes_the_part(ws: Workspace, tmp_path: Path) -> None:
         "pending": 2,
         "ratio": 0.9,
     }
+
+
+def tomcat_index(tmp_path: Path, hints: list[dict[str, Any]] | None) -> Path:
+    return write_index(
+        tmp_path / "cve-index",
+        [
+            slim(
+                "CVE-2030-0001",
+                entries=[TOMCAT_ENTRY],
+                assigner="apache",
+                updated="2030-01-09T18:00:00Z",
+            )
+        ],
+        hints=hints,
+    )
+
+
+def test_run_matches_with_the_hints_of_the_index(ws: Workspace, tmp_path: Path) -> None:
+    ws.add_target(
+        "source-development",
+        trivy_native("pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@11.0.22"),
+    )
+    directory = tomcat_index(tmp_path, [TOMCAT_HINT])
+    status = run_early_warning(ws, FakeNetwork(), index_dir=directory, cve_index=None)
+    assert status == "ok"
+    diagnostics = ws.json("status.json")["diagnostics"]
+    digest = hashlib.sha256((directory / "hints.json").read_bytes()).hexdigest()
+    assert diagnostics["hints"] == {"count": 1, "sha256": digest}
+    (candidate,) = ws.json("candidates.json")["candidates"]
+    assert candidate["rule"] == "hint"
+    assert candidate["confidence"] == {"basis": "hint", "hint_id": "apache-tomcat"}
+    assert candidate["package"]["version"] == "11.0.22"
+    assert candidate["affected_range"] == ">= 11.0.0-M1, < 11.0.25"
+
+
+def test_run_without_hints_in_the_index_does_not_match_the_product(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    ws.add_target(
+        "source-development",
+        trivy_native("pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@11.0.22"),
+    )
+    status = run_early_warning(
+        ws, FakeNetwork(), index_dir=tomcat_index(tmp_path, None), cve_index=None
+    )
+    assert status == "ok"
+    assert ws.json("status.json")["diagnostics"]["hints"] == {
+        "count": 0,
+        "sha256": None,
+    }
+    assert ws.json("candidates.json")["candidates"] == []
 
 
 def test_run_pulls_the_index_and_reports_its_digest(

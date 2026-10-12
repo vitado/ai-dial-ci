@@ -69,6 +69,8 @@ def make_targets_doc(*targets: dict[str, Any]) -> dict[str, Any]:
         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
         "registry": "ghcr.io",
         "release_lines": 1,
+        "run_kind": "full",
+        "run_kind_reasons": [],
         "run_id": "42",
         "run_url": "https://github.com/example/app/actions/runs/42",
         "run_started_at": "2030-01-01T00:00:00Z",
@@ -249,6 +251,7 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "published": "2020-01-01T00:00:00Z",
         "primary_url": "https://example.invalid/CVE-2000-0011",
         "scanners": ["trivy"],
+        "diff": "baseline",
     }
     assert records_by_cve(full)["CVE-2000-0001"]["pkg_type"] == "library"
 
@@ -667,7 +670,8 @@ def test_summary_md_separates_headline_lines(full: Workspace) -> None:
     # a bare newline would merge the paragraphs into one
     assert quote[0].startswith("> **") and quote[1] == ">"
     assert quote[2].startswith("> | Scope |")
-    assert quote[-2] == ">" and quote[-1] == "> 3/3 targets scanned"
+    assert quote[-4] == ">" and quote[-3] == "> 3/3 targets scanned"
+    assert quote[-2] == ">" and quote[-1].startswith("> No baseline to compare with")
     assert all(line.startswith(">") for line in quote)
 
 

@@ -206,6 +206,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "scan_targets": ["source-development"],
         "locations": ["gradle.lockfile"],
         "exposure": "source_only",
+        "diff": "baseline",
     }
     # not a record, not in the totals
     assert "CVE-2030-0001" not in records_by_cve(ws)
@@ -520,7 +521,8 @@ def test_section_is_there_without_any_records(tmp_path: Path) -> None:
 
 def headline(ws: Workspace) -> str:
     quoted = [line for line in summary(ws).splitlines() if line.startswith("> ")]
-    return quoted[-1]
+    # the last paragraph is what changed since the baseline
+    return quoted[-2]
 
 
 def test_headline_counts_early_warnings_and_names_the_urgent_ones(

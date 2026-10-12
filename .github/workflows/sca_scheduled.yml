@@ -55,6 +55,10 @@ on:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
         default: 90
+      targets:
+        type: string
+        description: "Scan only the targets whose id matches one of these patterns (comma- or newline-separated, `*` and `?` work: `source-*`, `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all. A filtered run is a partial one: it is compared with the last full run, but never is the baseline of a later run"
+        default: ""
       scan-source:
         type: boolean
         description: Scan the source code (default branch)
@@ -97,6 +101,8 @@ jobs:
           scan-images: ${{ inputs.scan-images }}
           scan-release-source: ${{ inputs.scan-release-source }}
           osv-enabled: ${{ inputs.osv-enabled }}
+          early-warning-enabled: ${{ inputs.early-warning-enabled }}
+          targets: ${{ inputs.targets }}
           config: ${{ inputs.config }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -398,6 +404,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
+      # to read the runs and the report artifact of the baseline of the diff
+      actions: read
     steps:
       # The targets part is always there, so the download does not fail when no target was scanned
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -405,6 +413,22 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
+      # What changed since the last full run of this workflow on the default branch. Having no baseline
+      # (the first run, an expired report, a failed lookup) is not an error: the report says so
+      - uses: epam/ai-dial-ci/actions/sca_find_baseline@4.12.0
+        id: baseline
+      - name: Download the baseline report
+        id: baseline-report
+        if: ${{ steps.baseline.outputs.run-id != '' }}
+        # The report does not depend on it: a baseline that cannot be downloaded is reported as missing
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sca-report
+          run-id: ${{ steps.baseline.outputs.run-id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sca-baseline
       - uses: epam/ai-dial-ci/actions/sca_merge_results@4.12.0
         id: merge
         with:
@@ -413,6 +437,8 @@ jobs:
           output-dir: ${{ runner.temp }}/sca
           trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
           early-warning-enabled: ${{ inputs.early-warning-enabled }}
+          baseline-dir: ${{ steps.baseline-report.outcome == 'success' && format('{0}/sca-baseline', runner.temp) || '' }}
+          baseline-reason: ${{ steps.baseline.outputs.run-id != '' && steps.baseline-report.outcome != 'success' && format('the report of baseline run {0} could not be downloaded', steps.baseline.outputs.run-id) || steps.baseline.outputs.reason }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

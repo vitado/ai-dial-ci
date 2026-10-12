@@ -17,6 +17,12 @@ inputs:
   early-warning-enabled:
     description: Whether the run has an early warning part (early-warning/ in parts-dir) to report; false leaves the report as it was without one
     default: "false"
+  baseline-dir:
+    description: Directory with the sca-report artifact of the baseline run (the latest full run), to say what changed since it; empty means there is no baseline
+    default: ""
+  baseline-reason:
+    description: Why there is no baseline, if the step that looked for it knows; shown in the report
+    default: ""
   step-summary:
     description: Whether to append summary.md to the job summary
     default: "true"
@@ -47,11 +53,19 @@ runs:
         STEP_SUMMARY: ${{ inputs.step-summary }}
         TRIVY_DB_INFO: ${{ inputs.trivy-db-info }}
         EARLY_WARNING_ENABLED: ${{ inputs.early-warning-enabled }}
+        BASELINE_DIR: ${{ inputs.baseline-dir }}
+        BASELINE_REASON: ${{ inputs.baseline-reason }}
       run: |
-        python "$ACTION_PATH/merge_results.py" \
-          --targets-file "$TARGETS_FILE" \
-          --parts-dir "$PARTS_DIR" \
-          --output-dir "$OUTPUT_DIR" \
-          --step-summary "$STEP_SUMMARY" \
-          --trivy-db-info "$TRIVY_DB_INFO" \
+        args=(
+          --targets-file "$TARGETS_FILE"
+          --parts-dir "$PARTS_DIR"
+          --output-dir "$OUTPUT_DIR"
+          --step-summary "$STEP_SUMMARY"
+          --trivy-db-info "$TRIVY_DB_INFO"
           --early-warning-enabled "$EARLY_WARNING_ENABLED"
+          --baseline-reason "$BASELINE_REASON"
+        )
+        if [ -n "$BASELINE_DIR" ]; then
+          args+=(--baseline-dir "$BASELINE_DIR")
+        fi
+        python "$ACTION_PATH/merge_results.py" "${args[@]}"

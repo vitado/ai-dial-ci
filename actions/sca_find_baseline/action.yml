@@ -1,0 +1,43 @@
+name: Find the baseline of an SCA scan
+description: Find the latest earlier full run of the calling workflow on the default branch that has a live sca-report artifact, to compare the report of the current run with. Not finding one is not an error
+
+inputs:
+  artifact-name:
+    description: Name of the report artifact
+    default: sca-report
+  max-runs:
+    description: How many earlier runs to look at at most
+    default: "20"
+  github-token:
+    description: Token for the GitHub API; needs the actions read permission
+    default: ${{ github.token }}
+
+outputs:
+  run-id:
+    description: Id of the baseline run; empty if there is none
+    value: ${{ steps.find.outputs.run-id }}
+  reason:
+    description: Why there is no baseline; empty if there is one
+    value: ${{ steps.find.outputs.reason }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    - name: Find the baseline run
+      id: find
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        MAX_RUNS: ${{ inputs.max-runs }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      # The calling repository, workflow file and run come from the default environment
+      # (GITHUB_REPOSITORY, GITHUB_WORKFLOW_REF, GITHUB_RUN_ID)
+      run: >-
+        python "$ACTION_PATH/find_baseline.py"
+        --artifact-name "$ARTIFACT_NAME"
+        --max-runs "$MAX_RUNS"

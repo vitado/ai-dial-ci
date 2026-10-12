@@ -26,6 +26,12 @@ inputs:
   osv-enabled:
     description: Whether to add an OSV twin of every Trivy target (the packages of the Trivy target are also checked against OSV)
     default: "true"
+  targets:
+    description: Scan only the targets whose id matches one of these patterns (comma- or newline-separated; `*` and `?` work, e.g. `source-*` or `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all targets. A filtered run is a partial one
+    default: ""
+  early-warning-enabled:
+    description: Whether the run has the early warning (only to tell a full run from a partial one)
+    default: "true"
   config:
     description: SCA configuration (YAML, same schema as .github/sca.yml of the repository) that is used instead of the file of the repository. Empty means the file, if there is one, else the defaults
     default: ""
@@ -81,6 +87,8 @@ runs:
         SCAN_IMAGES: ${{ inputs.scan-images }}
         SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
         OSV_ENABLED: ${{ inputs.osv-enabled }}
+        TARGETS: ${{ inputs.targets }}
+        EARLY_WARNING_ENABLED: ${{ inputs.early-warning-enabled }}
         CONFIG: ${{ inputs.config }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -95,5 +103,7 @@ runs:
         --scan-images "$SCAN_IMAGES"
         --scan-release-source "$SCAN_RELEASE_SOURCE"
         --osv-enabled "$OSV_ENABLED"
+        --targets "$TARGETS"
+        --early-warning-enabled "$EARLY_WARNING_ENABLED"
         --config "$CONFIG"
         --output-dir "$OUTPUT_DIR"

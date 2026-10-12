@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fnmatch
 import json
 import os
 import re
@@ -633,6 +634,70 @@ def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
         seen.add(identity)
 
 
+def parse_target_patterns(raw: str) -> list[str]:
+    """The patterns of the ``targets`` input: separated by commas or newlines."""
+    parts = (part.strip() for part in re.split(r"[,\n]", raw))
+    return [part for part in parts if part]
+
+
+def filter_targets(
+    targets: Sequence[dict[str, Any]], patterns: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Keep the targets whose id matches a pattern (``fnmatch``: ``*``, ``?``,
+    ``[...]``, case-sensitive). A pattern that matches nothing is an error: a typo
+    must not silently scan nothing.
+    """
+    if not patterns:
+        return list(targets)
+    unmatched = [
+        pattern
+        for pattern in patterns
+        if not any(fnmatch.fnmatchcase(t["id"], pattern) for t in targets)
+    ]
+    if unmatched:
+        raise ResolveError(
+            f"targets: no target matches {', '.join(repr(p) for p in unmatched)}; "
+            f"the targets of this repository are: "
+            f"{', '.join(t['id'] for t in targets) or 'none'}"
+        )
+    return [
+        t for t in targets if any(fnmatch.fnmatchcase(t["id"], p) for p in patterns)
+    ]
+
+
+def run_kind(
+    *,
+    patterns: Sequence[str],
+    scan_source: bool,
+    scan_images: bool,
+    scan_release_source: bool,
+    osv_enabled: bool,
+    early_warning_enabled: bool,
+    ref_name: str,
+    default_branch: str,
+) -> tuple[str, list[str]]:
+    """``(kind, reasons)``: ``full`` unless something narrows the scan.
+
+    A run is ``partial`` if the ``targets`` filter is set, if a part of the scan is
+    switched off, or if it does not run on the default branch of the calling
+    repository. Only a full run is a baseline for the diff of later runs.
+    """
+    narrowing = [
+        (bool(patterns), f"targets filter: {', '.join(patterns)}"),
+        (not scan_source, "scan-source is off"),
+        (not scan_images, "scan-images is off"),
+        (not scan_release_source, "scan-release-source is off"),
+        (not osv_enabled, "osv-enabled is off"),
+        (not early_warning_enabled, "early-warning-enabled is off"),
+        (
+            ref_name != default_branch,
+            f"not the default branch ({ref_name}, the default is {default_branch})",
+        ),
+    ]
+    reasons = [reason for narrows, reason in narrowing if narrows]
+    return ("partial" if reasons else "full"), reasons
+
+
 def resolve_config(
     github: GitHubClient, repository: str, commit_sha: str, override: str
 ) -> dict[str, Any]:
@@ -658,10 +723,20 @@ def resolve_targets(
     registry: RegistryClient,
     environ: Mapping[str, str],
     now: datetime,
+    caller_repository: str,
+    ref_name: str,
     config_input: str = "",
+    targets_filter: str = "",
+    early_warning_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Build the targets.json document. Raises ResolveError without a snapshot and
-    ConfigError for an invalid SCA configuration.
+    """Build the targets.json document. Raises ResolveError without a snapshot (or
+    for a ``targets_filter`` pattern that matches no target) and ConfigError for an
+    invalid SCA configuration.
+
+    ``targets_filter`` keeps only the targets whose id matches one of its patterns;
+    the OSV twins follow their Trivy targets. The run is ``partial`` (``run_kind``)
+    if the filter or a switch narrows the scan, or if ``ref_name`` is not the default
+    branch of ``caller_repository``: such a run is never the baseline of a diff.
 
     Order: the development source, the release sources (newest first), then the
     images of each image in ``images`` order.
@@ -696,6 +771,18 @@ def resolve_targets(
                     registry, image, latest_release, release_lines, release_error
                 )
             )
+    patterns = parse_target_patterns(targets_filter)
+    targets = filter_targets(targets, patterns)
+    kind, kind_reasons = run_kind(
+        patterns=patterns,
+        scan_source=scan_source,
+        scan_images=scan_images,
+        scan_release_source=scan_release_source,
+        osv_enabled=osv_enabled,
+        early_warning_enabled=early_warning_enabled,
+        ref_name=ref_name,
+        default_branch=github.default_branch(caller_repository),
+    )
     if osv_enabled:
         # After all trivy targets, in the same order
         targets.extend([make_osv_target(t) for t in targets])
@@ -711,6 +798,8 @@ def resolve_targets(
         "config": config,
         "registry": registry_name,
         "release_lines": release_lines,
+        "run_kind": kind,
+        "run_kind_reasons": kind_reasons,
         "run_id": run_id,
         "run_url": f"{server}/{run_repository}/actions/runs/{run_id}"
         if run_id and run_repository
@@ -818,6 +907,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="true/false: add an OSV twin of every Trivy target (default: %(default)s)",
     )
     parser.add_argument(
+        "--targets",
+        default="",
+        help=(
+            "only the targets whose id matches one of these patterns (commas or "
+            "newlines; * and ? work); default: all"
+        ),
+    )
+    parser.add_argument(
+        "--early-warning-enabled",
+        default="true",
+        help="true/false: whether the run has the early warning (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--caller-repository",
+        default=None,
+        help="owner/name of the repository that runs the workflow "
+        "(default: env GITHUB_REPOSITORY)",
+    )
+    parser.add_argument(
+        "--ref-name",
+        default=None,
+        help="branch or tag the workflow runs on (default: env GITHUB_REF_NAME)",
+    )
+    parser.add_argument(
         "--config",
         default="",
         help="SCA configuration (YAML) that replaces .github/sca.yml of the repository",
@@ -849,6 +962,17 @@ def run(
     scan_images = parse_bool(args.scan_images, "scan-images")
     scan_release_source = parse_bool(args.scan_release_source, "scan-release-source")
     osv_enabled = parse_bool(args.osv_enabled, "osv-enabled")
+    early_warning_enabled = parse_bool(
+        args.early_warning_enabled, "early-warning-enabled"
+    )
+    caller_repository = args.caller_repository or environ.get("GITHUB_REPOSITORY", "")
+    if not REPOSITORY_NAME.fullmatch(caller_repository):
+        raise ResolveError(
+            f"caller repository must be 'owner/name', got {caller_repository!r}"
+        )
+    ref_name = args.ref_name or environ.get("GITHUB_REF_NAME", "")
+    if not ref_name:
+        raise ResolveError("the branch or tag of the run is unknown (no ref name)")
     token = args.github_token or environ.get("GITHUB_TOKEN") or None
 
     http = HttpClient(transport)
@@ -870,6 +994,10 @@ def run(
         environ=environ,
         now=now,
         config_input=args.config,
+        targets_filter=args.targets,
+        early_warning_enabled=early_warning_enabled,
+        caller_repository=caller_repository,
+        ref_name=ref_name,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -881,6 +1009,8 @@ def run(
         f"({targets_doc['commit_sha']})"
     )
     print(describe_config(targets_doc["config"]))
+    reasons = "; ".join(targets_doc["run_kind_reasons"])
+    print(f"Run kind: {targets_doc['run_kind']}" + (f" ({reasons})" if reasons else ""))
     print(render_table(targets_doc["targets"]))
     for line in annotations(targets_doc["targets"]):
         print(line)

@@ -35,7 +35,9 @@ ENV = {
     "GITHUB_RUN_ID": "42",
     "GITHUB_SERVER_URL": "https://github.com",
     "GITHUB_REPOSITORY": "example/caller",
+    "GITHUB_REF_NAME": "development",
 }
+CALLER = "example/caller"
 
 
 class FakeTransport:
@@ -79,6 +81,10 @@ def github_routes(
     branch: str = "development",
 ) -> None:
     transport.add(f"{API}/repos/{REPOSITORY}", ok({"default_branch": branch}))
+    # the repository that runs the workflow, to tell a run on its default branch
+    transport.routes.setdefault(
+        f"{API}/repos/{CALLER}", ok({"default_branch": "development"})
+    )
     quoted = urllib.parse.quote(branch, safe="")
     transport.add(f"{API}/repos/{REPOSITORY}/commits/{quoted}", ok({"sha": "a" * 40}))
     # no .github/sca.yml: the defaults
@@ -130,6 +136,7 @@ def run_resolve_targets(
     scan_release_source: bool = False,
     osv_enabled: bool = False,
     token: str | None = "tkn",
+    **kwargs: Any,
 ) -> dict[str, Any]:
     http = no_sleep_http(transport)
     return rt.resolve_targets(
@@ -145,6 +152,8 @@ def run_resolve_targets(
         registry=rt.RegistryClient(http, "ghcr.io", token),
         environ=ENV,
         now=NOW,
+        caller_repository=CALLER,
+        **{"ref_name": "development", **kwargs},
     )
 
 
@@ -1285,6 +1294,8 @@ def resolve_config_of(
         registry=rt.RegistryClient(http, "ghcr.io", "tkn"),
         environ=ENV,
         now=NOW,
+        caller_repository=CALLER,
+        ref_name="development",
         config_input=config_input,
     )["config"]
 
@@ -1426,6 +1437,8 @@ def test_main_reports_an_invalid_configuration_and_writes_nothing(
     config_file_route(t, "schema_version: 7\n")
     monkeypatch.setattr(rt, "UrllibTransport", lambda: t)
     monkeypatch.setenv("GITHUB_API_URL", API)
+    monkeypatch.setenv("GITHUB_REPOSITORY", CALLER)
+    monkeypatch.setenv("GITHUB_REF_NAME", "development")
     code = rt.main(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
     assert code == 1
     out = capsys.readouterr().out

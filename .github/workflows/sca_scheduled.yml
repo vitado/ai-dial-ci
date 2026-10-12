@@ -59,6 +59,10 @@ on:
         type: boolean
         description: Scan the source code of the latest releases (git tags), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
         default: true
+      config:
+        type: string
+        description: "SCA configuration (YAML, the schema of .github/sca.yml) that is used instead of the .github/sca.yml of the scanned repository, for repositories that cannot carry the file. Empty means the file, if there is one, else the defaults"
+        default: ""
       runs-on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
@@ -72,6 +76,7 @@ jobs:
       packages: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
+      trivy-skip-paths: ${{ steps.targets.outputs.trivy-skip-paths }}
     steps:
       - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
         id: targets
@@ -84,6 +89,7 @@ jobs:
           scan-images: ${{ inputs.scan-images }}
           scan-release-source: ${{ inputs.scan-release-source }}
           osv-enabled: ${{ inputs.osv-enabled }}
+          config: ${{ inputs.config }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -191,6 +197,17 @@ jobs:
           ref: ${{ matrix.target.commit_sha }}
           persist-credentials: false
           lfs: true
+      # The skip-dirs / skip-files of the trivy.yaml of this very commit: what the SCA configuration (trivy_skip_paths)
+      # makes of them is decided here; the merge reads the record. The generated config replaces trivy.yaml only when
+      # Trivy must not skip the paths (a plain environment variable cannot clear a list the file sets)
+      - name: Prepare Trivy configuration
+        id: trivy-config
+        if: ${{ matrix.target.kind == 'fs' }}
+        uses: epam/ai-dial-ci/actions/sca_prepare_trivy_config@4.12.0
+        with:
+          mode: ${{ needs.targets.outputs.trivy-skip-paths }}
+          target-id: ${{ matrix.target.id }}
+          output-dir: ${{ runner.temp }}/sca-out/trivy
       - name: Detect Gradle build
         id: stack
         if: ${{ matrix.target.kind == 'fs' }}
@@ -232,6 +249,8 @@ jobs:
           scan-type: ${{ matrix.target.kind }}
           scan-ref: .
           image-ref: ${{ matrix.target.ref }}
+          # Empty (trivy.yaml of the repository, if any, applies as is) unless the skip paths must be scanned
+          trivy-config: ${{ steps.trivy-config.outputs.config-file }}
           format: json
           output: ${{ runner.temp }}/sca-out/trivy/${{ matrix.target.id }}.json
           # Outside the workspace, so that the cache is not scanned
@@ -251,6 +270,7 @@ jobs:
           DB_JOB_RESULT: ${{ needs.trivy-db.result }}
           SETUP_OUTCOME: ${{ steps.setup.outcome }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          TRIVY_CONFIG_OUTCOME: ${{ steps.trivy-config.outcome }}
           JAVA_OUTCOME: ${{ steps.java.outcome }}
           LOCKFILES_OUTCOME: ${{ steps.lockfiles.outcome }}
           LOGIN_OUTCOME: ${{ steps.login.outcome }}
@@ -260,7 +280,7 @@ jobs:
           out="$RUNNER_TEMP/sca-out/trivy"
           status=ok
           reason=
-          for step in "trivy db restore:$DB_OUTCOME" "trivy setup:$SETUP_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
+          for step in "trivy db restore:$DB_OUTCOME" "trivy setup:$SETUP_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "trivy configuration:$TRIVY_CONFIG_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
             outcome="${step#*:}"
             if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
               status=failed

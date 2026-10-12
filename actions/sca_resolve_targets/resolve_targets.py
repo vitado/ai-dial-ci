@@ -2,7 +2,8 @@
 """Resolve the scan targets (source snapshot + container images) of one repository.
 
 Used by the SCA scheduled scan. Talks only to the GitHub REST API and to the
-OCI distribution API of the image registry; uses the Python standard library only.
+OCI distribution API of the image registry. Besides the standard library it needs
+PyYAML, for the repository configuration (``.github/sca.yml``, see ``sca_config``).
 
 The HTTP layer is injectable: every network call goes through a ``Transport``
 (a callable ``(url, headers) -> Response``), so the logic can be tested with a
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import re
@@ -27,6 +29,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import sca_config
 
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
@@ -187,6 +191,33 @@ class GitHubClient:
                 "sha"
             ]
         )
+
+    def file_text(self, repo: str, path: str, ref: str) -> str | None:
+        """Text of a file of the repository at a commit, or None if there is none."""
+        quoted = urllib.parse.quote(path, safe="/")
+        ref_query = urllib.parse.quote(ref, safe="")
+        response = self._get(f"/repos/{repo}/contents/{quoted}?ref={ref_query}")
+        if response.status == 404:
+            return None
+        if response.status != 200:
+            raise ResolveError(
+                f"GitHub API GET contents of {path} in {repo}@{ref} "
+                f"returned HTTP {response.status}"
+            )
+        try:
+            body = response.json()
+            if (
+                not isinstance(body, dict)
+                or body.get("type") != "file"
+                or body.get("encoding") != "base64"
+            ):
+                raise ResolveError(
+                    f"{path} in {repo}@{ref} is not a regular file of up to 1 MB"
+                )
+            raw = base64.b64decode("".join(body["content"].split()), validate=True)
+            return raw.decode("utf-8-sig")
+        except (KeyError, TypeError, ValueError, binascii.Error) as err:
+            raise ResolveError(f"cannot read {path} in {repo}@{ref}: {err!r}") from err
 
     def latest_release_tag(self, repo: str) -> str | None:
         """Tag of the latest stable release, or None if the repo has none (HTTP 404)."""
@@ -602,6 +633,17 @@ def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
         seen.add(identity)
 
 
+def resolve_config(
+    github: GitHubClient, repository: str, commit_sha: str, override: str
+) -> dict[str, Any]:
+    """The SCA configuration of the run: the ``config`` input, else the
+    ``.github/sca.yml`` of the pinned commit, else the defaults.
+    """
+    text = github.file_text(repository, sca_config.CONFIG_PATH, commit_sha)
+    file_ref = None if text is None else f"{sca_config.CONFIG_PATH}@{commit_sha}"
+    return sca_config.build_config(text, file_ref, override)
+
+
 def resolve_targets(
     *,
     repository: str,
@@ -616,14 +658,17 @@ def resolve_targets(
     registry: RegistryClient,
     environ: Mapping[str, str],
     now: datetime,
+    config_input: str = "",
 ) -> dict[str, Any]:
-    """Build the targets.json document. Raises ResolveError without a snapshot.
+    """Build the targets.json document. Raises ResolveError without a snapshot and
+    ConfigError for an invalid SCA configuration.
 
     Order: the development source, the release sources (newest first), then the
     images of each image in ``images`` order.
     """
     default_branch = github.default_branch(repository)
     commit_sha = github.commit_sha(repository, default_branch)
+    config = resolve_config(github, repository, commit_sha, config_input)
 
     with_images = scan_images and bool(images)
     with_release_source = scan_source and scan_release_source
@@ -663,6 +708,7 @@ def resolve_targets(
         "repo": repository,
         "default_branch": default_branch,
         "commit_sha": commit_sha,
+        "config": config,
         "registry": registry_name,
         "release_lines": release_lines,
         "run_id": run_id,
@@ -723,6 +769,18 @@ def annotations(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     return lines
 
 
+def describe_config(config: Mapping[str, Any]) -> str:
+    """One line on where the SCA configuration came from and what it sets."""
+    source = config["source"] or "none, defaults"
+    if config["overrides"]:
+        source += f" (replaces {config['overrides']})"
+    paths = ", ".join(config[sca_config.KEY_NON_SHIPPED_PATHS]) or "none"
+    return (
+        f"Configuration: {source}; non_shipped_paths: {paths}; "
+        f"trivy_skip_paths: {config[sca_config.KEY_TRIVY_SKIP_PATHS]}"
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument(
@@ -758,6 +816,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--osv-enabled",
         default="true",
         help="true/false: add an OSV twin of every Trivy target (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--config",
+        default="",
+        help="SCA configuration (YAML) that replaces .github/sca.yml of the repository",
     )
     parser.add_argument(
         "--output-dir", required=True, type=Path, help="directory for targets.json"
@@ -806,6 +869,7 @@ def run(
         registry=registry,
         environ=environ,
         now=now,
+        config_input=args.config,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -816,6 +880,7 @@ def run(
         f"Repository {targets_doc['repo']} @ {targets_doc['default_branch']} "
         f"({targets_doc['commit_sha']})"
     )
+    print(describe_config(targets_doc["config"]))
     print(render_table(targets_doc["targets"]))
     for line in annotations(targets_doc["targets"]):
         print(line)
@@ -827,6 +892,7 @@ def run(
             "commit-sha": targets_doc["commit_sha"],
             "default-branch": targets_doc["default_branch"],
             "targets-file": str(targets_file),
+            "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
         }
         with open(output_path, "a", encoding="utf-8", newline="\n") as out:
             out.writelines(format_output(k, v) for k, v in outputs.items())
@@ -839,6 +905,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(args, UrllibTransport(), os.environ, datetime.now(UTC))
     except ResolveError as err:
         print(f"::error title=Scan target resolution failed::{err}")
+        return 1
+    except sca_config.ConfigError as err:
+        print(f"::error title=Invalid SCA configuration::{err}")
         return 1
 
 

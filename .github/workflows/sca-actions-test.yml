@@ -28,5 +28,9 @@ jobs:
           python-version: "3.12"
       - name: Install pytest
         run: python -m pip install pytest
+      # PyYAML as the actions install it: pinned, with hashes
+      - name: Install action dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r actions/sca_resolve_targets/requirements.txt
       - name: Run tests
         run: python -m pytest test/sca

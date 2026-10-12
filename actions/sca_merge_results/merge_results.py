@@ -42,6 +42,13 @@ the tag; an image has no graph) and, in a run without images, stands for the
 release in the exposure and in the headline. With images it never raises a
 finding above ``source_only``: see ``classify_exposure``.
 
+Paths that are not shipped (``non_shipped_paths`` of the SCA configuration in
+targets.json, and the ``skip-dirs`` / ``skip-files`` of a source target's trivy.yaml
+when the configuration says ``trivy_skip_paths: as_non_shipped``) do not count
+towards the release or development exposure: a finding seen only in lockfiles under
+them is ``source_only`` in every repository, and its locations are marked as not
+shipped. The record stays in ``vulnerabilities.json``.
+
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
 decides about failing the run after the artifact has been uploaded.
@@ -88,6 +95,19 @@ MERGE_KEY = (
     "scanners; a vulnerability only OSV knows is keyed by its OSV id when it has no CVE"
 )
 TARGET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# SCA configuration of the run (``config`` of targets.json), see sca_config.py of
+# the sca_resolve_targets action
+KEY_NON_SHIPPED_PATHS = "non_shipped_paths"
+KEY_TRIVY_SKIP_PATHS = "trivy_skip_paths"
+SKIP_AS_NON_SHIPPED = "as_non_shipped"
+SKIP_APPLY = "apply"
+SKIP_IGNORE = "ignore"
+SKIP_MODES = (SKIP_AS_NON_SHIPPED, SKIP_APPLY, SKIP_IGNORE)
+TRIVY_CONFIG_SUFFIX = ".trivy-config.json"  # <id>.trivy-config.json of an fs target
+TRIVY_CONFIG_SCHEMA_VERSION = 1
+NOT_SHIPPED_MARK = "(not shipped)"
+MAX_LISTED_SKIPS = 5
 
 GRADLE_RESULT_TYPE = "gradle"
 GRADLE_GRAPH_SUFFIX = ".gradle-graph"  # <id>.gradle-graph/ next to <id>.json
@@ -221,7 +241,55 @@ def load_targets_file(path: Path) -> dict[str, Any]:
                 f"targets file {path} has a duplicate {scanner} target id: {tid}"
             )
         seen.add((scanner, tid))
+    data["config"] = validate_config(data.get("config"), path)
     return data
+
+
+def validate_config(raw: Any, path: Path) -> dict[str, Any]:
+    """The SCA configuration of targets.json (the defaults if it has none)."""
+    config = default_config()
+    if raw is None:
+        return config
+    where = f"targets file {path}: invalid config"
+    if not isinstance(raw, dict):
+        raise InputError(f"{where}: not an object")
+    patterns = raw.get(KEY_NON_SHIPPED_PATHS, [])
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise InputError(f"{where}: {KEY_NON_SHIPPED_PATHS} must be a list of strings")
+    mode = raw.get(KEY_TRIVY_SKIP_PATHS, SKIP_AS_NON_SHIPPED)
+    if mode not in SKIP_MODES:
+        raise InputError(
+            f"{where}: {KEY_TRIVY_SKIP_PATHS} {mode!r} is not one of the modes"
+        )
+    for key in ("source", "overrides"):
+        if not isinstance(raw.get(key), str | None):
+            raise InputError(f"{where}: {key} must be a string or null")
+        config[key] = raw.get(key)
+    config.update({KEY_NON_SHIPPED_PATHS: list(patterns), KEY_TRIVY_SKIP_PATHS: mode})
+    return config
+
+
+def load_trivy_config_record(path: Path) -> dict[str, Any]:
+    """The ``<id>.trivy-config.json`` of a source target (written by the
+    sca_prepare_trivy_config action); raises OSError or ValueError if unusable.
+    """
+    record = read_json(path)
+    if not isinstance(record, dict):
+        raise ValueError("not a JSON object")
+    if record.get("schema_version") != TRIVY_CONFIG_SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema_version {record.get('schema_version')!r}")
+    if record.get("mode") not in SKIP_MODES:
+        raise ValueError(f"invalid mode {record.get('mode')!r}")
+    for key in ("skip_dirs", "skip_files"):
+        value = record.get(key)
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError(f"{key} must be a list of strings")
+    if not isinstance(record.get("paths_scanned"), bool):
+        raise ValueError("paths_scanned must be a boolean")
+    return {
+        key: record.get(key)
+        for key in ("mode", "paths_scanned", "config_file", "skip_dirs", "skip_files")
+    }
 
 
 def load_target_result(
@@ -1749,6 +1817,189 @@ def new_osv_record(
     return record
 
 
+# ---- Not shipped paths
+
+
+def default_config() -> dict[str, Any]:
+    """The SCA configuration of a run without one (as in sca_config.py)."""
+    return {
+        "source": None,
+        "overrides": None,
+        KEY_NON_SHIPPED_PATHS: [],
+        KEY_TRIVY_SKIP_PATHS: SKIP_AS_NON_SHIPPED,
+    }
+
+
+def split_path_pattern(pattern: str) -> list[str]:
+    """Split a glob on ``/`` outside braces."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(pattern):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(depth - 1, 0)
+        elif char == "/" and depth == 0:
+            parts.append(pattern[start:index])
+            start = index + 1
+    parts.append(pattern[start:])
+    return parts
+
+
+def matching_brace(text: str, start: int) -> int:
+    """Index of the ``}`` that closes the ``{`` at ``start``, -1 if there is none."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def split_alternatives(text: str) -> list[str]:
+    """Split the inside of ``{...}`` on the commas that are not in a nested ``{}``."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
+
+
+def glob_regex(text: str) -> str:
+    r"""Regex of a glob without ``**``: ``*`` and ``?`` stay within a path segment,
+    ``[abc]`` / ``[!abc]`` are character classes, ``{a,b}`` alternatives and ``\``
+    escapes the next character.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "[" and (end := text.find("]", index + 2)) != -1:
+            body = text[index + 1 : end]
+            negate = body[:1] in ("!", "^")
+            body = re.sub(r"([\\\[\]^])", r"\\\1", body[1:] if negate else body)
+            out.append(f"[^/{body}]" if negate else f"[{body}]")
+            index = end
+        elif char == "{" and (end := matching_brace(text, index)) != -1:
+            alternatives = split_alternatives(text[index + 1 : end])
+            out.append("(?:" + "|".join(glob_regex(a) for a in alternatives) + ")")
+            index = end
+        elif char == "\\" and index + 1 < len(text):
+            index += 1
+            out.append(re.escape(text[index]))
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+def path_regex(pattern: str) -> re.Pattern[str]:
+    """Regex of a ``/``-separated glob: a segment that is exactly ``**`` matches
+    zero or more segments (a trailing ``/**`` also the directory itself).
+    """
+    segments: list[str] = []
+    for segment in split_path_pattern(pattern):
+        if not (segment == "**" and segments and segments[-1] == "**"):
+            segments.append(segment)
+    pieces: list[str] = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            pieces.append(".*" if last else "(?:[^/]+/)*")
+        else:
+            pieces.append(glob_regex(segment) + ("" if last else "/"))
+    if segments[-1] == "**" and len(segments) > 1:
+        # "a/" + ".*" is "a(?:/.*)?": the directory itself matches, too
+        pieces[-2] = pieces[-2].removesuffix("/")
+        pieces[-1] = "(?:/.*)?"
+    return re.compile("".join(pieces))
+
+
+def repository_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Regex of a ``non_shipped_paths`` pattern (validated by sca_config.py of the
+    sca_resolve_targets action): anchored at the repository root; a trailing ``/``
+    makes it a directory, matching every file below it.
+    """
+    if pattern.endswith("/"):
+        return re.compile(path_regex(pattern.removesuffix("/")).pattern + "/.+")
+    return path_regex(pattern)
+
+
+def trivy_glob_regex(pattern: str) -> re.Pattern[str] | None:
+    """Regex of a ``skip-dirs`` / ``skip-files`` entry as Trivy matches it (doublestar
+    against the path relative to the scan root, after ``posixpath.normpath``: a
+    trailing ``/`` and a leading ``./`` do not count). None for an absolute entry,
+    which never matches a relative path.
+    """
+    normalized = posixpath.normpath(pattern) if pattern else "."
+    if normalized.startswith("/"):
+        return None
+    return path_regex(normalized)
+
+
+def trivy_skips_path(
+    path: str, dirs: Sequence[re.Pattern[str]], files: Sequence[re.Pattern[str]]
+) -> bool:
+    """Whether Trivy would have skipped a file: a directory above it (or the scan
+    root, ``.``) matches a ``skip-dirs`` entry, or the file a ``skip-files`` one.
+    """
+    parts = path.split("/")
+    ancestors = [".", *("/".join(parts[:n]) for n in range(1, len(parts)))]
+    return any(rx.fullmatch(a) for rx in dirs for a in ancestors) or any(
+        rx.fullmatch(path) for rx in files
+    )
+
+
+class NotShipped:
+    """Which locations of which targets are not part of what the repository ships:
+    the ``non_shipped_paths`` of the configuration (all fs targets) and, per target,
+    the skip paths of its trivy.yaml that were scanned anyway (``as_non_shipped``).
+    """
+
+    def __init__(
+        self,
+        patterns: Iterable[str] = (),
+        trivy_configs: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.patterns = list(patterns)
+        self._patterns = [repository_pattern_regex(p) for p in self.patterns]
+        self._skips: dict[str, tuple[list[re.Pattern[str]], list[re.Pattern[str]]]] = {}
+        for tid, config in (trivy_configs or {}).items():
+            if config["mode"] != SKIP_AS_NON_SHIPPED:
+                continue
+            dirs = [rx for d in config["skip_dirs"] if (rx := trivy_glob_regex(d))]
+            files = [rx for f in config["skip_files"] if (rx := trivy_glob_regex(f))]
+            if dirs or files:
+                self._skips[tid] = (dirs, files)
+
+    def __bool__(self) -> bool:
+        return bool(self._patterns or self._skips)
+
+    def matches(self, tid: str, location: str) -> bool:
+        """Whether a location (a trivy ``Target``) of a target is not shipped."""
+        path = location.removeprefix("./")
+        if any(rx.fullmatch(path) for rx in self._patterns):
+            return True
+        skips = self._skips.get(tid)
+        return skips is not None and trivy_skips_path(path, *skips)
+
+
 # ---- Exposure
 
 
@@ -1781,8 +2032,12 @@ def classify_exposure(classes: Collection[str], has_images: bool) -> str:
 
     Without images (e.g. a Python package) the sources are the subject: a finding
     in the source of a release tag is a release one, in the source of the default
-    branch a development one.
+    branch a development one. A finding with no class at all, because every sighting
+    of it is in a not shipped location (see ``assign_exposure``), is ``source_only``
+    in either case.
     """
+    if not classes:
+        return EXPOSURE_SOURCE_ONLY
     if has_images:
         if not classes & {CLASS_RELEASE, CLASS_DEVELOPMENT}:
             return EXPOSURE_SOURCE_ONLY
@@ -1798,11 +2053,31 @@ def classify_exposure(classes: Collection[str], has_images: bool) -> str:
     return EXPOSURE_DEVELOPMENT_ONLY
 
 
-def assign_exposure(records: Iterable[Record], targets: Sequence[Target]) -> None:
+def assign_exposure(
+    records: Iterable[Record],
+    targets: Sequence[Target],
+    sightings: Sightings | None = None,
+    not_shipped: NotShipped | None = None,
+) -> None:
+    """Set the exposure of the records. A target whose every sighting of a record is
+    in a not shipped location (``not_shipped``; sources only, never an image) says
+    nothing about what the record is exposed to, so it adds no class.
+    """
     by_id = {t["id"]: t for t in targets}
     has_images = any(t.get("kind") == KIND_IMAGE for t in targets)
     for record in records:
-        classes = {target_class(by_id[tid]) for tid in record["scan_targets"]}
+        seen = (sightings or {}).get(record_identity(record), {})
+        classes = set()
+        for tid in record["scan_targets"]:
+            target = by_id[tid]
+            if (
+                not_shipped
+                and target.get("kind") == KIND_FS
+                and seen.get(tid)
+                and all(not_shipped.matches(tid, loc) for loc in seen[tid])
+            ):
+                continue
+            classes.add(target_class(target))
         classes.discard(None)
         record["exposure"] = classify_exposure(classes, has_images)  # type: ignore[arg-type]
 
@@ -1856,10 +2131,12 @@ def finalize_records(
     records: Iterable[Record],
     targets: Sequence[Target],
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+    sightings: Sightings | None = None,
+    not_shipped: NotShipped | None = None,
 ) -> list[Record]:
     """Enrich the merged records (exposure, upgrade_to) and put them in report order."""
     records = list(records)
-    assign_exposure(records, targets)
+    assign_exposure(records, targets, sightings, not_shipped)
     assign_upgrades(records, in_place)
     return sorted(records, key=record_sort_key)
 
@@ -1968,12 +2245,16 @@ def build_scan_report(
     records: Sequence[Record],
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
+    trivy_configs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
     osv_api_url = None
     targets: list[dict[str, Any]] = []
     for target, state, native in results:
         entry = build_target_entry(target, state, native)
+        if target["scanner"] == SCANNER_TRIVY and target["id"] in (trivy_configs or {}):
+            # What trivy.yaml of the scanned commit says to skip, and what was done
+            entry["trivy_skip_paths"] = dict((trivy_configs or {})[target["id"]])
         if native is not None:
             if entry["packages_scanned"] == 0:
                 print(
@@ -2002,6 +2283,7 @@ def build_scan_report(
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
         "osv": {"api_url": osv_api_url} if has_osv else None,
+        "config": targets_doc.get("config") or default_config(),
         "totals": build_totals(targets, records),
         "targets": targets,
     }
@@ -2196,6 +2478,25 @@ def record_identity(record: Mapping[str, Any]) -> tuple[Any, Any, Any]:
     return (record["cve"], record["pkg"], record["version"])
 
 
+def report_not_shipped(report: Mapping[str, Any]) -> NotShipped:
+    """The not shipped locations of a run, from its scan_report.json."""
+    config = report.get("config") or default_config()
+    configs = {
+        t["id"]: t["trivy_skip_paths"]
+        for t in report["targets"]
+        if t.get("trivy_skip_paths")
+    }
+    return NotShipped(config[KEY_NON_SHIPPED_PATHS], configs)
+
+
+def source_only_what(report: Mapping[str, Any]) -> str:
+    """What a ``source_only`` finding is in: build / test dependencies, and, if the
+    run knows not shipped paths, those paths.
+    """
+    base = "build / test dependencies"
+    return f"{base} or not shipped paths" if report_not_shipped(report) else base
+
+
 def verdict_text(
     report: Mapping[str, Any],
     records: Sequence[Record],
@@ -2266,7 +2567,7 @@ def verdict_text(
         text = f"Nothing to upgrade — {severity_phrase(unfixed)} without a fix"
         text += f"{where} — see watch" if top_unfixed else ", see watch"
         if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
-            text += f" · {only_sources} only in build / test dependencies"
+            text += f" · {only_sources} only in {source_only_what(report)}"
         return text
     if not clauses:
         names = [*release_subjects(targets)]
@@ -2276,7 +2577,7 @@ def verdict_text(
             f"No known vulnerabilities in {join_names(names) or 'the scanned targets'}"
         )
         if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
-            text += f" — {only_sources} only in build / test dependencies"
+            text += f" — {only_sources} only in {source_only_what(report)}"
         return text
     # The first action is a sentence, the others follow in a second: "…; fix …"
     rest = "; ".join(c[0].lower() + c[1:] for c in clauses[2:])
@@ -2322,7 +2623,10 @@ def scope_table(report: Mapping[str, Any], records: Sequence[Record]) -> list[st
         found = [r for r in records if r["exposure"] in in_development]
         scopes.append((DEVELOPMENT_TAG, found, True))
     found = [r for r in records if r["exposure"] == EXPOSURE_SOURCE_ONLY]
-    scopes.append(("Source only (build / test)", found, False))
+    label = (
+        "build / test / not shipped" if report_not_shipped(report) else "build / test"
+    )
+    scopes.append((f"Source only ({label})", found, False))
     scopes = [scope for scope in scopes if scope[1]]
     if not scopes:
         return []
@@ -2608,7 +2912,11 @@ def exposure_label(
     if exposure == EXPOSURE_RELEASE_ONLY:
         return f"Released {released} only"
     if exposure == EXPOSURE_SOURCE_ONLY:
-        return "Source only · dev dependency" if dev else "Source only · not in images"
+        if dev:
+            return "Source only · dev dependency"
+        return (
+            "Source only · not in images" if has_images else "Source only · not shipped"
+        )
     return "development only" if has_images else "development (source)"
 
 
@@ -2627,6 +2935,7 @@ def action_text(
     via: str = "",
     open_in_development: bool = True,
     base_image: bool = False,
+    has_images: bool = True,
 ) -> str:
     """What to do, verb first; ``via`` is the dependency chain to upgrade through.
 
@@ -2652,7 +2961,11 @@ def action_text(
     if exposure == EXPOSURE_RELEASE_ONLY:
         return f"Release a patch from {lines} (already fixed in development){via_text}"
     if exposure == EXPOSURE_SOURCE_ONLY:
-        note = "dev dependency, not shipped" if dev else "not in published images"
+        note = (
+            "dev dependency, not shipped"
+            if dev
+            else ("not in published images" if has_images else "not shipped")
+        )
         if not open_in_development:
             return f"Already fixed in development — {note}"
         return f"Upgrade in development{via_text} — {note}"
@@ -2663,9 +2976,11 @@ def where_cell(
     group: Sequence[Record],
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None = None,
 ) -> str:
     """Where a group was found: tags per image, then the lockfiles of the source
-    of the default branch and of each release tag.
+    of the default branch and of each release tag; a lockfile in a not shipped
+    location is marked ``(not shipped)``.
 
     ``statgpt-chat :development, :0.17.7 · statgpt-admin :development · source
     poetry.lock · source @ 0.17.7 poetry.lock``; a run with one image calls it
@@ -2681,7 +2996,12 @@ def where_cell(
                 continue
             if target.get("kind") == KIND_FS:
                 name = f"source @ {target['tag']}" if target.get("tag") else "source"
-                sources.setdefault(name, []).extend(seen[target["id"]])
+                sources.setdefault(name, []).extend(
+                    f"{loc} {NOT_SHIPPED_MARK}"
+                    if not_shipped and not_shipped.matches(target["id"], loc)
+                    else loc
+                    for loc in seen[target["id"]]
+                )
             else:
                 name = image_short_name(target) if several else "image"
                 _append_unique(tags.setdefault(name, []), f":{target.get('tag')}")
@@ -2737,6 +3057,7 @@ def package_fix_row(
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+    not_shipped: NotShipped | None = None,
 ) -> list[Any]:
     """A package version with a fixable CVE: what resolves it, and what to do."""
     fixable = [r for r in group if r["fix_available"]]
@@ -2753,6 +3074,7 @@ def package_fix_row(
             else "",
             found_in_default_source(group, targets),
             base_image,
+            any(t.get("kind") == KIND_IMAGE for t in targets),
         )
     return [
         package_cell(group),
@@ -2760,7 +3082,7 @@ def package_fix_row(
         resolves_cell(group),
         group_exposure_label(group, targets),
         action,
-        where_cell(fixable, sightings, targets),
+        where_cell(fixable, sightings, targets, not_shipped),
     ]
 
 
@@ -2769,6 +3091,7 @@ def base_image_row(
     group: Sequence[Record],
     sightings: Sightings,
     targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None = None,
 ) -> list[Any]:
     """The OS packages of one exposure and base image line that a rebuild fixes."""
     packages = len({(r["pkg"], r["version"]) for r in group})
@@ -2785,7 +3108,7 @@ def base_image_row(
             release_tags_of(group, targets),
             base_image=True,
         ),
-        where_cell(group, sightings, targets),
+        where_cell(group, sightings, targets, not_shipped),
     ]
 
 
@@ -2795,6 +3118,7 @@ def render_what_to_fix(
     targets: Sequence[Mapping[str, Any]],
     base_os: Mapping[str, str] | None = None,
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
+    not_shipped: NotShipped | None = None,
 ) -> list[str]:
     """Packages with at least one CVE an upgrade resolves; empty if there are none.
 
@@ -2809,10 +3133,17 @@ def render_what_to_fix(
     for group in group_fixes(dependencies):
         if any(r["fix_available"] for r in group):
             key = urgency_key(group, group[0]["pkg"] or "", group[0]["version"] or "")
-            rows.append((key, package_fix_row(group, sightings, targets, in_place)))
+            rows.append(
+                (
+                    key,
+                    package_fix_row(group, sightings, targets, in_place, not_shipped),
+                )
+            )
     for label, group in base_image_groups(os_records, base_os):
         key = urgency_key(group, label, "")
-        rows.append((key, base_image_row(label, group, sightings, targets)))
+        rows.append(
+            (key, base_image_row(label, group, sightings, targets, not_shipped))
+        )
     if not rows:
         return []
     rows.sort(key=lambda row: row[0])
@@ -2823,7 +3154,7 @@ def render_what_to_fix(
     )
     lines = ["## What to fix", "", *table]
     packages = [
-        package_fix_row(group, sightings, targets, in_place)
+        package_fix_row(group, sightings, targets, in_place, not_shipped)
         for group in group_fixes(r for r in records if is_base_image(r))
         if any(r["fix_available"] for r in group)
     ]
@@ -3059,6 +3390,24 @@ def trivy_findings_text(findings: Mapping[str, Any]) -> str:
     return f"{text} · {unknown} UNKNOWN" if unknown else text
 
 
+def skip_paths_note(target: Mapping[str, Any] | None) -> str | None:
+    """What was done with the skip-dirs / skip-files of the trivy.yaml of a source
+    target, None if it lists none.
+    """
+    skip = (target or {}).get("trivy_skip_paths")
+    paths = [*skip["skip_dirs"], *skip["skip_files"]] if skip else []
+    if not paths:
+        return None
+    shown = ", ".join(paths[:MAX_LISTED_SKIPS])
+    if len(paths) > MAX_LISTED_SKIPS:
+        shown += f" +{len(paths) - MAX_LISTED_SKIPS} more"
+    return {
+        SKIP_APPLY: f"trivy.yaml skip paths skipped by Trivy: {shown}",
+        SKIP_AS_NON_SHIPPED: f"trivy.yaml skip paths scanned, not shipped: {shown}",
+        SKIP_IGNORE: f"trivy.yaml skip paths scanned: {shown}",
+    }[skip["mode"]]
+
+
 def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     """One row per scanned subject (the id Trivy and OSV share), a cell per scanner."""
     several = has_several_images(targets)
@@ -3078,7 +3427,15 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
                 target_label(trivy or osv, several),  # type: ignore[arg-type]
                 scan_cell(trivy, trivy_findings_text),
                 *([scan_cell(osv, lambda f: str(f["total"]))] if with_osv else []),
-                "no packages seen" if empty else None,
+                "; ".join(
+                    note
+                    for note in (
+                        "no packages seen" if empty else None,
+                        skip_paths_note(trivy),
+                    )
+                    if note
+                )
+                or None,
             ]
         )
     header = ["Target", "Trivy", *(["OSV"] if with_osv else []), "Note"]
@@ -3090,6 +3447,30 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
         )
     body = [f"<sub>{legend}</sub>", "", *md_table(header, rows)]
     return ["", *md_details("Scan coverage", body)]
+
+
+def config_text(config: Mapping[str, Any] | None) -> str | None:
+    """Where the SCA configuration of the run came from and what it sets; None if
+    the run has none.
+    """
+    if not config or not config.get("source"):
+        return None
+
+    def short(ref: str) -> str:
+        path, _, sha = ref.partition("@")
+        return f"{path}@{sha[:SHORT_SHA_LENGTH]}" if sha else ref
+
+    if config["source"] == "input":
+        text = "Configuration: workflow input"
+        if config.get("overrides"):
+            text += f" (replaces {short(config['overrides'])})"
+    else:
+        text = f"Configuration: {short(config['source'])}"
+    if config[KEY_NON_SHIPPED_PATHS]:
+        text += f" · not shipped: {', '.join(config[KEY_NON_SHIPPED_PATHS])}"
+    if config[KEY_TRIVY_SKIP_PATHS] != SKIP_AS_NON_SHIPPED:
+        text += f" · trivy_skip_paths: {config[KEY_TRIVY_SKIP_PATHS]}"
+    return text
 
 
 def render_footer(report: Mapping[str, Any]) -> list[str]:
@@ -3115,6 +3496,8 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
     if generated:
         parts.append(f"generated {generated}")
     lines = ["", f"<sub>{' · '.join(parts)}</sub>"]
+    if text := config_text(report.get("config")):
+        lines += ["", f"<sub>{text}</sub>"]
     if report.get("osv"):
         queried = [t["queried_at"] for t in report["targets"] if t["queried_at"]]
         queried_at = format_timestamp(max(queried)) if queried else None
@@ -3137,11 +3520,12 @@ def build_summary_md(
     targets = report["targets"]
     # The findings sections are about the records, so about the Trivy targets only
     record_targets = trivy_targets(targets)
+    not_shipped = report_not_shipped(report)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
     lines += render_headline(headline_blocks(report, records, in_place))
     if records:
         fixes = render_what_to_fix(
-            records, sightings, record_targets, base_os, in_place
+            records, sightings, record_targets, base_os, in_place, not_shipped
         )
         lines += ["", *fixes] if fixes else []
         lines += render_watch(records, record_targets)
@@ -3213,6 +3597,7 @@ def run_merge(
     (output_dir / "_native" / SCANNER_TRIVY).mkdir(parents=True, exist_ok=True)
 
     results = []
+    trivy_configs: dict[str, dict[str, Any]] = {}
     for target in targets_doc["targets"]:
         scanner = target["scanner"]
         # Parts are namespaced by scanner: <parts-dir>/<scanner>/<id>.*
@@ -3220,6 +3605,21 @@ def run_merge(
         native_dir.mkdir(parents=True, exist_ok=True)
         scanner_parts_dir = parts_dir / scanner
         state, native = load_target_result(target, scanner_parts_dir)
+        if (
+            native is not None
+            and scanner == SCANNER_TRIVY
+            and target.get("kind") == KIND_FS
+        ):
+            record_path = scanner_parts_dir / f"{target['id']}{TRIVY_CONFIG_SUFFIX}"
+            if record_path.is_file():
+                try:
+                    trivy_configs[target["id"]] = load_trivy_config_record(record_path)
+                except (OSError, ValueError) as e:
+                    state.update(
+                        status=STATUS_FAILED,
+                        reason=f"unreadable trivy config record: {e}",
+                    )
+                    native = None
         if (
             native is not None
             and scanner == SCANNER_TRIVY
@@ -3244,9 +3644,12 @@ def run_merge(
     repo = targets_doc.get("repo")
     image_ids = {t["id"] for t in trivy_only if t.get("kind") == KIND_IMAGE}
     merged, sightings, in_place = merge_records(repo, ok_scans, image_ids, osv_scans)
-    records = finalize_records(merged, trivy_only, in_place)
+    not_shipped = NotShipped(
+        targets_doc["config"][KEY_NON_SHIPPED_PATHS], trivy_configs
+    )
+    records = finalize_records(merged, trivy_only, in_place, sightings, not_shipped)
     scan_report = build_scan_report(
-        targets_doc, results, records, generated_utc, trivy_db
+        targets_doc, results, records, generated_utc, trivy_db, trivy_configs
     )
     vulns = build_vulnerabilities(repo, generated_utc, records)
 

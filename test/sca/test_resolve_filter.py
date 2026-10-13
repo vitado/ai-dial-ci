@@ -154,6 +154,7 @@ def test_a_default_run_on_the_default_branch_is_full() -> None:
         ({"scan_images": False}, "scan-images is off"),
         ({"scan_release_source": False}, "scan-release-source is off"),
         ({"osv_enabled": False}, "osv-enabled is off"),
+        ({"early_warning_enabled": False}, "early-warning-enabled is off"),
         (
             {"ref_name": "feature/x"},
             "not the default branch (feature/x, the default is development)",
@@ -172,11 +173,12 @@ def test_every_narrowing_is_listed() -> None:
         scan_images=False,
         scan_release_source=False,
         osv_enabled=False,
+        early_warning_enabled=False,
         ref_name="main",
         targets_filter="source-development",
     )
     assert kind == "partial"
-    assert len(reasons) == 5
+    assert len(reasons) == 6
 
 
 def test_the_default_branch_is_the_one_of_the_calling_repository() -> None:
@@ -201,13 +203,17 @@ def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
         tmp_path,
         IMAGES="example/x",
         TARGETS="x-development",
+        EARLY_WARNING_ENABLED="false",
     )
     assert rt.run(env, t, NOW) == 0
     doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in doc["targets"]] == ["x-development", "x-development"]
     assert [x["scanner"] for x in doc["targets"]] == ["trivy", "osv"]
     assert doc["run_kind"] == "partial"
-    assert doc["run_kind_reasons"] == ["targets filter: x-development"]
+    assert doc["run_kind_reasons"] == [
+        "targets filter: x-development",
+        "early-warning-enabled is off",
+    ]
 
 
 def test_caller_and_ref_come_from_the_environment(tmp_path: Path) -> None:

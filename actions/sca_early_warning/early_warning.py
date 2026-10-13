@@ -1,0 +1,1334 @@
+#!/usr/bin/env python3
+"""Early warning of the SCA scheduled scan: CVE records that vulnerability
+databases do not map to packages yet.
+
+A CVE record (cvelistV5, published by the CVE Numbering Authority, CNA) names the
+affected product, its repository or package and the affected versions. Trivy and
+OSV need a database that maps the CVE to a package (GHSA, distribution trackers,
+Go/PyPA/RustSec advisories); until it does, they cannot report it. This script
+matches the CNA data of recent records directly with the language packages found
+by Trivy in the run, and reports the matches that no scanner of the run knows. It
+is an informational signal, not a finding: the merge drops an early warning as soon
+as a record of the run has its CVE id or an alias, so a CVE that a database maps
+disappears from the radar by construction (see sca_merge_results).
+
+Inputs:
+  * targets.json written by sca_resolve_targets;
+  * a parts directory with the ``trivy/`` parts (``<id>.json`` and
+    ``<id>.status.json`` of every Trivy target): the package inventory;
+  * the central CVE index (see sca_build_cve_index), an OCI artifact pulled with
+    ORAS (``--cve-index``), or a directory that holds one (``--index-dir``, for
+    tests and for running the script by hand with no registry): the CVE records of
+    the last 180 days. The deltas of the cvelistV5
+    releases since the index was built are applied to its records, with the code of
+    the builder (the ``end_of_day`` delta of each past day, the hourly deltas of
+    today, the delta log for what they lack), so the records are hours old and not
+    a day. There is no other source of records: no index, no early warning;
+  * the source repository of each package, from deps.dev (API v3).
+
+Outputs (``<output-dir>/early-warning/``):
+  * ``status.json`` - ``{status, reason, window_days, records_scanned,
+    candidates, index, diagnostics}``; status is ``ok``, ``failed`` or ``skipped``;
+    ``index`` is ``{ref, digest, built_at, gaps, stale}`` (``gaps``: the hours of
+    the window for which the feed had no delta, the index's and those of the deltas
+    applied since; ``stale``: the index was built more than ``INDEX_STALE_DAYS``
+    days ago, which the builder's daily run should not allow: the early warning
+    goes on, from an older index plus the deltas, and says so), or null if no index
+    was read; ``diagnostics.index_records_skipped`` counts the records of an unknown
+    shape that the catch-up with the deltas left out;
+  * ``candidates.json`` (``ok`` only) - ``{schema_version, generated_utc,
+    generated_from, candidates[]}``; a candidate is one CVE for one package
+    version, with the CNA data it was matched by, how it was matched (``match``) and
+    where the package was seen.
+
+Matching (the narrow form recommended by the study of the CVE feed; only npm, PyPI,
+Maven and Cargo packages, OS packages are out of scope like in OSV):
+
+  package_name  ``affected[].packageName`` equals the package name
+      (``collectionURL`` names the registry: a foreign registry or a repository of
+      the entry that differs from the package's one rejects the match);
+  source_repo  ``affected[].repo`` equals the source repository of the package AND
+      the entry is about this artifact (``packageName`` or ``product`` agrees with
+      the artifact; a repository of many artifacts must not match them all);
+  product_name  the entry has neither ``packageName`` nor ``repo``: ``product`` is
+      the artifact, ``vendor`` is the repository owner (or the artifact), a
+      reference of the CVE points at the repository of the package and, for a
+      scoped npm package, the scope is the vendor or owner;
+  repo_module  ``product`` is the repository (and not the artifact) and the CVE
+      text names the artifact itself.
+
+``match`` says how the candidate was matched, not how likely it is right: there is
+no threshold on it. When several entries match, the first of these is kept.
+
+The affected versions are checked with the version scheme of the package
+ecosystem. A version that cannot be parsed or compared never makes a match
+(precision over recall); these are counted in the diagnostics.
+
+A failure of the index, of the deltas or of deps.dev is not a failure of the scan:
+the status is ``failed`` with a reason and the script exits 0 (the report says
+"Early warning unavailable"). Only an unusable input exits non-zero.
+
+The HTTP layer of deps.dev is injectable: every request goes through a ``Transport``
+(a callable ``(method, url, headers, body) -> Response``), the downloads of the
+deltas through the ``Downloader`` of ``_sca_lib.cve_index`` and the ORAS call through a
+``subprocess.run``-like runner, so the logic can be tested with fakes and no
+network. Python standard library only (and the ``oras`` command).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from functools import cmp_to_key
+from pathlib import Path
+from typing import Any
+
+from _sca_lib.cve_index import (
+    FEED_URL,
+    SEVERITIES,
+    SEVERITY_ORDER,
+    STATE_PUBLISHED,
+    Feed,
+    FeedClient,
+    IndexBuildError,
+    UrllibDownloader,
+    apply_deltas,
+    gap_ranges,
+    gaps_of,
+    read_previous,
+    reconcile,
+    select_severity,
+)
+from _sca_lib.gha import escape_command_data
+from _sca_lib.http import HttpClient, Transport, TransportError, UrllibTransport
+from _sca_lib.jsonio import InputError, dump_json, load_targets_list, read_json
+from _sca_lib.purl import parse_purl as purl_parts
+from _sca_lib.times import format_time, parse_time
+from _sca_lib.versions import compare_versions
+
+ORAS_TIMEOUT_SECONDS = 300
+DEPSDEV_URL = "https://api.deps.dev"
+USER_AGENT = "ai-dial-ci-sca-early-warning"
+
+SCANNER_TRIVY = "trivy"
+STATUS_PENDING = "pending"
+STATUS_OK = "ok"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
+CLASS_LANGUAGE_PACKAGES = "lang-pkgs"
+SCHEMA_VERSION = 1
+PART_DIR = "early-warning"
+
+HTTP_OK = 200
+HTTP_NOT_FOUND = 404
+DEPSDEV_WORKERS = 4
+# deps.dev is considered unavailable after this many failed requests in a row
+DEPSDEV_BREAKER = 10
+# Versions of a package tried (newest first) until deps.dev knows one of them
+DEPSDEV_VERSION_TRIES = 3
+
+ECOSYSTEMS = ("npm", "pypi", "maven", "cargo")
+MAX_LOCATIONS = 50
+
+MATCH_PACKAGE_NAME = "package_name"
+MATCH_SOURCE_REPO = "source_repo"
+MATCH_PRODUCT_NAME = "product_name"
+MATCH_REPO_MODULE = "repo_module"
+MATCH_PRIORITY = {
+    MATCH_PACKAGE_NAME: 0,
+    MATCH_SOURCE_REPO: 1,
+    MATCH_PRODUCT_NAME: 2,
+    MATCH_REPO_MODULE: 3,
+}
+
+_GHSA_RE = re.compile(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}", re.IGNORECASE)
+
+
+class IndexUnavailable(Exception):
+    """The CVE index cannot be pulled, read or brought up to date."""
+
+
+class DepsDevError(Exception):
+    """A deps.dev request that cannot be completed."""
+
+
+class DepsDevUnavailable(Exception):
+    """deps.dev fails persistently: the repositories of the packages are unknown."""
+
+
+# --------------------------------------------------------------------------
+# Affected versions of a CNA entry
+# --------------------------------------------------------------------------
+
+STATUS_AFFECTED = "affected"
+STATUS_NOT_AFFECTED = "not_affected"
+STATUS_UNKNOWN = "unknown"
+STATUS_ALL = "affected_all"  # no versions listed, the default status is affected
+
+_WILDCARDS = frozenset({"*", "unspecified", "n/a", "unknown", ""})
+_FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_COMPARISON_RE = re.compile(r"^\s*(?:(\S+)\s*(<=?)\s*(\S+)|(<=?|>=?|=)\s*(\S+))\s*$")
+_OPERATOR_CHARS_RE = re.compile(r"[<>=;,]")
+UNSUPPORTED_VERSION_TYPES = frozenset({"git", "rpm", "deb", "apk"})
+
+
+def _is_wildcard(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in _WILDCARDS
+
+
+def _free_text_affects(ecosystem: str, version: str, text: str) -> bool | None:
+    """Free text of the GitHub CNA style: ``< 2.14.0``, ``>= 1.0, < 1.5``,
+    ``7.0.0 < 7.24.0; < 6.24.0`` (``;`` is OR, ``,`` is AND).
+    """
+    alternatives = []
+    for alternative in text.split(";"):
+        holds = True
+        for part in alternative.split(","):
+            match = _COMPARISON_RE.match(part)
+            if not match:
+                return None
+            if match.group(2):
+                low, op, high = match.group(1), match.group(2), match.group(3)
+                above = compare_versions(ecosystem, version, low)
+                below = compare_versions(ecosystem, version, high)
+                if above is None or below is None:
+                    return None
+                holds = (
+                    holds and above >= 0 and (below < 0 if op == "<" else below <= 0)
+                )
+            else:
+                op, other = match.group(4), match.group(5)
+                result = compare_versions(ecosystem, version, other)
+                if result is None:
+                    return None
+                holds = (
+                    holds
+                    and {
+                        "<": result < 0,
+                        "<=": result <= 0,
+                        ">": result > 0,
+                        ">=": result >= 0,
+                        "=": result == 0,
+                    }[op]
+                )
+        alternatives.append(holds)
+    return any(alternatives)
+
+
+def _in_range(ecosystem: str, version: str, item: Mapping[str, Any]) -> bool | None:
+    """Whether the version lies in the range of one ``versions[]`` item; None if it
+    cannot be told.
+    """
+    low, less, less_equal = (
+        item.get("version"),
+        item.get("lessThan"),
+        item.get("lessThanOrEqual"),
+    )
+    if (
+        _OPERATOR_CHARS_RE.search(str(low or ""))
+        and less is None
+        and less_equal is None
+    ):
+        return _free_text_affects(ecosystem, version, str(low))
+    kind = str(item.get("versionType") or "").lower()
+    bounds = (low, less, less_equal)
+    if kind in UNSUPPORTED_VERSION_TYPES or any(
+        b and _FULL_COMMIT_RE.match(str(b)) for b in bounds
+    ):
+        return None
+    if less is None and less_equal is None:
+        if _is_wildcard(low):
+            return None
+        result = compare_versions(ecosystem, version, str(low))
+        return None if result is None else result == 0
+    holds = True
+    if not _is_wildcard(low) and str(low) != "0":
+        result = compare_versions(ecosystem, version, str(low))
+        if result is None:
+            return None
+        holds = holds and result >= 0
+    if not _is_wildcard(less):
+        result = compare_versions(ecosystem, version, str(less))
+        if result is None:
+            return None
+        holds = holds and result < 0
+    if not _is_wildcard(less_equal):
+        result = compare_versions(ecosystem, version, str(less_equal))
+        if result is None:
+            return None
+        holds = holds and result <= 0
+    return holds
+
+
+def _status_by_changes(
+    ecosystem: str, version: str, item: Mapping[str, Any]
+) -> str | None:
+    """Status at the version by the ``changes`` of an item (``version`` is the first
+    point, each change is the next one); None if a point cannot be compared.
+    """
+    points = [(item.get("version"), item.get("status"))] + [
+        (change.get("at"), change.get("status")) for change in item["changes"]
+    ]
+    current = None
+    for at, status in points:
+        if at in ("*", "0"):
+            current = status
+            continue
+        result = compare_versions(ecosystem, version, str(at)) if at else None
+        if result is None:
+            return None
+        if result < 0:
+            break
+        current = status
+    return current or STATUS_NOT_AFFECTED
+
+
+def entry_status(ecosystem: str, version: str, entry: Mapping[str, Any]) -> str:
+    """What one ``affected[]`` entry says about a version: ``affected``,
+    ``affected_all``, ``not_affected`` or ``unknown``.
+    """
+    items = entry.get("versions") or []
+    default = entry.get("defaultStatus")
+    unknown = hit_affected = hit_unaffected = False
+    for item in items:
+        status = item.get("status")
+        if item.get("changes"):
+            current = _status_by_changes(ecosystem, version, item)
+            if current is None:
+                unknown = True
+            elif current == STATUS_AFFECTED:
+                hit_affected = True
+            elif current == "unaffected":
+                hit_unaffected = True
+            continue
+        inside = _in_range(ecosystem, version, item)
+        if inside is None:
+            unknown = unknown or status != "unaffected"
+        elif inside:
+            hit_affected = hit_affected or status == STATUS_AFFECTED
+            hit_unaffected = hit_unaffected or status == "unaffected"
+    if hit_unaffected:
+        return STATUS_NOT_AFFECTED
+    if hit_affected:
+        return STATUS_AFFECTED
+    if not items:
+        return STATUS_ALL if default == STATUS_AFFECTED else STATUS_UNKNOWN
+    if unknown:
+        return STATUS_UNKNOWN
+    listed_affected = any(i.get("status") == STATUS_AFFECTED for i in items)
+    if default == STATUS_AFFECTED and not listed_affected:
+        return STATUS_AFFECTED
+    return STATUS_NOT_AFFECTED
+
+
+def describe_range(entry: Mapping[str, Any]) -> str:
+    """The affected versions of an entry as the CNA gave them."""
+    parts = []
+    for item in entry.get("versions") or []:
+        if item.get("status") != STATUS_AFFECTED:
+            continue
+        low, less, less_equal = (
+            item.get("version"),
+            item.get("lessThan"),
+            item.get("lessThanOrEqual"),
+        )
+        if less is None and less_equal is None:
+            text = str(low)
+            if not _OPERATOR_CHARS_RE.search(text):
+                text = f"= {text}"
+            fixed = [
+                str(c.get("at"))
+                for c in item.get("changes") or []
+                if c.get("status") == "unaffected"
+            ]
+            if fixed:
+                text += f" (fixed in {', '.join(fixed)})"
+            parts.append(text)
+            continue
+        upper = f"< {less}" if not _is_wildcard(less) else f"<= {less_equal}"
+        if _is_wildcard(less) and _is_wildcard(less_equal):
+            upper = ""
+        lower = "" if _is_wildcard(low) or str(low) == "0" else f">= {low}"
+        parts.append(", ".join(p for p in (lower, upper) if p) or "all versions")
+    if not parts:
+        return "all versions" if entry.get("defaultStatus") == STATUS_AFFECTED else ""
+    return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Names and repositories
+# --------------------------------------------------------------------------
+
+
+def normalize_repo(url: Any) -> str | None:
+    """``host/owner/name`` in lower case, whatever the form of the URL."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    text = url.strip().lower()
+    text = re.sub(r"^git\+", "", text)
+    text = re.sub(r"^(https?|git|ssh)://", "", text)
+    text = re.sub(r"^[^@/]+@", "", text)
+    if re.match(r"^[a-z0-9.-]+:[^/0-9]", text):
+        text = text.replace(":", "/", 1)
+    text = re.sub(r"^www\.", "", text)
+    text = re.sub(r"[#?].*$", "", text)
+    text = re.sub(
+        r"/(tree|blob|issues|pull|releases|wiki|commit|security)(/.*)?$", "", text
+    )
+    text = re.sub(r"\.git$", "", text).rstrip("/")
+    return text or None
+
+
+def normalize_name(ecosystem: str, name: str) -> str:
+    name = name.strip().lower()
+    if ecosystem == "pypi":
+        return re.sub(r"[-_.]+", "-", name)
+    if ecosystem == "cargo":
+        return name.replace("_", "-")
+    if ecosystem == "maven":
+        return name.replace("/", ":")
+    return name
+
+
+def squash(text: Any) -> str:
+    """Lower case letters and digits only: ``Jackson-Core`` == ``jackson_core``."""
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+_REGISTRY_HOSTS = (
+    ("npmjs.org", "npm"),
+    ("npmjs.com", "npm"),
+    ("pypi.org", "pypi"),
+    ("pythonhosted.org", "pypi"),
+    ("maven.org", "maven"),
+    ("maven.apache.org", "maven"),
+    ("sonatype.com", "maven"),
+    ("mvnrepository.com", "maven"),
+    ("crates.io", "cargo"),
+)
+_NEUTRAL_HOSTS = ("github.com", "gitlab.com", "bitbucket.org")
+FOREIGN_REGISTRY = "other"
+_FOREIGN_HOSTS = (
+    "redhat.com",
+    "wordpress.org",
+    "cpan.org",
+    "hex.pm",
+    "nuget.org",
+    "packagist.org",
+    "rubygems.org",
+    "conan.io",
+    "pkg.go.dev",
+    "golang.org",
+    "apple.com",
+    "microsoft.com",
+)
+
+
+def registry_ecosystem(collection_url: str | None) -> str | None:
+    """The ecosystem a ``collectionURL`` names: one of ECOSYSTEMS, FOREIGN_REGISTRY
+    (a registry or catalogue of something else) or None (a repository host or an
+    unknown URL: no statement about the ecosystem).
+    """
+    if not collection_url:
+        return None
+    host = (urllib.parse.urlsplit(collection_url.strip()).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _NEUTRAL_HOSTS):
+        return None
+    for suffix, ecosystem in _REGISTRY_HOSTS:
+        if host == suffix or host.endswith("." + suffix):
+            return ecosystem
+    if any(host == h or host.endswith("." + h) for h in _FOREIGN_HOSTS):
+        return FOREIGN_REGISTRY
+    return None
+
+
+def url_points_at_repo(url: str, repo: str) -> bool:
+    """Whether a URL is the repository or a page below it (not a sibling that
+    merely starts with the same characters).
+    """
+    normal = re.sub(r"^git\+", "", url.strip().lower())
+    normal = re.sub(r"^[a-z]+://", "", normal)
+    normal = re.sub(r"^www\.", "", normal)
+    normal = re.sub(r"[#?].*$", "", normal).removesuffix(".git").rstrip("/")
+    return normal == repo or normal.startswith(repo + "/")
+
+
+# --------------------------------------------------------------------------
+# Inventory
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Package:
+    ecosystem: str
+    name: str
+    version: str
+
+    @property
+    def artifact(self) -> str:
+        """The last segment of the name: ``guava`` of ``com.google.guava:guava``,
+        ``common`` of ``@nestjs/common``.
+        """
+        return self.name.split(":")[-1].split("/")[-1]
+
+
+@dataclass
+class Inventory:
+    # package -> target id -> locations (lockfiles / image results)
+    sightings: dict[Package, dict[str, set[str]]] = field(default_factory=dict)
+    unsupported: int = 0
+    targets_read: int = 0
+
+
+def parse_purl(purl: str) -> Package | None:
+    """The package of a supported ecosystem a purl names, else None."""
+    parts = purl_parts(purl)
+    if parts is None or parts.type not in ECOSYSTEMS or not parts.version:
+        return None
+    name = "/".join(p for p in (parts.namespace, parts.name) if p)
+    if parts.type == "maven":
+        name = name.replace("/", ":")
+    return Package(parts.type, name, parts.version)
+
+
+def trivy_native(trivy_dir: Path, target_id: str) -> dict[str, Any] | None:
+    """The native result of a Trivy target, None unless it was scanned fully."""
+    try:
+        status = read_json(trivy_dir / f"{target_id}.status.json")
+        if not isinstance(status, dict) or status.get("status") != STATUS_OK:
+            return None
+        native = read_json(trivy_dir / f"{target_id}.json")
+    except (OSError, ValueError):
+        return None
+    return native if isinstance(native, dict) else None
+
+
+def load_inventory(targets: Sequence[Mapping[str, Any]], trivy_dir: Path) -> Inventory:
+    """The language packages of every Trivy target that was scanned: where each
+    package version was seen. Packages of other ecosystems, or without a versioned
+    purl, are counted but not matched.
+    """
+    inventory = Inventory()
+    unsupported: set[tuple[Any, Any]] = set()
+    for target in targets:
+        if target.get("scanner") != SCANNER_TRIVY or target.get("status") != (
+            STATUS_PENDING
+        ):
+            continue
+        native = trivy_native(trivy_dir, target["id"])
+        if native is None:
+            continue
+        inventory.targets_read += 1
+        for result in native.get("Results") or []:
+            if result.get("Class") != CLASS_LANGUAGE_PACKAGES:
+                continue
+            for item in result.get("Packages") or []:
+                purl = (item.get("Identifier") or {}).get("PURL")
+                package = parse_purl(purl) if isinstance(purl, str) else None
+                if package is None:
+                    unsupported.add((item.get("Name"), item.get("Version")))
+                    continue
+                places = inventory.sightings.setdefault(package, {})
+                places.setdefault(target["id"], set()).add(result.get("Target", ""))
+    inventory.unsupported = len(unsupported)
+    return inventory
+
+
+# --------------------------------------------------------------------------
+# deps.dev: the source repository of a package
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class RepoLookup:
+    """Source repositories by (ecosystem, name), and what the lookup met."""
+
+    repos: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    requests: int = 0
+    without_repo: int = 0
+    errors: int = 0
+
+
+class DepsDevClient:
+    def __init__(self, http: HttpClient, api_url: str) -> None:
+        self._http = http
+        self._api_url = api_url.rstrip("/")
+        self._headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+
+    def source_repos(self, package: Package) -> tuple[str, ...] | None:
+        """Normalized source repositories of the package version; None if deps.dev
+        does not know the version (404).
+        """
+        path = "/v3/systems/{}/packages/{}/versions/{}".format(
+            package.ecosystem,
+            urllib.parse.quote(package.name, safe=""),
+            urllib.parse.quote(package.version, safe=""),
+        )
+        try:
+            response = self._http.request(
+                "GET", self._api_url + path, self._headers, None
+            )
+        except TransportError as err:
+            raise DepsDevError(f"GET {path}: {err}") from err
+        if response.status == HTTP_NOT_FOUND:
+            return None
+        if response.status != HTTP_OK:
+            raise DepsDevError(f"GET {path}: HTTP {response.status}")
+        try:
+            data = json.loads(response.body)
+        except ValueError as err:
+            raise DepsDevError(f"GET {path}: answer is not valid JSON: {err}") from err
+        if not isinstance(data, dict):
+            raise DepsDevError(f"GET {path}: unexpected answer")
+        found: set[str] = set()
+        for project in data.get("relatedProjects") or []:
+            if project.get("relationType") == "SOURCE_REPO":
+                found.add(normalize_repo((project.get("projectKey") or {}).get("id")))
+        for link in data.get("links") or []:
+            if link.get("label") == "SOURCE_REPO":
+                found.add(normalize_repo(link.get("url")))
+        return tuple(sorted(r for r in found if r))
+
+
+def newest_first(ecosystem: str, versions: Iterable[str]) -> list[str]:
+    def order(a: str, b: str) -> int:
+        return compare_versions(ecosystem, a, b) or 0
+
+    return sorted(set(versions), key=cmp_to_key(order), reverse=True)
+
+
+def resolve_repos(
+    client: DepsDevClient,
+    inventory: Inventory,
+    workers: int = DEPSDEV_WORKERS,
+    breaker: int = DEPSDEV_BREAKER,
+) -> RepoLookup:
+    """The source repository of every package name of the inventory.
+
+    The repository is asked for a version of the name (the newest first; the next
+    one only if deps.dev does not know it), with at most ``workers`` requests in
+    flight. A request that fails after its retries leaves the name without
+    repositories and is counted; ``breaker`` failures in a row mean deps.dev is down
+    and raise DepsDevUnavailable.
+    """
+    versions: dict[tuple[str, str], list[str]] = {}
+    for package in inventory.sightings:
+        versions.setdefault((package.ecosystem, package.name), []).append(
+            package.version
+        )
+    lookup = RepoLookup()
+    lock = threading.Lock()
+    state = {"consecutive": 0, "tripped": False, "last": ""}
+
+    def one(key: tuple[str, str]) -> tuple[str, ...]:
+        for version in newest_first(key[0], versions[key])[:DEPSDEV_VERSION_TRIES]:
+            if state["tripped"]:
+                return ()
+            try:
+                repos = client.source_repos(Package(key[0], key[1], version))
+            except DepsDevError as err:
+                with lock:
+                    lookup.requests += 1
+                    lookup.errors += 1
+                    state["consecutive"] += 1
+                    state["last"] = str(err)
+                    state["tripped"] = state["consecutive"] >= breaker
+                return ()
+            with lock:
+                lookup.requests += 1
+                state["consecutive"] = 0
+            if repos is not None:
+                return repos
+        return ()
+
+    keys = sorted(versions)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for key, repos in zip(keys, pool.map(one, keys), strict=True):
+            lookup.repos[key] = repos
+            lookup.without_repo += not repos
+    if state["tripped"]:
+        raise DepsDevUnavailable(
+            f"deps.dev failed {breaker} requests in a row, last: {state['last']}"
+        )
+    return lookup
+
+
+# --------------------------------------------------------------------------
+# CVE records: severity, the slim form, the names of the feed assets
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# The CVE index
+# --------------------------------------------------------------------------
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+# An index older than this is reported: the builder has not run for a while
+INDEX_STALE_DAYS = 2
+
+
+@dataclass
+class IndexData:
+    """The CVE index as read: the records (the latest version of each), its metadata
+    and the gaps of the feed in its window (``{from, to}`` ranges of hours). ``ref``
+    and ``digest`` say which artifact it is (no digest for a directory).
+    """
+
+    records: dict[str, dict[str, Any]]
+    metadata: dict[str, Any]
+    ref: str
+    digest: str | None = None
+    gaps: list[dict[str, str]] = field(default_factory=list)
+    skipped: int = 0  # records of an unknown shape left out by the catch-up
+
+
+def pull_index(ref: str, dest: Path, run: Runner = subprocess.run) -> str:
+    """Pull the index artifact into ``dest`` with ORAS, anonymously; return its digest.
+
+    The reference is resolved to a digest first and the artifact pulled by that
+    digest, so that the digest in the report is that of what was read, even if the
+    tag moves in between. ORAS or the registry failing is IndexUnavailable.
+    """
+
+    def oras(*arguments: str) -> str:
+        try:
+            done = run(
+                ["oras", *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=ORAS_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            raise IndexUnavailable(f"cannot pull {ref}: {err}") from err
+        if done.returncode != 0:
+            lines = (done.stderr or "").strip().splitlines()
+            reason = lines[-1] if lines else f"exit code {done.returncode}"
+            raise IndexUnavailable(
+                f"cannot pull {ref}: oras {arguments[0]} failed: {reason}"
+            )
+        return done.stdout.strip()
+
+    digest = oras("resolve", ref)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise IndexUnavailable(f"cannot pull {ref}: no digest ({digest[:80]!r})")
+    repository = re.sub(r":[^:/@]+$", "", ref.split("@")[0])
+    oras("pull", f"{repository}@{digest}", "--output", str(dest))
+    return digest
+
+
+def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
+    """The index in a directory. An index that cannot be read, or that has another
+    schema, is IndexUnavailable: the early warning is not made from a guess.
+    """
+    try:
+        previous = read_previous(directory)
+        gaps = list(previous.metadata.get("gaps") or [])
+        gaps_of(gaps)  # the shape of the gaps is checked here and not later
+    except (IndexBuildError, OSError, ValueError) as err:
+        raise IndexUnavailable(f"the index {ref} cannot be read: {err}") from err
+    return IndexData(previous.records, previous.metadata, ref, digest, gaps)
+
+
+def catch_up(
+    index: IndexData,
+    downloader: Any,
+    feed_url: str,
+    work_dir: Path,
+    now: datetime,
+) -> None:
+    """Bring the records of the index up to ``now``: the deltas of the days since it
+    was built, and the records that the delta log lists and the deltas lack (the
+    code of the builder). Keeps the records that are published and were updated in
+    the window of the index, and sets ``index.gaps`` to the gaps of the feed in that
+    window: those of the index before the day it was built, and those of the deltas
+    applied now. A delta that cannot be downloaded or read is IndexUnavailable.
+    """
+    now = now.astimezone(UTC).replace(microsecond=0)
+    built = parse_time(index.metadata.get("built_at"))
+    window_days = index.metadata.get("window_days")
+    if built is None or not isinstance(window_days, int) or window_days < 1:
+        raise IndexUnavailable(f"the index {index.ref} has no built_at or window")
+    cutoff = now - timedelta(days=window_days)
+    if built < cutoff:
+        raise IndexUnavailable(
+            f"the index {index.ref} was built {built:%Y-%m-%d}, before its window of "
+            f"{window_days} days: no delta connects it to today"
+        )
+    since = datetime(built.year, built.month, built.day, tzinfo=UTC)
+    feed = Feed()
+    try:
+        client = FeedClient(downloader, feed_url, work_dir / "feed")
+        apply_deltas(index.records, client, since.date(), now, cutoff, feed)
+        reconcile(
+            index.records, downloader, work_dir / "reconcile", since, now, cutoff, feed
+        )
+        gaps = feed.gaps | {h for h in gaps_of(index.gaps) if h < since}
+        index.skipped = len(feed.skipped)
+    except IndexBuildError as err:
+        raise IndexUnavailable(str(err)) from err
+    first_hour = cutoff.replace(minute=0, second=0)
+    index.gaps = gap_ranges({h for h in gaps if h >= first_hour})
+    index.records = {
+        cve: record
+        for cve, record in index.records.items()
+        if record["state"] == STATE_PUBLISHED
+        and (parse_time(record["updated"]) or cutoff) >= cutoff
+    }
+
+
+def index_document(index: IndexData) -> dict[str, Any]:
+    """What the report says about the index it was made from."""
+    return {
+        "ref": index.ref,
+        "digest": index.digest,
+        "built_at": index.metadata.get("built_at"),
+        "gaps": index.gaps,
+    }
+
+
+def index_is_stale(index: IndexData, now: datetime) -> bool:
+    built = parse_time(index.metadata.get("built_at"))
+    return built is not None and now - built > timedelta(days=INDEX_STALE_DAYS)
+
+
+# --------------------------------------------------------------------------
+# Matching
+# --------------------------------------------------------------------------
+
+CONSISTENT = "consistent"
+CONSISTENT_BY_TEXT = "consistent_by_text"
+MODULE_UNKNOWN = "module_unknown"
+INCONSISTENT = "inconsistent"
+_BOUNDARY = r"(?<![A-Za-z0-9-]){}(?![A-Za-z0-9-])"
+_JDK_SUFFIX_RE = re.compile(r"jdk\d+\w*|lts\w*")
+
+
+@dataclass
+class Index:
+    by_name: dict[tuple[str, str], list[Package]] = field(default_factory=dict)
+    by_repo: dict[str, list[Package]] = field(default_factory=dict)
+    by_artifact: dict[str, list[Package]] = field(default_factory=dict)
+    by_owner_base: dict[tuple[str, str], list[Package]] = field(default_factory=dict)
+    repos: dict[Package, tuple[str, ...]] = field(default_factory=dict)
+
+
+def build_index(
+    inventory: Inventory, repos: Mapping[tuple[str, str], tuple[str, ...]]
+) -> Index:
+    index = Index()
+    for package in sorted(
+        inventory.sightings, key=lambda p: (p.ecosystem, p.name, p.version)
+    ):
+        package_repos = repos.get((package.ecosystem, package.name), ())
+        index.repos[package] = package_repos
+        name = normalize_name(package.ecosystem, package.name)
+        index.by_name.setdefault((package.ecosystem, name), []).append(package)
+        for key in {squash(package.artifact), squash(package.name)}:
+            index.by_artifact.setdefault(key, []).append(package)
+        for repo in package_repos:
+            index.by_repo.setdefault(repo, []).append(package)
+            parts = repo.split("/")
+            if len(parts) >= 3:
+                owner_base = (squash(parts[1]), squash(parts[-1]))
+                index.by_owner_base.setdefault(owner_base, []).append(package)
+    return index
+
+
+def named_in_text(package: Package, text: str) -> bool:
+    """Whether the text names the package itself: its full name, or its artifact id
+    as a whole word (not for a scoped npm package, whose last segment is too generic
+    to mean anything alone).
+    """
+    needles = {package.name}
+    if not (package.ecosystem == "npm" and package.name.startswith("@")):
+        needles.add(package.artifact)
+    return any(
+        re.search(_BOUNDARY.format(re.escape(needle)), text, re.IGNORECASE)
+        for needle in needles
+        if needle
+    )
+
+
+def name_agrees(package_name: str, package: Package) -> bool:
+    """A CNA ``packageName`` is the package, or its artifact id, or the family name of
+    a Bouncy-Castle-like artifact (``bcprov`` for ``bcprov-jdk18on``).
+    """
+    wanted = squash(package_name)
+    if wanted in {squash(package.name), squash(package.artifact)}:
+        return True
+    artifact = squash(package.artifact)
+    return artifact.startswith(wanted) and bool(
+        _JDK_SUFFIX_RE.fullmatch(artifact[len(wanted) :])
+    )
+
+
+def entry_consistency(
+    package: Package, entry: Mapping[str, Any], repo: str | None, text: str
+) -> str:
+    """Whether a CNA entry is about this artifact and not about another artifact of
+    the same repository.
+    """
+    package_name = entry.get("packageName")
+    if package_name:
+        return CONSISTENT if name_agrees(package_name, package) else INCONSISTENT
+    product = squash(entry.get("product"))
+    if not product:
+        return INCONSISTENT
+    if product in {squash(package.artifact), squash(package.name)}:
+        return CONSISTENT
+    if repo and product == squash(repo.rsplit("/", 1)[-1]):
+        # The product is the repository (many modules): only if the text says which
+        return CONSISTENT_BY_TEXT if named_in_text(package, text) else MODULE_UNKNOWN
+    return INCONSISTENT
+
+
+@dataclass
+class Hit:
+    """One entry of one record meeting one package version."""
+
+    package: Package
+    match: str
+    status: str
+    entry: Mapping[str, Any]
+
+
+def entry_hits(
+    index: Index, record: Mapping[str, Any], entry: Mapping[str, Any], outcomes: Counter
+) -> Iterator[Hit]:
+    """The packages a CNA entry applies to, with the verdict of its versions.
+
+    ``outcomes`` counts the matches that were rejected, by reason.
+    """
+    text = f"{record['title'] or ''} {record['description']}"
+    package_name = entry.get("packageName")
+    entry_repo = normalize_repo(entry.get("repo"))
+    collection = entry.get("collectionURL")
+    collection_eco = registry_ecosystem(collection)
+
+    if package_name:
+        # package_name
+        collection_repo = (
+            normalize_repo(collection)
+            if collection and collection_eco is None
+            else None
+        )
+        wanted_repo = entry_repo or collection_repo
+        for ecosystem in ECOSYSTEMS:
+            key = (ecosystem, normalize_name(ecosystem, package_name))
+            for package in index.by_name.get(key, ()):
+                if collection_eco and collection_eco != ecosystem:
+                    outcomes["rejected_registry"] += 1
+                elif (
+                    wanted_repo
+                    and index.repos[package]
+                    and wanted_repo not in index.repos[package]
+                ):
+                    outcomes["rejected_repo_conflict"] += 1
+                else:
+                    yield Hit(
+                        package,
+                        MATCH_PACKAGE_NAME,
+                        entry_status(package.ecosystem, package.version, entry),
+                        entry,
+                    )
+
+    if entry_repo:
+        # source_repo / repo_module
+        for package in index.by_repo.get(entry_repo, ()):
+            consistency = entry_consistency(package, entry, entry_repo, text)
+            if consistency == INCONSISTENT:
+                outcomes["wrong_artifact"] += 1
+            elif consistency == MODULE_UNKNOWN:
+                outcomes["module_unknown"] += 1
+            else:
+                match = (
+                    MATCH_SOURCE_REPO
+                    if consistency == CONSISTENT
+                    else MATCH_REPO_MODULE
+                )
+                yield Hit(
+                    package,
+                    match,
+                    entry_status(package.ecosystem, package.version, entry),
+                    entry,
+                )
+        return
+
+    if package_name or not entry.get("product"):
+        return
+    product = squash(entry["product"])
+    vendor = squash(entry.get("vendor"))
+    # product_name: the product is the artifact
+    for package in index.by_artifact.get(product, ()):
+        yield from _product_name_hit(index, record, entry, package, vendor, outcomes)
+    # repo_module: vendor/product are the owner/name of the source repository
+    for package in index.by_owner_base.get((vendor, product), ()):
+        if product in {squash(package.artifact), squash(package.name)}:
+            continue  # that is product_name's: the artifact, with its stricter checks
+        if named_in_text(package, text):
+            yield Hit(
+                package,
+                MATCH_REPO_MODULE,
+                entry_status(package.ecosystem, package.version, entry),
+                entry,
+            )
+        else:
+            outcomes["module_unknown"] += 1
+
+
+def _product_name_hit(
+    index: Index,
+    record: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    package: Package,
+    vendor: str,
+    outcomes: Counter,
+) -> Iterator[Hit]:
+    repos = index.repos[package]
+    owners = {squash(r.split("/")[1]) for r in repos if r.count("/") >= 2}
+    if vendor not in owners and vendor != squash(package.artifact):
+        outcomes["wrong_vendor"] += 1
+        return
+    if package.ecosystem == "npm" and package.name.startswith("@"):
+        scope = squash(package.name[1:].split("/")[0])
+        if scope != vendor and scope not in owners:
+            outcomes["wrong_scope"] += 1
+            return
+    if not any(url_points_at_repo(u, r) for u in record["references"] for r in repos):
+        outcomes["uncorroborated"] += 1
+        return
+    yield Hit(
+        package,
+        MATCH_PRODUCT_NAME,
+        entry_status(package.ecosystem, package.version, entry),
+        entry,
+    )
+
+
+def ghsa_aliases(record: Mapping[str, Any]) -> list[str]:
+    """GHSA ids the record links to (its references name them)."""
+    found = {
+        "GHSA-" + m.group(0)[5:].lower()
+        for url in record["references"]
+        for m in _GHSA_RE.finditer(url)
+    }
+    return sorted(found)
+
+
+@dataclass
+class MatchResult:
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    outcomes: Counter = field(default_factory=Counter)
+
+
+def match_records(
+    records: Iterable[Mapping[str, Any]],
+    index: Index,
+    inventory: Inventory,
+) -> MatchResult:
+    """Candidates: one per CVE and package version that the CNA data says is
+    affected. When several entries say so, the strongest match (``package_name``,
+    ``source_repo``, ``product_name``, ``repo_module``) and its entry are kept.
+    """
+    result = MatchResult()
+    for record in sorted(records, key=lambda r: r["cve"]):
+        hits: dict[Package, list[Hit]] = {}
+        for entry in record["affected"]:
+            for hit in entry_hits(index, record, entry, result.outcomes):
+                hits.setdefault(hit.package, []).append(hit)
+        for package, package_hits in hits.items():
+            affecting = [
+                h for h in package_hits if h.status in (STATUS_AFFECTED, STATUS_ALL)
+            ]
+            if not affecting:
+                if any(h.status == STATUS_UNKNOWN for h in package_hits):
+                    result.outcomes["version_unknown"] += 1
+                else:
+                    result.outcomes["version_outside_range"] += 1
+                continue
+            best = min(affecting, key=lambda h: MATCH_PRIORITY[h.match])
+            result.candidates.append(
+                candidate_document(record, best, inventory.sightings[package])
+            )
+    result.candidates.sort(key=candidate_sort_key)
+    return result
+
+
+def candidate_document(
+    record: Mapping[str, Any],
+    hit: Hit,
+    sightings: Mapping[str, set[str]],
+) -> dict[str, Any]:
+    package = hit.package
+    return {
+        "cve": record["cve"],
+        "aliases": ghsa_aliases(record),
+        "cna": record["assigner"],
+        "published": record["published"],
+        "updated": record["updated"],
+        "title": record["title"],
+        "package": {
+            "ecosystem": package.ecosystem,
+            "name": package.name,
+            "version": package.version,
+        },
+        "affected_range": describe_range(hit.entry),
+        "match": hit.match,
+        **select_severity(record["metrics"]),
+        "exploitation": record["metrics"]["exploitation"],
+        "sightings": {
+            tid: sorted(places)[:MAX_LOCATIONS]
+            for tid, places in sorted(sightings.items())
+        },
+    }
+
+
+def candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Severity, CVSS score (highest first, none last), newest publication first,
+    then identity.
+    """
+    score = (candidate["cvss"] or {}).get("score")
+    published = parse_time(candidate["published"])
+    return (
+        SEVERITY_ORDER.get(candidate["severity"], len(SEVERITIES)),
+        score is None,
+        -(score or 0),
+        -(published.timestamp() if published else 0),
+        candidate["package"]["name"],
+        candidate["package"]["version"],
+        candidate["cve"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Run
+# --------------------------------------------------------------------------
+
+
+def status_document(
+    status: str,
+    reason: str | None,
+    window_days: int | None = None,
+    records_scanned: int | None = None,
+    candidates: int | None = None,
+    index: Mapping[str, Any] | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "window_days": window_days,
+        "records_scanned": records_scanned,
+        "candidates": candidates,
+        "index": dict(index) if index else None,
+        "diagnostics": dict(diagnostics or {}),
+    }
+
+
+def load_index(
+    args: argparse.Namespace, work_dir: Path, run: Runner = subprocess.run
+) -> IndexData:
+    """The index of ``--index-dir``, or the one of ``--cve-index`` pulled with ORAS."""
+    if args.index_dir:
+        return read_index(args.index_dir, str(args.index_dir), None)
+    destination = work_dir / "index"
+    digest = pull_index(args.cve_index, destination, run)
+    return read_index(destination, args.cve_index, digest)
+
+
+def analyse(
+    args: argparse.Namespace,
+    transport: Transport,
+    now: datetime,
+    sleep: Callable[[float], None] = time.sleep,
+    downloader: Any = None,
+    run: Runner = subprocess.run,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``(status document, candidates document)``; the latter only if ``ok``.
+
+    ``downloader`` fetches the deltas (a ``cve_index.Downloader``), ``run`` calls
+    ORAS; both default to the real ones.
+    """
+    targets = load_targets_list(args.targets_file)
+    inventory = load_inventory(targets, args.parts_dir / SCANNER_TRIVY)
+    if not inventory.targets_read:
+        return status_document(STATUS_SKIPPED, "no Trivy target was scanned"), None
+    http = HttpClient(transport, sleep)
+    diagnostics: dict[str, Any] = {
+        "packages": len(inventory.sightings),
+        "packages_unsupported": inventory.unsupported,
+    }
+    index: IndexData | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="sca-early-warning-") as work:
+            index = load_index(args, Path(work), run)
+            catch_up(
+                index,
+                downloader or UrllibDownloader(),
+                args.feed_url,
+                Path(work),
+                now,
+            )
+        lookup = resolve_repos(DepsDevClient(http, args.depsdev_url), inventory)
+    except (IndexUnavailable, DepsDevUnavailable) as err:
+        return status_document(
+            STATUS_FAILED,
+            str(err),
+            index.metadata.get("window_days") if index else None,
+            index=index_document(index) if index else None,
+            diagnostics=diagnostics,
+        ), None
+    window_days = index.metadata["window_days"]
+    match_index = build_index(inventory, lookup.repos)
+    matched = match_records(index.records.values(), match_index, inventory)
+    diagnostics.update(
+        index_records=len(index.records),
+        index_records_skipped=index.skipped,
+        depsdev_requests=lookup.requests,
+        depsdev_names_without_repo=lookup.without_repo,
+        depsdev_errors=lookup.errors,
+        outcomes=dict(sorted(matched.outcomes.items())),
+    )
+    candidates_doc = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_utc": format_time(now),
+        "generated_from": {
+            "days": window_days,
+            "from": format_time(now - timedelta(days=window_days)),
+            "to": format_time(now),
+        },
+        "candidates": matched.candidates,
+    }
+    status = status_document(
+        STATUS_OK,
+        None,
+        window_days,
+        len(index.records),
+        len(matched.candidates),
+        {**index_document(index), "stale": index_is_stale(index, now)},
+        diagnostics,
+    )
+    return status, candidates_doc
+
+
+def run(
+    args: argparse.Namespace,
+    transport: Transport,
+    now: datetime,
+    sleep: Callable[[float], None] = time.sleep,
+    downloader: Any = None,
+    runner: Runner = subprocess.run,
+) -> str:
+    """Write the part; return its status."""
+    for name in ("feed_url", "depsdev_url"):
+        url = getattr(args, name).rstrip("/")
+        if urllib.parse.urlsplit(url).scheme != "https":
+            raise InputError(f"{name.replace('_', '-')} must be an https URL")
+    if bool(args.cve_index) == bool(args.index_dir):
+        raise InputError("exactly one of cve-index and index-dir is needed")
+    status, candidates = analyse(args, transport, now, sleep, downloader, runner)
+    out_dir = args.output_dir / PART_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dump_json(out_dir / "status.json", status)
+    if candidates is not None:
+        dump_json(out_dir / "candidates.json", candidates)
+    if status["status"] == STATUS_OK:
+        print(
+            f"early warning: {status['records_scanned']} CVE record(s) of the last "
+            f"{status['window_days']} day(s) from the index of "
+            f"{status['index']['built_at']} and the deltas since, "
+            f"{status['diagnostics']['packages']} package version(s), "
+            f"{status['candidates']} candidate(s)"
+        )
+        if status["index"]["stale"]:
+            print(
+                "::warning title=Early warning index is stale::"
+                + escape_command_data(
+                    f"the CVE index was built {status['index']['built_at']}, more "
+                    f"than {INDEX_STALE_DAYS} days ago: the daily build of "
+                    "sca_cve_index.yml may be failing; the early warning used the "
+                    "deltas since"
+                )
+            )
+        gaps = status["index"]["gaps"]
+        if gaps:
+            print(
+                "::warning title=Early warning feed gaps::no CVE feed delta for "
+                + escape_command_data(
+                    ", ".join(f"{g['from']} to {g['to']}" for g in gaps)
+                )
+            )
+    elif status["status"] == STATUS_FAILED:
+        print(
+            "::warning title=Early warning unavailable::"
+            + escape_command_data(status["reason"])
+            + " (the scan itself is not affected)"
+        )
+    else:
+        print(f"early warning skipped: {status['reason']}")
+    return status["status"]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser.add_argument("--targets-file", required=True, type=Path)
+    parser.add_argument(
+        "--parts-dir",
+        required=True,
+        type=Path,
+        help="directory with the Trivy parts (trivy/<id>.json, trivy/<id>.status.json)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="directory to write early-warning/status.json and candidates.json into",
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--cve-index",
+        help="the CVE index artifact to pull with ORAS, e.g. "
+        "ghcr.io/epam/ai-dial-sca-cve-index:1",
+    )
+    source.add_argument(
+        "--index-dir",
+        type=Path,
+        help="a directory with the index files instead (tests, runs by hand)",
+    )
+    parser.add_argument("--feed-url", default=FEED_URL, help="cvelistV5 release assets")
+    parser.add_argument("--depsdev-url", default=DEPSDEV_URL, help="deps.dev API")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        run(args, UrllibTransport(), datetime.now(UTC))
+    except InputError as err:
+        print(
+            f"::error title=Invalid early warning input::{escape_command_data(err)}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

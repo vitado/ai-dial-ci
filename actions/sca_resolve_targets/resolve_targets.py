@@ -443,6 +443,7 @@ def run_kind(
     scan_images: bool,
     scan_release_source: bool,
     osv_enabled: bool,
+    early_warning_enabled: bool,
     ref_name: str,
     default_branch: str,
 ) -> tuple[str, list[str]]:
@@ -458,6 +459,7 @@ def run_kind(
         (not scan_images, "scan-images is off"),
         (not scan_release_source, "scan-release-source is off"),
         (not osv_enabled, "osv-enabled is off"),
+        (not early_warning_enabled, "early-warning-enabled is off"),
         (
             ref_name != default_branch,
             f"not the default branch ({ref_name}, the default is {default_branch})",
@@ -492,6 +494,7 @@ class Inputs:
     scan_images: bool = True
     scan_release_source: bool = True
     osv_enabled: bool = True
+    early_warning_enabled: bool = True
     targets_filter: str = ""
     config: str = ""
     token: str | None = None
@@ -528,6 +531,7 @@ class Inputs:
             scan_images=flag("SCAN_IMAGES"),
             scan_release_source=flag("SCAN_RELEASE_SOURCE"),
             osv_enabled=flag("OSV_ENABLED"),
+            early_warning_enabled=flag("EARLY_WARNING_ENABLED"),
             targets_filter=environ.get("TARGETS", ""),
             config=environ.get("CONFIG", ""),
             token=environ.get("GITHUB_TOKEN") or None,
@@ -588,6 +592,7 @@ def resolve_targets(
         scan_images=inputs.scan_images,
         scan_release_source=inputs.scan_release_source,
         osv_enabled=inputs.osv_enabled,
+        early_warning_enabled=inputs.early_warning_enabled,
         ref_name=inputs.ref_name,
         default_branch=github.default_branch(inputs.caller_repository),
     )
@@ -707,6 +712,10 @@ def run(
             "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
             "targets-file": str(targets_file),
             "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
+            # Decided here, once; the early warning job and the merge follow it
+            "early-warning-enabled": "true"
+            if inputs.early_warning_enabled
+            else "false",
         }
         append_text(
             output_path, "".join(format_output(k, v) for k, v in outputs.items())

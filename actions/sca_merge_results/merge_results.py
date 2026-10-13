@@ -49,6 +49,20 @@ towards the release or development exposure: a finding seen only in lockfiles un
 them is ``source_only`` in every repository, and its locations are marked as not
 shipped. The record stays in ``vulnerabilities.json``.
 
+Early warning (``early-warning/`` part of the sca_early_warning action, when the run
+has one): CVE records whose CNA data matches a language package of the run but that
+no scanner reported. The merge drops the ones whose CVE id or alias is the ``id`` or
+an alias of any record (a database maps them now, so a scanner reports them),
+classifies the rest by exposure like a record and reports them in
+``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
+section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
+not in the scope table, not in the headline. Every entry carries the ``match`` the
+part computed, how it was matched (``package_name``, ``source_repo``, ``product_name``
+or ``repo_module``); the merge shows it and neither filters nor tiers by it. The part
+says which CVE index it read (``index``: ref, digest, built_at, feed gaps), and the
+report repeats it. A broken or missing part is reported as unavailable, never as an
+empty result.
+
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
 decides about failing the run after the artifact has been uploaded.
@@ -62,6 +76,7 @@ each depending on the ones listed before it:
     base image) into records;
   * ``osv_source``: osv-scanner output into OSV vulnerabilities and records;
   * ``record_merge``: the records of one repository from the Trivy and OSV scans;
+  * ``early_warning_merge``: the early warning radar matched with the findings;
   * ``report``: ``vulnerabilities.json`` and ``scan_report.json`` (the contract);
   * ``summary``: ``summary.md`` and its cut to the limit of the step summary.
 """
@@ -81,6 +96,7 @@ from typing import Any
 from _sca_lib.gha import append_text, escape_command_data
 from _sca_lib.jsonio import InputError, dump_json, read_json
 from _sca_lib.times import format_time
+from early_warning_merge import EARLY_WARNING_DIR, build_early_warning
 from osv_source import OsvResolutionError, OsvScan, osv_result_problem, resolve_osv_scan
 from record_merge import merge_records
 from records import (
@@ -315,8 +331,13 @@ def run_merge(
     output_dir: Path,
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
+    early_warning_enabled: bool = False,
 ) -> int:
-    """Write all outputs; return the number of failed targets."""
+    """Write all outputs; return the number of failed targets.
+
+    ``early_warning_enabled``: the run has an early warning part to report (the
+    early-warning job); without it the report has no early warning at all.
+    """
     targets_doc = load_targets_file(targets_file)
     report_dir = output_dir / "_report"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -375,6 +396,17 @@ def run_merge(
         targets_doc["config"][KEY_NON_SHIPPED_PATHS], trivy_configs
     )
     records = finalize_records(merged, trivy_only, sightings, not_shipped)
+    early_warning = None
+    if early_warning_enabled:
+        early_warning = build_early_warning(
+            parts_dir / EARLY_WARNING_DIR,
+            repo,
+            generated_utc,
+            records,
+            trivy_only,
+            bool(ok_scans),
+            not_shipped,
+        )
     scan_report = build_scan_report(
         targets_doc,
         results,
@@ -382,6 +414,7 @@ def run_merge(
         generated_utc,
         trivy_db,
         trivy_configs,
+        early_warning,
     )
     vulns = build_vulnerabilities(repo, generated_utc, records)
     if (stale := trivy_db_stale_days(trivy_db, generated_utc)) is not None:
@@ -393,9 +426,16 @@ def run_merge(
 
     dump_json(report_dir / "vulnerabilities.json", vulns)
     dump_json(report_dir / "scan_report.json", scan_report)
+    if early_warning is not None:
+        dump_json(report_dir / "early_warning.json", early_warning.document)
+        if early_warning.report["status"] == STATUS_FAILED:
+            print(
+                "::warning title=Early warning unavailable::"
+                + escape_command_data(early_warning.report["reason"])
+            )
     write_text(
         output_dir / "summary.md",
-        build_summary_md(scan_report, vulns, sightings),
+        build_summary_md(scan_report, vulns, sightings, early_warning),
     )
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]
@@ -458,6 +498,15 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "of the Trivy DB snapshot used by the run (default: unknown)"
         ),
     )
+    parser.add_argument(
+        "--early-warning-enabled",
+        type=parse_bool,
+        default=False,
+        help=(
+            "the run has an early warning part (early-warning/ in --parts-dir) to "
+            "report (true/false, default false)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -471,6 +520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_dir,
             generated_utc,
             parse_trivy_db_info(args.trivy_db_info),
+            args.early_warning_enabled,
         )
     except InputError as e:
         print(

@@ -1,4 +1,4 @@
-"""The ``summary.md`` of the SCA merge: facts, tables, footer.
+"""The ``summary.md`` of the SCA merge: facts, tables, early warning, footer.
 
 The whole Markdown rendering lives here (also the cut of the text to the limit of
 the GitHub step summary). It depends on the record model and the report; they do
@@ -13,6 +13,15 @@ from functools import cmp_to_key
 from typing import Any
 
 from _sca_lib.versions import compare_tokens
+from early_warning_merge import (
+    ADP_SOURCE_PREFIX,
+    CVE_RECORD_URL,
+    EARLY_WARNING_COLLAPSE_ABOVE,
+    EARLY_WARNING_GAPS_LISTED,
+    HEADLINE_SEVERITIES,
+    EarlyWarning,
+    early_warning_groups,
+)
 from osv_source import OSV_FOOTER
 from records import (
     CLASS_DEVELOPMENT,
@@ -50,6 +59,7 @@ from report import count_by_severity, trivy_db_stale_days
 from trivy_source import ECOSYSTEM_FAMILIES
 
 SHORT_SHA_LENGTH = 7
+DIGEST_SHORT_LENGTH = 12
 
 
 # GitHub rejects a step summary over 1 MiB; the rest of the limit is left for the
@@ -68,10 +78,12 @@ NOT_IN_PRODUCTION = "not in production"
 
 REASON_DEV_DEPENDENCY = "dev dependency"
 REASON_NOT_SHIPPED_PATH = "not shipped path"
+NOT_SHIPPED_MARK = f"({NOT_IN_PRODUCTION} · {REASON_NOT_SHIPPED_PATH})"
 MAX_LISTED_SKIPS = 5
 PATH_SEPARATOR = " › "
 RELEASE_LINE_RE = re.compile(r"^v?(\d+)\.(\d+)")
 TITLE_MAX_LENGTH = 80
+MAX_LISTED_LOCATIONS = 3
 
 
 class Markup(str):
@@ -237,18 +249,24 @@ def join_names(names: Sequence[str]) -> str:
     return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def facts_text(report: Mapping[str, Any], records: Sequence[Record]) -> str:
+def facts_text(
+    report: Mapping[str, Any],
+    records: Sequence[Record],
+    early_warning: EarlyWarning | None = None,
+) -> str:
     """The facts of the run in one line: the (unique) findings by severity, where
     they are (a finding in a release and in development counts in both), how many
-    have a fix in the databases; or that there are none.
+    have a fix in the databases and the early warnings; or that there are none.
     """
+    warning = early_warning_headline(early_warning)
     if not records:
         targets = report["targets"]
         names = [*release_subjects(targets)]
         if development_scanned(targets):
             names.append(DEVELOPMENT_TAG)
         where = join_names(names) or "the scanned targets"
-        return f"No known vulnerabilities in {where}"
+        text = f"No known vulnerabilities in {where}"
+        return f"{text} · {warning}" if warning else text
     counts = count_by_severity(r["severity"] for r in records)
     severities = ", ".join(f"{counts[s]} {s}" for s in SEVERITIES if counts[s])
     total = len(records)
@@ -264,6 +282,8 @@ def facts_text(report: Mapping[str, Any], records: Sequence[Record]) -> str:
     parts.append(", ".join(f"{n} {label}" for n, label in where_counts if n))
     if fixable := sum(r["fix_available"] for r in records):
         parts.append(f"{fixable} with a fix in the database")
+    if warning:
+        parts.append(warning)
     return " · ".join(p for p in parts if p)
 
 
@@ -338,7 +358,9 @@ def totals_line(
 
 
 def headline_blocks(
-    report: Mapping[str, Any], records: Sequence[Record]
+    report: Mapping[str, Any],
+    records: Sequence[Record],
+    early_warning: EarlyWarning | None = None,
 ) -> list[list[str]]:
     """The paragraphs of the headline: failures, the facts, the scope table, the
     coverage of the run.
@@ -360,7 +382,7 @@ def headline_blocks(
         return [*blocks, [text]]
 
     osv_only = sum(is_osv_only(r) for r in records)
-    blocks.append([f"**{facts_text(report, records)}**"])
+    blocks.append([f"**{facts_text(report, records, early_warning)}**"])
     if records:
         if table := scope_table(report, records):
             blocks.append(table)
@@ -569,6 +591,49 @@ def not_in_production_reasons(
     if all(in_not_shipped_paths(r, sightings, targets, not_shipped) for r in group):
         reasons.append(REASON_NOT_SHIPPED_PATH)
     return reasons
+
+
+def where_cell(
+    group: Sequence[Record],
+    sightings: Sightings,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None = None,
+) -> str:
+    """Where a group was found: tags per image, then the lockfiles of the source
+    of the default branch and of each release tag; a lockfile in a not shipped
+    location is marked ``(not shipped)``.
+
+    ``statgpt-chat :development, :0.17.7 · statgpt-admin :development · source
+    poetry.lock · source @ 0.17.7 poetry.lock``; a run with one image calls it
+    ``image``.
+    """
+    several = has_several_images(targets)
+    tags: dict[str, list[str]] = {}
+    sources: dict[str, list[str]] = {}  # "source" / "source @ <tag>" -> lockfiles
+    for target in targets:
+        for record in group:
+            seen = sightings.get(record_identity(record), {})
+            if target["id"] not in seen:
+                continue
+            if target.get("kind") == KIND_FS:
+                name = f"source @ {target['tag']}" if target.get("tag") else "source"
+                sources.setdefault(name, []).extend(
+                    f"{loc} {NOT_SHIPPED_MARK}"
+                    if not_shipped and not_shipped.matches(target["id"], loc)
+                    else loc
+                    for loc in seen[target["id"]]
+                )
+            else:
+                name = image_short_name(target) if several else "image"
+                append_unique(tags.setdefault(name, []), f":{target.get('tag')}")
+    parts = [f"{name} {', '.join(names)}" for name, names in tags.items()]
+    for name, locations in sources.items():
+        shown = sorted(set(locations))
+        text = f"{name} " + ", ".join(shown[:MAX_LISTED_LOCATIONS])
+        if len(shown) > MAX_LISTED_LOCATIONS:
+            text += f" +{len(shown) - MAX_LISTED_LOCATIONS} more"
+        parts.append(text)
+    return " · ".join(parts)
 
 
 def group_exposure_label(
@@ -901,7 +966,188 @@ def config_text(config: Mapping[str, Any] | None) -> str | None:
     return text
 
 
-def render_footer(report: Mapping[str, Any]) -> list[str]:
+EARLY_WARNING_TITLE = "Early warning — not yet in vulnerability databases"
+
+
+EARLY_WARNING_EXPLANATION = (
+    "CVE records of their CNAs match these packages, but no vulnerability database "
+    "maps them to a package yet."
+)
+
+
+EARLY_WARNING_HEADER = [
+    "Package",
+    "Severity",
+    "CVE",
+    "CNA",
+    "Published",
+    "Affected",
+    "Match",
+    "Exposure",
+    "Where",
+]
+
+
+def early_warning_headline(early_warning: EarlyWarning | None) -> str | None:
+    """The early warning part of the coverage line: ``2 early warnings (1 CRITICAL)``
+    (packages, and how many of them have CRITICAL or HIGH ones), or a note that it
+    is unavailable, so that its absence is not read as "nothing".
+    """
+    if early_warning is None:
+        return None
+    status = early_warning.report["status"]
+    if status == STATUS_FAILED:
+        return "early warning unavailable"
+    if status != STATUS_OK or not early_warning.entries:
+        return None
+    groups = early_warning_groups(early_warning.entries)
+    worst = count_by_severity(
+        min((e["severity"] for e in g), key=lambda s: SEV_ORDER.get(s, len(SEV_ORDER)))
+        for g in groups
+    )
+    text = f"{len(groups)} early warning{'s' if len(groups) != 1 else ''}"
+    urgent = format_severity_counts({s: worst[s] for s in HEADLINE_SEVERITIES})
+    return f"{text} ({urgent})" if urgent else text
+
+
+def early_warning_severity_text(entry: Record) -> str:
+    """``HIGH 7.5``; ``(ADP)`` when the score is not the CNA's, and what is known
+    about exploitation.
+    """
+    text = entry["severity"]
+    score = (entry["cvss"] or {}).get("score")
+    if score is not None:
+        text += f" {score:.1f}"
+    if (entry["severity_source"] or "").startswith(ADP_SOURCE_PREFIX):
+        text += " (ADP)"
+    exploitation = entry["exploitation"] or {}
+    if exploitation.get("kev"):
+        text += " · KEV"
+    elif exploitation.get("ssvc") == "active":
+        text += " · exploited (SSVC)"
+    return text
+
+
+def early_warning_row(
+    group: Sequence[Record],
+    early_warning: EarlyWarning,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None,
+) -> list[Any]:
+    """One package version: the worst severity of its CVEs, and the CVEs (with their
+    own severity if there are several) with the distinct CNAs, publication dates,
+    affected ranges and matches.
+    """
+    links = []
+    for entry in group:
+        link = md_link(entry["cve"], f"{CVE_RECORD_URL}{entry['cve']}")
+        if len(group) > 1:
+            severity = md_escape(early_warning_severity_text(entry))
+            link = Markup(f"{link} ({severity})")
+        links.append(link)
+    cnas: list[str] = []
+    dates: list[str] = []
+    ranges: list[str] = []
+    matches: list[str] = []
+    for entry in group:
+        append_unique(cnas, entry["cna"])
+        append_unique(dates, (entry["published"] or "?")[:10])
+        append_unique(ranges, entry["affected_range"] or "?")
+        append_unique(matches, entry["match"].replace("_", " "))
+    return [
+        f"{group[0]['pkg']} {group[0]['version']}",
+        early_warning_severity_text(group[0]),
+        md_join(", ", links),
+        ", ".join(cnas),
+        ", ".join(dates),
+        " · ".join(ranges),
+        ", ".join(matches),
+        group_exposure_label(group, targets, early_warning.sightings, not_shipped),
+        where_cell(group, early_warning.sightings, targets, not_shipped),
+    ]
+
+
+def render_early_warning(
+    early_warning: EarlyWarning | None,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None = None,
+) -> list[str]:
+    """The early warning section: the packages, worst first, collapsed above
+    ``EARLY_WARNING_COLLAPSE_ABOVE``; or the reason it is unavailable. Nothing when
+    it was skipped or has nothing to report.
+    """
+    if early_warning is None:
+        return []
+    report = early_warning.report
+    if report["status"] == STATUS_FAILED:
+        reason = report["reason"] or "unknown reason"
+        return [
+            "",
+            "## Early warning — unavailable",
+            "",
+            f"Early warning unavailable: {md_cell(reason)}",
+        ]
+    groups = early_warning_groups(early_warning.entries)
+    if report["status"] != STATUS_OK or not groups:
+        return []
+    table = md_table(
+        EARLY_WARNING_HEADER,
+        (early_warning_row(g, early_warning, targets, not_shipped) for g in groups),
+    )
+    if len(groups) > EARLY_WARNING_COLLAPSE_ABOVE:
+        table = md_details(f"Show the {len(groups)} packages", table)
+    return [
+        "",
+        f"## {EARLY_WARNING_TITLE} ({len(groups)})",
+        "",
+        EARLY_WARNING_EXPLANATION,
+        "",
+        *table,
+    ]
+
+
+def short_digest(digest: str | None) -> str | None:
+    """``sha256:0123456789ab`` of an OCI digest."""
+    if not digest:
+        return None
+    algorithm, _, value = digest.rpartition(":")
+    return f"{algorithm}:{value[:DIGEST_SHORT_LENGTH]}" if algorithm else digest
+
+
+def early_warning_footer(early_warning: EarlyWarning | None) -> str | None:
+    """Where the early warning looked: the CVE index (its date and digest), the
+    window, and the gaps of the feed in it.
+    """
+    if early_warning is None or early_warning.report["status"] != STATUS_OK:
+        return None
+    report = early_warning.report
+    index = report["index"]
+    built = format_timestamp(index["built_at"]) or index["built_at"]
+    digest = short_digest(index["digest"])
+    window = (early_warning.document.get("generated_from") or {}).get("from")
+    start = format_timestamp(window)
+    text = f"Early warning: CVE index of {built}"
+    if digest:
+        text += f" ({digest})"
+    text += f", records published or updated in the last {report['window_days']} days"
+    if start:
+        text += f" (since {start})"
+    if report["records_scanned"] is not None:
+        text += f", {report['records_scanned']} checked"
+    if index.get("stale"):
+        text += " · the index is more than 2 days old, its daily build is late"
+    if early_warning.gaps:
+        listed = early_warning.gaps[:EARLY_WARNING_GAPS_LISTED]
+        more = len(early_warning.gaps) - len(listed)
+        text += f" · feed gaps: {', '.join(listed)}"
+        if more:
+            text += f" and {more} more"
+    return text
+
+
+def render_footer(
+    report: Mapping[str, Any], early_warning: EarlyWarning | None = None
+) -> list[str]:
     parts = []
     if report["commit_sha"]:
         parts.append(f"commit {report['commit_sha'][:SHORT_SHA_LENGTH]}")
@@ -934,6 +1180,8 @@ def render_footer(report: Mapping[str, Any]) -> list[str]:
         queried_at = format_timestamp(max(queried)) if queried else None
         text = f"{OSV_FOOTER} · queried {queried_at}" if queried_at else OSV_FOOTER
         lines += ["", f"<sub>{text}</sub>"]
+    if text := early_warning_footer(early_warning):
+        lines += ["", f"<sub>{text}</sub>"]
     return lines
 
 
@@ -941,23 +1189,26 @@ def build_summary_md(
     report: Mapping[str, Any],
     vulns: Mapping[str, Any],
     sightings: Sightings,
+    early_warning: EarlyWarning | None = None,
 ) -> str:
+    """``early_warning`` is the early warning of the run, if it has one."""
     records = vulns["records"]
     targets = report["targets"]
     # The findings sections are about the records, so about the Trivy targets only
     record_targets = trivy_targets(targets)
     not_shipped = report_not_shipped(report)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
-    lines += render_headline(headline_blocks(report, records))
+    lines += render_headline(headline_blocks(report, records, early_warning))
     if records:
         lines += render_unfixed(records, record_targets, sightings, not_shipped)
+    lines += render_early_warning(early_warning, record_targets, not_shipped)
     if records:
         lines += render_severity_sections(
             records, record_targets, sightings, not_shipped
         )
         lines += render_dependency_paths(records)
     lines += render_coverage(targets)
-    lines += render_footer(report)
+    lines += render_footer(report, early_warning)
     return "\n".join(lines) + "\n"
 
 

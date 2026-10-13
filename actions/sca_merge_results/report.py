@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from _sca_lib.gha import escape_command_data
+from early_warning_merge import EarlyWarning
 from osv_source import osv_findings, osv_packages
 from records import (
     EXPOSURES,
@@ -152,6 +153,7 @@ def build_scan_report(
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
     trivy_configs: Mapping[str, Mapping[str, Any]] | None = None,
+    early_warning: EarlyWarning | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
     osv_scanner_version = None
@@ -193,6 +195,7 @@ def build_scan_report(
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
         "osv": {"scanner_version": osv_scanner_version} if has_osv else None,
+        "early_warning": early_warning.report if early_warning else None,
         "run_kind": targets_doc["run_kind"],
         "run_kind_reasons": targets_doc["run_kind_reasons"],
         "config": targets_doc.get("config") or default_config(),

@@ -1,0 +1,89 @@
+name: Resolve SCA scan targets
+description: Resolve the default-branch snapshot, the source of the latest release and the container images (development and latest release) that an SCA scheduled scan should cover
+
+inputs:
+  repository:
+    description: Repository (owner/name) whose code is scanned and whose releases are resolved
+    required: true
+  registry:
+    description: Container registry the images are pulled from
+    default: ghcr.io
+  images:
+    description: Image names without registry, one per line (e.g. epam/ai-dial-chat). Empty means source scan only
+    default: ""
+  scan-source:
+    description: Whether to include the source (filesystem) target
+    default: "true"
+  scan-images:
+    description: Whether to include the image targets
+    default: "true"
+  scan-release-source:
+    description: Whether to include the source (filesystem) target of the latest release (needs scan-source). It works without images, too
+    default: "true"
+  osv-enabled:
+    description: Whether to add an OSV twin of every Trivy target (the packages of the Trivy target are also checked against OSV)
+    default: "true"
+  targets:
+    description: Scan only the targets whose id matches one of these patterns (comma- or newline-separated; `*` and `?` work, e.g. `source-*` or `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all targets. A filtered run is a partial one
+    default: ""
+  config:
+    description: SCA configuration (YAML, same schema as .github/sca.yml of the repository) that is used instead of the file of the repository. Empty means the file, if there is one, else the defaults
+    default: ""
+  github-token:
+    description: Token for the GitHub API and for authenticating to ghcr.io
+    default: ${{ github.token }}
+  output-dir:
+    description: Directory where targets.json is written
+    default: ${{ runner.temp }}/sca
+
+outputs:
+  matrix:
+    description: Compact JSON array of the pending Trivy targets (may be "[]")
+    value: ${{ steps.targets.outputs.matrix }}
+  targets-file:
+    description: Path to targets.json with all targets and their statuses
+    value: ${{ steps.targets.outputs.targets-file }}
+  trivy-skip-paths:
+    description: How the skip-dirs and skip-files of the trivy.yaml of the repository are treated (as_non_shipped, apply or ignore), from the SCA configuration
+    value: ${{ steps.targets.outputs.trivy-skip-paths }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+    # PyYAML for the configuration file; pinned with hashes, wheels only (nothing is built or executed on install)
+    - name: Install dependencies
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: >-
+        python -m pip install --disable-pip-version-check --no-input
+        --require-hashes --only-binary=:all:
+        --requirement "$ACTION_PATH/requirements.txt"
+    # gh (GitHub API) is on the runner image; oras lists the tags of the images
+    - name: Set up ORAS
+      uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      with:
+        version: "1.3.3"
+    - name: Resolve targets
+      id: targets
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGES: ${{ inputs.images }}
+        SCAN_SOURCE: ${{ inputs.scan-source }}
+        SCAN_IMAGES: ${{ inputs.scan-images }}
+        SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
+        OSV_ENABLED: ${{ inputs.osv-enabled }}
+        TARGETS: ${{ inputs.targets }}
+        CONFIG: ${{ inputs.config }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        # the shared code of the SCA actions: actions/_sca_lib, a sibling of this directory
+        PYTHONPATH: ${{ github.action_path }}/..
+      run: python "$ACTION_PATH/resolve_targets.py"

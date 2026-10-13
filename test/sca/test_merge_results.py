@@ -152,13 +152,6 @@ def records_by_cve(ws: Workspace) -> dict[str, dict[str, Any]]:
     return {r["cve"]: r for r in ws.json("_report/vulnerabilities.json")["records"]}
 
 
-def without_diff(item: dict[str, Any]) -> dict[str, Any]:
-    """A record or an early warning without its ``diff`` (what changed since the
-    baseline run, tested in test_diff.py), to compare the rest.
-    """
-    return {k: v for k, v in item.items() if k != "diff"}
-
-
 # ---------------------------------------------------------------- merging
 
 
@@ -227,7 +220,7 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "CVE-2000-0002",  # source_only, CRITICAL
         "CVE-2000-0003",  # source_only, MEDIUM
     ]
-    openssl = without_diff(records_by_cve(full)["CVE-2000-0011"])
+    openssl = records_by_cve(full)["CVE-2000-0011"]
     assert openssl == {
         "repo": "example/app",
         "cve": "CVE-2000-0011",
@@ -681,6 +674,23 @@ def test_summary_md_separates_headline_lines(full: Workspace) -> None:
     if scanned + 1 < len(quote):  # a paragraph after it is separated as well
         assert quote[scanned + 1] == ">"
     assert all(line.startswith(">") for line in quote)
+
+
+def test_summary_md_says_that_a_partial_run_is_not_the_state_of_the_repository(
+    tmp_path: Path,
+) -> None:
+    doc = make_targets_doc(SOURCE)
+    doc["run_kind"] = "partial"
+    doc["run_kind_reasons"] = ["targets filter: source-*"]
+    ws = Workspace(tmp_path, doc)
+    ws.add_part("source-development", "source", lockfiles=3)
+    ws.run()
+    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    assert (
+        "> Partial run (targets filter: source-*): not a full scan of the repository"
+        in md
+    )
+    assert ws.json("_report/scan_report.json")["run_kind"] == "partial"
 
 
 def test_summary_md_labels_images_by_name_when_there_are_several(

@@ -97,8 +97,6 @@ from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import sca_diff
-
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
 UNKNOWN_SEVERITY = "UNKNOWN"
@@ -3063,10 +3061,9 @@ def headline_blocks(
     records: Sequence[Record],
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
-    diff: sca_diff.Diff | None = None,
 ) -> list[list[str]]:
     """The paragraphs of the headline: failures, the verdict, the scope table, the
-    coverage of the run and what changed since the baseline.
+    coverage of the run.
     """
     targets = report["targets"]
     blocks: list[list[str]] = []
@@ -3096,9 +3093,7 @@ def headline_blocks(
         blocks.append([totals_line(report, osv_only, packages, warning)])
     if report["run_kind"] != "full":
         reasons = "; ".join(report["run_kind_reasons"])
-        blocks.append([f"Partial run ({reasons}): not used as a baseline"])
-    if diff is not None:
-        blocks.append([sca_diff.diff_line(diff)])
+        blocks.append([f"Partial run ({reasons}): not a full scan of the repository"])
     return blocks
 
 
@@ -3194,7 +3189,7 @@ def package_cell(group: Sequence[Record]) -> str:
         text += ", indirect"
     if first["pkg_type"] == "os":
         text += " (base image)"
-    return text + sca_diff.new_suffix(group)
+    return text
 
 
 def package_families(group: Iterable[Record]) -> str:
@@ -3508,7 +3503,7 @@ def base_image_row(
     noun = "package" if packages == 1 else "packages"
     counts = count_by_severity(r["severity"] for r in group)
     return [
-        f"Base image · {label} ({packages} {noun})" + sca_diff.new_suffix(group),
+        f"Base image · {label} ({packages} {noun})",
         BASE_IMAGE_UPGRADE,
         format_severity_counts(counts, ", "),
         group_exposure_label(group, targets),
@@ -3641,8 +3636,7 @@ def render_watch_dependencies(
         rows.append(
             [
                 f"{group[0]['pkg']} {group[0]['version']}"
-                + (f" · {family}" if family else "")
-                + sca_diff.new_suffix(group),
+                + (f" · {family}" if family else ""),
                 format_severity_counts(counts, ", "),
                 scope_cell(group),
                 shortest_path_text(group),
@@ -3674,7 +3668,7 @@ def render_watch_base_image(
         counts = count_by_severity(r["severity"] for r in group)
         rows.append(
             [
-                f"{group[0]['pkg']} {group[0]['version']}" + sca_diff.new_suffix(group),
+                f"{group[0]['pkg']} {group[0]['version']}",
                 format_severity_counts(counts, ", "),
                 group_exposure_label(group, targets),
                 "Wait for a distribution fix or change the base image; "
@@ -3701,7 +3695,7 @@ def cve_cell(record: Record) -> str:
     cve = record["cve"]
     text = f"[{cve}]({record['primary_url']})" if record["primary_url"] else cve
     text = f"{text} · OSV only" if is_osv_only(record) else text
-    return text + sca_diff.new_suffix([record])
+    return text
 
 
 def cvss_cell(record: Record) -> str | None:
@@ -3993,7 +3987,7 @@ def early_warning_row(
         _append_unique(rules, entry["rule"])
         _append_unique(confidences, confidence_text(entry["confidence"]))
     return [
-        f"{group[0]['pkg']} {group[0]['version']}" + sca_diff.new_suffix(group),
+        f"{group[0]['pkg']} {group[0]['version']}",
         early_warning_severity_text(group[0]),
         ", ".join(links),
         ", ".join(cnas),
@@ -4126,12 +4120,10 @@ def build_summary_md(
     base_os: Mapping[str, str] | None = None,
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
-    diff: sca_diff.Diff | None = None,
 ) -> str:
     """``base_os`` is the OS of each scanned image (target id -> ``ubuntu 24.04``),
     ``in_place`` the findings that are fixed in place (see ``fixed_in_place``),
-    ``early_warning`` the early warning of the run, if it has one, ``diff`` what
-    changed since the baseline run.
+    ``early_warning`` the early warning of the run, if it has one.
     """
     records = vulns["records"]
     targets = report["targets"]
@@ -4139,9 +4131,7 @@ def build_summary_md(
     record_targets = trivy_targets(targets)
     not_shipped = report_not_shipped(report)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
-    lines += render_headline(
-        headline_blocks(report, records, in_place, early_warning, diff)
-    )
+    lines += render_headline(headline_blocks(report, records, in_place, early_warning))
     if records:
         fixes = render_what_to_fix(
             records, sightings, record_targets, base_os, in_place, not_shipped
@@ -4149,7 +4139,6 @@ def build_summary_md(
         lines += ["", *fixes] if fixes else []
         lines += render_watch(records, record_targets)
     lines += render_early_warning(early_warning, record_targets, not_shipped)
-    lines += sca_diff.render_resolved(diff)
     if records:
         lines += render_severity_sections(records, record_targets)
         lines += render_dependency_paths(records)
@@ -4211,16 +4200,11 @@ def run_merge(
     generated_utc: str,
     trivy_db: Mapping[str, str | None] | None = None,
     early_warning_enabled: bool = False,
-    baseline_dir: Path | None = None,
-    baseline_reason: str = "",
 ) -> int:
     """Write all outputs; return the number of failed targets.
 
     ``early_warning_enabled``: the run has an early warning part to report (the
     early-warning job); without it the report has no early warning at all.
-    ``baseline_dir``: the ``sca-report`` of the baseline run, to say what changed
-    since it; without one (``baseline_reason`` says why, if the step that looked
-    for it knows) the report says there is nothing to compare with.
     """
     targets_doc = load_targets_file(targets_file)
     report_dir = output_dir / "_report"
@@ -4300,20 +4284,10 @@ def run_merge(
         trivy_configs,
         early_warning,
     )
-    diff = sca_diff.attach_diff(
-        diff_tools(),
-        repo,
-        baseline_dir,
-        baseline_reason,
-        scan_report,
-        records,
-        early_warning,
-    )
     vulns = build_vulnerabilities(repo, generated_utc, records)
 
     dump_json(report_dir / "vulnerabilities.json", vulns)
     dump_json(report_dir / "scan_report.json", scan_report)
-    sca_diff.write_diff(report_dir, diff, records, early_warning, generated_utc)
     if early_warning is not None:
         dump_json(report_dir / "early_warning.json", early_warning.document)
         if early_warning.report["status"] == STATUS_FAILED:
@@ -4332,7 +4306,7 @@ def run_merge(
     write_text(
         output_dir / "summary.md",
         build_summary_md(
-            scan_report, vulns, sightings, base_os, in_place, early_warning, diff
+            scan_report, vulns, sightings, base_os, in_place, early_warning
         ),
     )
 
@@ -4346,22 +4320,6 @@ def run_merge(
         f"{len(failed)} failed target(s)"
     )
     return len(failed)
-
-
-def diff_tools() -> sca_diff.Tools:
-    """What the diff (sca_diff.py) takes from this module."""
-    return sca_diff.Tools(
-        canonical_package_name,
-        ECOSYSTEM_FAMILIES,
-        PYTHON_FAMILY,
-        record_ids,
-        record_sort_key,
-        read_json,
-        dump_json,
-        md_cell,
-        md_table,
-        md_details,
-    )
 
 
 def append_text(path: str, text: str) -> None:
@@ -4423,20 +4381,6 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "report (true/false, default false)"
         ),
     )
-    parser.add_argument(
-        "--baseline-dir",
-        type=Path,
-        default=None,
-        help=(
-            "the sca-report of the baseline run (the latest full run), to say what "
-            "changed since it; default: none"
-        ),
-    )
-    parser.add_argument(
-        "--baseline-reason",
-        default="",
-        help="why there is no baseline, if the step that looked for it knows",
-    )
     return parser.parse_args(argv)
 
 
@@ -4451,8 +4395,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             generated_utc,
             parse_trivy_db_info(args.trivy_db_info),
             args.early_warning_enabled,
-            args.baseline_dir,
-            args.baseline_reason,
         )
     except InputError as e:
         print(f"::error title=Invalid merge input::{e}", file=sys.stderr)

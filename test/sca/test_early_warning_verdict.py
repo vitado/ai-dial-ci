@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from early_warning_merge import EarlyWarning, early_warning_report
+from records import STATUS_FAILED, STATUS_OK, blank_record
+from summary import shipped_early_warning_text, verdict_text
 from test_early_warning_merge import candidate, write_part
 from test_merge_results import (
     DEV,
@@ -16,7 +19,6 @@ from test_merge_results import (
     SOURCE,
     Workspace,
     make_targets_doc,
-    mr,
 )
 
 IN_DEVELOPMENT_IMAGE = {"app-development": ["Java"]}
@@ -143,7 +145,7 @@ def test_a_verdict_with_a_high_clause_gets_nothing_added(tmp_path: Path) -> None
 
 
 def make_record(**fields: Any) -> dict[str, Any]:
-    record = mr.blank_record("example/app", "CVE-2000-1", "pkg", "1", "library")
+    record = blank_record("example/app", "CVE-2000-1", "pkg", "1", "library")
     record.update(
         scan_targets=["app-development"],
         exposure="development_only",
@@ -167,8 +169,8 @@ def early_warning_of(*severities: str, exposure: str = "development_only") -> An
                 "version": "1",
             }
         )
-    report = mr.early_warning_report(mr.STATUS_OK, None)
-    return mr.EarlyWarning(report, {}, entries)
+    report = early_warning_report(STATUS_OK, None)
+    return EarlyWarning(report, {}, entries)
 
 
 @pytest.fixture
@@ -184,9 +186,7 @@ def report() -> dict[str, Any]:
 def test_a_verdict_with_only_medium_clauses_carries_the_caveat(
     report: dict[str, Any],
 ) -> None:
-    text = mr.verdict_text(
-        report, [make_record()], early_warning=early_warning_of("HIGH")
-    )
+    text = verdict_text(report, [make_record()], early_warning=early_warning_of("HIGH"))
     assert text == (
         "Fix 1 MEDIUM in development before the next release"
         " · 1 HIGH early warning to verify"
@@ -197,7 +197,7 @@ def test_a_nothing_to_upgrade_verdict_with_only_medium_findings_carries_the_cave
     report: dict[str, Any],
 ) -> None:
     record = make_record(fix_available=False)
-    text = mr.verdict_text(report, [record], early_warning=early_warning_of("CRITICAL"))
+    text = verdict_text(report, [record], early_warning=early_warning_of("CRITICAL"))
     assert text == (
         "Nothing to upgrade — 1 MEDIUM without a fix, see watch"
         " · 1 CRITICAL early warning to verify"
@@ -209,24 +209,22 @@ def test_a_verdict_with_a_critical_or_high_action_or_watch_gets_nothing_added(
 ) -> None:
     warning = early_warning_of("HIGH")
     actionable = make_record(severity="HIGH")
-    assert "early warning" not in mr.verdict_text(
+    assert "early warning" not in verdict_text(
         report, [actionable], early_warning=warning
     )
     unfixed = make_record(severity="CRITICAL", fix_available=False)
-    assert "early warning" not in mr.verdict_text(
-        report, [unfixed], early_warning=warning
-    )
+    assert "early warning" not in verdict_text(report, [unfixed], early_warning=warning)
 
 
 def test_early_warnings_in_the_source_only_or_unavailable_add_nothing(
     report: dict[str, Any],
 ) -> None:
     source_only = early_warning_of("CRITICAL", exposure="source_only")
-    assert mr.shipped_early_warning_text(source_only) is None
+    assert shipped_early_warning_text(source_only) is None
     failed = early_warning_of("CRITICAL")
-    failed.report = mr.early_warning_report(mr.STATUS_FAILED, "feed down")
-    assert mr.shipped_early_warning_text(failed) is None
-    assert mr.shipped_early_warning_text(None) is None
-    assert mr.verdict_text(report, [], early_warning=failed) == (
+    failed.report = early_warning_report(STATUS_FAILED, "feed down")
+    assert shipped_early_warning_text(failed) is None
+    assert shipped_early_warning_text(None) is None
+    assert verdict_text(report, [], early_warning=failed) == (
         "No known vulnerabilities in development"
     )

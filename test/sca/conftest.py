@@ -11,3 +11,5 @@ sys.path.insert(0, str(ACTIONS))
 # resolve_targets.py imports its sibling module sca_config, as it does when it runs
 # from its action directory
 sys.path.insert(0, str(ACTIONS / "sca_resolve_targets"))
+# merge_results.py imports its sibling modules the same way
+sys.path.insert(0, str(ACTIONS / "sca_merge_results"))

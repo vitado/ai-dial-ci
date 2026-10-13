@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _sca_lib.jsonio import InputError
+from merge_results import load_targets_file
+from records import NotShipped, default_config, trivy_glob_regex, trivy_skips_path
+from summary import not_in_production_reasons, skip_paths_note
 from test_merge_results import (
     DEV,
     REL,
     SOURCE,
     Workspace,
     make_targets_doc,
-    mr,
     plain,
     records_by_id,
 )
@@ -103,14 +106,14 @@ def add_skip_record(ws: Workspace, **fields: Any) -> None:
     ],
 )
 def test_repository_pattern_matching(pattern: str, path: str, expected: bool) -> None:
-    not_shipped = mr.NotShipped([pattern])
+    not_shipped = NotShipped([pattern])
     assert not_shipped.matches("source-development", path) is expected
 
 
 def test_not_shipped_is_falsy_without_patterns_and_skips() -> None:
-    assert not mr.NotShipped()
-    assert mr.NotShipped(["examples/"])
-    assert not mr.NotShipped([], {"t": {**SKIP_RECORD, "mode": "apply"}})
+    assert not NotShipped()
+    assert NotShipped(["examples/"])
+    assert not NotShipped([], {"t": {**SKIP_RECORD, "mode": "apply"}})
 
 
 # --------------------------------------------------------- trivy skip globs
@@ -151,23 +154,23 @@ def test_not_shipped_is_falsy_without_patterns_and_skips() -> None:
     ],
 )
 def test_trivy_skip_dirs_matching(entry: str, directory: str, expected: bool) -> None:
-    regex = mr.trivy_glob_regex(entry)
+    regex = trivy_glob_regex(entry)
     assert bool(regex and regex.fullmatch(directory)) is expected
 
 
 def test_trivy_skips_a_file_below_a_skipped_dir_or_by_file_pattern() -> None:
-    dirs = [mr.trivy_glob_regex("examples")]
-    files = [mr.trivy_glob_regex("*/*.txt")]
-    assert mr.trivy_skips_path("examples/app/r.txt", dirs, []) is True  # type: ignore[arg-type]
-    assert mr.trivy_skips_path("a/examples/r.txt", dirs, []) is False  # type: ignore[arg-type]
-    assert mr.trivy_skips_path("lib/r.txt", [], files) is True  # type: ignore[arg-type]
-    assert mr.trivy_skips_path("r.txt", [], files) is False  # type: ignore[arg-type]
-    assert mr.trivy_skips_path("a/b/r.txt", [], files) is False  # type: ignore[arg-type]
+    dirs = [trivy_glob_regex("examples")]
+    files = [trivy_glob_regex("*/*.txt")]
+    assert trivy_skips_path("examples/app/r.txt", dirs, []) is True  # type: ignore[arg-type]
+    assert trivy_skips_path("a/examples/r.txt", dirs, []) is False  # type: ignore[arg-type]
+    assert trivy_skips_path("lib/r.txt", [], files) is True  # type: ignore[arg-type]
+    assert trivy_skips_path("r.txt", [], files) is False  # type: ignore[arg-type]
+    assert trivy_skips_path("a/b/r.txt", [], files) is False  # type: ignore[arg-type]
 
 
 def test_trivy_skips_everything_with_a_root_matching_dir_pattern() -> None:
-    dirs = [mr.trivy_glob_regex("**")]
-    assert mr.trivy_skips_path("requirements.txt", dirs, []) is True  # type: ignore[arg-type]
+    dirs = [trivy_glob_regex("**")]
+    assert trivy_skips_path("requirements.txt", dirs, []) is True  # type: ignore[arg-type]
 
 
 # ------------------------------------------------------------------ merging
@@ -236,7 +239,7 @@ def test_without_config_the_outputs_are_those_of_a_run_without_not_shipped_paths
     plain = workspace(tmp_path / "plain", None)
     explicit = workspace(tmp_path / "explicit", None)
     doc = json.loads(explicit.targets_file.read_text())
-    doc["config"] = mr.default_config()
+    doc["config"] = default_config()
     explicit.targets_file.write_text(json.dumps(doc), encoding="utf-8")
     for ws in (plain, explicit):
         ws.run()
@@ -280,14 +283,14 @@ def test_summary_marks_not_shipped_locations_and_names_the_configuration(
 
 def test_not_in_production_reasons() -> None:
     targets = [SOURCE, DEV]
-    not_shipped = mr.NotShipped(["examples/"])
+    not_shipped = NotShipped(["examples/"])
 
     def reasons(
         seen: dict[str, list[str]], dev: bool | None = None, shipped: bool = True
     ) -> list[str]:
         record = {"id": "CVE-1", "pkg": "p", "version": "1", "dev": dev}
         sightings = {("CVE-1", "p", "1"): seen}
-        return mr.not_in_production_reasons(
+        return not_in_production_reasons(
             [record], sightings, targets, not_shipped if shipped else None
         )
 
@@ -391,17 +394,17 @@ def test_skip_paths_of_other_modes_do_not_change_the_classification(
 def test_skip_paths_note_says_what_trivy_did() -> None:
     def note(mode: str) -> str | None:
         skip = {**SKIP_RECORD, "mode": mode, "skip_dirs": ["a", "b"]}
-        return mr.skip_paths_note({"trivy_skip_paths": skip})
+        return skip_paths_note({"trivy_skip_paths": skip})
 
     assert note("apply") == "trivy.yaml skip paths skipped by Trivy: a, b"
     assert note("ignore") == "trivy.yaml skip paths scanned: a, b"
     assert note("as_non_shipped") == (
         "trivy.yaml skip paths scanned, not shipped: a, b"
     )
-    assert mr.skip_paths_note({"trivy_skip_paths": SKIP_RECORD}) is None
-    assert mr.skip_paths_note({}) is None
+    assert skip_paths_note({"trivy_skip_paths": SKIP_RECORD}) is None
+    assert skip_paths_note({}) is None
     many = {**SKIP_RECORD, "skip_dirs": [f"d{i}" for i in range(7)]}
-    assert (mr.skip_paths_note({"trivy_skip_paths": many}) or "").endswith("d4 +2 more")
+    assert (skip_paths_note({"trivy_skip_paths": many}) or "").endswith("d4 +2 more")
 
 
 def test_an_empty_skip_list_adds_neither_note_nor_change(tmp_path: Path) -> None:
@@ -471,11 +474,11 @@ def test_invalid_config_in_targets_file_is_an_input_error(
     doc["config"] = bad
     path = tmp_path / "targets.json"
     path.write_text(json.dumps(doc), encoding="utf-8")
-    with pytest.raises(mr.InputError, match="invalid config"):
-        mr.load_targets_file(path)
+    with pytest.raises(InputError, match="invalid config"):
+        load_targets_file(path)
 
 
 def test_targets_file_without_config_gets_the_defaults(tmp_path: Path) -> None:
     path = tmp_path / "targets.json"
     path.write_text(json.dumps(make_targets_doc(SOURCE)), encoding="utf-8")
-    assert mr.load_targets_file(path)["config"] == mr.default_config()
+    assert load_targets_file(path)["config"] == default_config()

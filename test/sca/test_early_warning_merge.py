@@ -8,13 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from merge_results import main, parse_args
+from records import blank_record, record_ids
+from summary import early_warning_severity_text, short_digest, totals_line
 from test_merge_results import (
     DEV,
     REL,
     SOURCE,
     Workspace,
     make_targets_doc,
-    mr,
     plain,
     records_by_id,
 )
@@ -235,10 +237,10 @@ def test_candidates_known_to_a_scanner_are_dropped(ws: Workspace) -> None:
 
 
 def test_aliases_are_compared_with_the_aliases_of_records_case_insensitively() -> None:
-    record = mr.blank_record("r", "CVE-2030-0009", "p", "1", "library")
+    record = blank_record("r", "CVE-2030-0009", "p", "1", "library")
     record["aliases"] = ["GHSA-AAAA-bbbb-cccc"]
     part_dir = Path("unused")
-    known = {i.upper() for i in mr.record_ids(record)}
+    known = {i.upper() for i in record_ids(record)}
     assert "GHSA-AAAA-BBBB-CCCC" in known
     assert part_dir  # the id comparison itself is covered by the run below
 
@@ -502,8 +504,8 @@ def test_the_match_does_not_filter_or_reorder_the_entries(ws: Workspace) -> None
 
 
 def test_short_digest() -> None:
-    assert mr.short_digest("sha256:" + "ab" * 32) == "sha256:" + "ab" * 6
-    assert mr.short_digest(None) is None
+    assert short_digest("sha256:" + "ab" * 32) == "sha256:" + "ab" * 6
+    assert short_digest(None) is None
 
 
 def test_severity_text_names_the_source_and_exploitation() -> None:
@@ -516,30 +518,26 @@ def test_severity_text_names_the_source_and_exploitation() -> None:
         }
         return {**base, **fields}
 
-    assert mr.early_warning_severity_text(entry()) == "HIGH 7.5"
-    assert mr.early_warning_severity_text(entry(severity_source="adp:CISA-ADP")) == (
+    assert early_warning_severity_text(entry()) == "HIGH 7.5"
+    assert early_warning_severity_text(entry(severity_source="adp:CISA-ADP")) == (
         "HIGH 7.5 (ADP)"
     )
     assert (
-        mr.early_warning_severity_text(
-            entry(exploitation={"kev": True, "ssvc": "active"})
-        )
+        early_warning_severity_text(entry(exploitation={"kev": True, "ssvc": "active"}))
         == "HIGH 7.5 · KEV"
     )
     assert (
-        mr.early_warning_severity_text(
+        early_warning_severity_text(
             entry(exploitation={"kev": False, "ssvc": "active"})
         )
         == "HIGH 7.5 · exploited (SSVC)"
     )
     assert (
-        mr.early_warning_severity_text(
-            entry(exploitation={"kev": False, "ssvc": "none"})
-        )
+        early_warning_severity_text(entry(exploitation={"kev": False, "ssvc": "none"}))
         == "HIGH 7.5"
     )
     assert (
-        mr.early_warning_severity_text(
+        early_warning_severity_text(
             entry(severity="UNKNOWN", severity_source=None, cvss=None)
         )
         == "UNKNOWN"
@@ -630,7 +628,7 @@ def test_totals_line_places_the_early_warning_after_the_osv_count() -> None:
     report = {
         "totals": {"targets": {"total": 8, "ok": 8, "failed": 0, "not_applicable": 1}}
     }
-    assert mr.totals_line(report, osv_only=3, early_warning="2 early warnings") == (
+    assert totals_line(report, osv_only=3, early_warning="2 early warnings") == (
         "8/7 targets scanned · 3 found only by OSV · 2 early warnings "
         "· 1 not applicable"
     )
@@ -790,9 +788,9 @@ def test_cli_flag_enables_the_early_warning(ws: Workspace) -> None:
         "--early-warning-enabled",
         "true",
     ]
-    assert mr.main(args) == 0
+    assert main(args) == 0
     assert ws.json("_report/scan_report.json")["early_warning"]["reported"] == 1
-    assert mr.parse_args(args[:-2]).early_warning_enabled is False
+    assert parse_args(args[:-2]).early_warning_enabled is False
 
 
 def test_a_stale_index_is_in_the_report_and_the_footer(ws: Workspace) -> None:

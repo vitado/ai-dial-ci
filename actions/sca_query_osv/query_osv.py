@@ -5,7 +5,8 @@ Used by the SCA scheduled scan. Every Trivy target that was scanned successfully
 gets an OSV twin target (same id, scanner ``osv``). The native Trivy JSON of the
 target is converted to a CycloneDX BOM (``trivy convert``), the components that
 Trivy covers with its own distribution feeds (OS packages: ``pkg:deb``,
-``pkg:apk``, ``pkg:rpm``) and the ones without a package URL are removed, and
+``pkg:apk``, ``pkg:rpm``), the ones without a package URL and the ones without a
+version (a local workspace package, which OSV cannot be asked about) are removed, and
 ``osv-scanner scan source -L <id>.cdx.json --all-packages`` matches the rest
 with OSV (online, api.osv.dev).
 
@@ -105,6 +106,16 @@ def purl_type(purl: str) -> str:
     return purl.removeprefix("pkg:").split("/", 1)[0].lower()
 
 
+def has_version(component: dict[str, Any], purl: str) -> bool:
+    """A package without a version (a local workspace package) cannot be queried."""
+    version = component.get("version")
+    return (
+        isinstance(version, str)
+        and bool(version.strip())
+        and "@" in purl.split("?", 1)[0].split("#", 1)[0]
+    )
+
+
 def with_full_name(component: dict[str, Any], kind: str) -> dict[str, Any]:
     group = component.get("group")
     if not group:
@@ -118,6 +129,8 @@ def with_full_name(component: dict[str, Any], kind: str) -> dict[str, Any]:
 def filter_bom(bom: dict[str, Any]) -> tuple[dict[str, Any], int]:
     """``(BOM of the language packages, library components without a purl)``.
 
+    Components without a version are dropped too (not counted as skipped).
+
     Only the components stay: osv-scanner has no use for the dependency graph and
     the Trivy findings of the BOM. Trivy keeps the namespace of a package in
     ``group`` (a Maven group, an npm scope), but osv-scanner names the package it
@@ -130,7 +143,7 @@ def filter_bom(bom: dict[str, Any]) -> tuple[dict[str, Any], int]:
     for component in bom.get("components") or []:
         purl = component.get("purl")
         if isinstance(purl, str) and purl.startswith("pkg:"):
-            if purl_type(purl) not in OS_PURL_TYPES:
+            if purl_type(purl) not in OS_PURL_TYPES and has_version(component, purl):
                 kept.append(with_full_name(component, purl_type(purl)))
         elif component.get("type") == "library":
             skipped += 1

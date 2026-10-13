@@ -232,6 +232,17 @@ def test_filter_bom_folds_the_group_into_the_name_as_osv_writes_it() -> None:
     assert "group" in maven  # the input is not modified
 
 
+def test_filter_bom_removes_components_without_a_version() -> None:
+    no_version = {"type": "library", "name": "ws", "purl": "pkg:npm/ws"}
+    empty = {**no_version, "version": "", "purl": "pkg:npm/ws@"}
+    blank_purl = {**no_version, "version": "1.0"}
+    keep = component("pkg:npm/lodash@4.17.0")
+    bom, skipped = qo.filter_bom({"components": [no_version, empty, blank_purl, keep]})
+    assert bom["components"] == [keep]
+    assert skipped == 0
+    assert qo.unread_packages(bom, osv_output(("npm", "lodash", "4.17.0"))) == []
+
+
 def test_filter_bom_without_components() -> None:
     assert qo.filter_bom({})[0]["components"] == []
 

@@ -13,7 +13,6 @@ network.
 
 from __future__ import annotations
 
-import argparse
 import base64
 import binascii
 import fnmatch
@@ -25,9 +24,10 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import sca_config
 from _sca_lib.gha import append_text, escape_command_data, format_output
@@ -46,9 +46,11 @@ SCANNER_TRIVY = "trivy"
 SCANNER_OSV = "osv"
 
 KIND_FS = "fs"
+KIND_IMAGE = "image"
 
 STATUS_PENDING = "pending"
 STATUS_NOT_APPLICABLE = "not_applicable"
+STATUS_FAILED = "failed"
 
 GITHUB_TAGS_PAGE_SIZE = 100
 TOOL_TIMEOUT_SECONDS = 120.0
@@ -236,21 +238,14 @@ def parse_stable_semver(tag: str) -> tuple[int, int, int] | None:
     return int(match.group(2)), int(match.group(3)), int(match.group(4))
 
 
-def latest_release_lines(tags: Sequence[str], count: int) -> list[str]:
-    """Highest-patch tag of each of the ``count`` highest stable major.minor lines."""
-    best: dict[tuple[int, int], tuple[tuple[int, bool], str]] = {}
-    for tag in tags:
-        version = parse_stable_semver(tag)
-        if version is None:
-            continue
-        line = (version[0], version[1])
-        rank = (
-            version[2],
-            not tag.startswith("v"),
-        )  # on a tie prefer the unprefixed tag
-        if line not in best or rank > best[line][0]:
-            best[line] = (rank, tag)
-    return [best[line][1] for line in sorted(best, reverse=True)[:count]]
+def newest_stable_tag(tags: Sequence[str]) -> str | None:
+    """The highest stable ``[v]X.Y.Z`` tag; on a tie the unprefixed one."""
+    stable = [tag for tag in tags if parse_stable_semver(tag)]
+    return max(
+        stable,
+        key=lambda tag: (parse_stable_semver(tag), not tag.startswith("v")),
+        default=None,
+    )
 
 
 def find_release_tag(release_tag: str, tags: Sequence[str]) -> str | None:
@@ -275,62 +270,33 @@ def source_target_id(git_ref: str) -> str:
 
 
 def make_target(
-    registry: str,
-    image: str,
-    tag: str | None,
+    kind: str,
     status: str,
     reason: str | None = None,
+    *,
+    image: str | None = None,
+    tag: str | None = None,
+    ref: str | None = None,
+    git_ref: str | None = None,
+    commit_sha: str | None = None,
 ) -> dict[str, Any]:
-    """An image target; without a known tag the id is ``<image>-release``."""
+    """A Trivy target: an image, or a filesystem target (``git_ref`` pinned to
+    ``commit_sha``; a release source has a ``tag``, the development one has none).
+
+    Without a known tag the id is ``<image>-release`` or ``source-release``.
+    """
+    if kind == KIND_IMAGE:
+        ident = target_id(str(image), tag or "release")
+    else:
+        ident = source_target_id(git_ref or "release")
     return {
-        "id": target_id(image, tag or "release"),
+        "id": ident,
         "scanner": SCANNER_TRIVY,
-        "kind": "image",
+        "kind": kind,
         "image": image,
         "tag": tag,
-        "ref": f"{registry}/{image}:{tag}" if tag else None,
-        "git_ref": None,
-        "commit_sha": None,
-        "status": status,
-        "reason": reason,
-    }
-
-
-def make_source_target(git_ref: str, commit_sha: str) -> dict[str, Any]:
-    """A filesystem target: ``git_ref`` (branch or tag) pinned to ``commit_sha``."""
-    return {
-        "id": source_target_id(git_ref),
-        "scanner": SCANNER_TRIVY,
-        "kind": KIND_FS,
-        "image": None,
-        "tag": None,
-        "ref": None,
+        "ref": ref,
         "git_ref": git_ref,
-        "commit_sha": commit_sha,
-        "status": STATUS_PENDING,
-        "reason": None,
-    }
-
-
-def make_release_source_target(
-    tag: str | None,
-    commit_sha: str | None,
-    status: str,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    """A filesystem target of a release: the repository at its git ``tag``.
-
-    ``tag`` is what tells a release source from the development one. Without a
-    known tag the id is ``source-release``.
-    """
-    return {
-        "id": source_target_id(tag or "release"),
-        "scanner": SCANNER_TRIVY,
-        "kind": KIND_FS,
-        "image": None,
-        "tag": tag,
-        "ref": None,
-        "git_ref": tag,
         "commit_sha": commit_sha,
         "status": status,
         "reason": reason,
@@ -376,93 +342,91 @@ def parse_bool(value: str, name: str) -> bool:
     raise ResolveError(f"{name} must be 'true' or 'false', got {value!r}")
 
 
-def resolve_image_targets(
-    registry: RegistryClient,
-    image: str,
-    latest_release: str | None,
-    release_lines: int,
-    release_error: str | None = None,
-) -> list[dict[str, Any]]:
-    """Targets of one image: the ``development`` tag plus the release tag(s).
+class Release(NamedTuple):
+    """The release of the run: its ``tag``, or the ``error`` of the lookup; both are
+    None if the repository has no stable release."""
 
-    ``latest_release`` is the tag of the latest GitHub release (only looked up when
-    ``release_lines == 1``); ``release_error`` is set if that lookup failed.
-    """
-    reg = registry.registry
+    tag: str | None
+    error: str | None = None
+
+
+def resolve_release(github: GitHubClient, repository: str) -> Release:
+    """The release to scan: the latest GitHub release, else the newest stable
+    ``[v]X.Y.Z`` git tag of the repository."""
+    try:
+        tag = github.latest_release_tag(repository)
+        if tag is None:
+            tag = newest_stable_tag(github.repository_tags(repository))
+    except ResolveError as err:
+        return Release(None, str(err))
+    return Release(tag)
+
+
+def resolve_image_targets(
+    registry: RegistryClient, image: str, release: Release
+) -> list[dict[str, Any]]:
+    """Targets of one image: the ``development`` tag and the tag of the release."""
+
+    def image_target(tag: str | None, status: str, reason: str | None = None):
+        ref = f"{registry.registry}/{image}:{tag}" if tag else None
+        return make_target(KIND_IMAGE, status, reason, image=image, tag=tag, ref=ref)
+
     try:
         tags = registry.tags(image)
     except RegistryError as err:
         reason = str(err)
         return [
-            make_target(reg, image, "development", "failed", reason),
-            make_target(reg, image, latest_release, "failed", reason),
+            image_target("development", STATUS_FAILED, reason),
+            image_target(release.tag, STATUS_FAILED, reason),
         ]
 
     if "development" in tags:
-        targets = [make_target(reg, image, "development", "pending")]
+        targets = [image_target("development", STATUS_PENDING)]
     else:
         reason = "tag development not published for this image"
-        targets = [make_target(reg, image, "development", "not_applicable", reason)]
+        targets = [image_target("development", STATUS_NOT_APPLICABLE, reason)]
 
-    if release_error is not None:
-        targets.append(make_target(reg, image, None, "failed", release_error))
-    elif latest_release is not None:
-        found = find_release_tag(latest_release, tags)
-        if found is None:
-            reason = f"release {latest_release} not published for this image"
-            targets.append(
-                make_target(reg, image, latest_release, "not_applicable", reason)
-            )
-        else:
-            targets.append(make_target(reg, image, found, "pending"))
+    if release.error is not None:
+        targets.append(image_target(None, STATUS_FAILED, release.error))
+    elif release.tag is None:
+        reason = "no stable release tag published for this image"
+        targets.append(image_target(None, STATUS_NOT_APPLICABLE, reason))
+    elif (found := find_release_tag(release.tag, tags)) is None:
+        reason = f"release {release.tag} not published for this image"
+        targets.append(image_target(release.tag, STATUS_NOT_APPLICABLE, reason))
     else:
-        selected = latest_release_lines(tags, release_lines)
-        if not selected:
-            reason = "no stable release tag published for this image"
-            targets.append(make_target(reg, image, None, "not_applicable", reason))
-        targets.extend(make_target(reg, image, tag, "pending") for tag in selected)
+        targets.append(image_target(found, STATUS_PENDING))
     return targets
 
 
-def resolve_release_source_targets(
-    github: GitHubClient,
-    repository: str,
-    latest_release: str | None,
-    release_lines: int,
-    release_error: str | None = None,
-) -> list[dict[str, Any]]:
-    """Source targets of the releases, newest first: the repository at each tag.
+def resolve_release_source_target(
+    github: GitHubClient, repository: str, release: Release
+) -> dict[str, Any]:
+    """The source target of the release: the repository at its git tag, so that
+    repositories without images have a release scan too."""
 
-    The releases are those of the image targets (the latest GitHub release for one
-    line, else the newest stable ``X.Y.Z`` tag of each line), but taken from the git
-    tags of the repository, so that repositories without images have them too.
-    ``latest_release`` is the tag of the latest GitHub release (only looked up when
-    ``release_lines == 1``); ``release_error`` is set if that lookup failed.
-    """
-    if release_error is not None:
-        return [make_release_source_target(None, None, "failed", release_error)]
-    if latest_release is not None:
-        tags = [latest_release]
-    else:
-        try:
-            tags = latest_release_lines(
-                github.repository_tags(repository), release_lines
-            )
-        except ResolveError as err:
-            return [make_release_source_target(None, None, "failed", str(err))]
-        if not tags:
-            reason = "no stable release tag in the repository"
-            return [make_release_source_target(None, None, "not_applicable", reason)]
-    targets = []
-    for tag in tags:
-        try:
-            sha = github.tag_commit_sha(repository, tag)
-        except ResolveError as err:
-            reason = f"cannot resolve release tag {tag}: {err}"
-            targets.append(make_release_source_target(tag, None, "failed", reason))
-        else:
-            targets.append(make_release_source_target(tag, sha, "pending"))
-    return targets
+    def source_target(status: str, reason: str | None = None, sha: str | None = None):
+        return make_target(
+            KIND_FS,
+            status,
+            reason,
+            tag=release.tag,
+            git_ref=release.tag,
+            commit_sha=sha,
+        )
+
+    if release.error is not None:
+        return source_target(STATUS_FAILED, release.error)
+    if release.tag is None:
+        return source_target(
+            STATUS_NOT_APPLICABLE, "no stable release tag in the repository"
+        )
+    try:
+        sha = github.tag_commit_sha(repository, release.tag)
+    except ResolveError as err:
+        reason = f"cannot resolve release tag {release.tag}: {err}"
+        return source_target(STATUS_FAILED, reason)
+    return source_target(STATUS_PENDING, sha=sha)
 
 
 def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
@@ -550,100 +514,140 @@ def resolve_config(
     return sca_config.build_config(text, file_ref, override)
 
 
+@dataclass(frozen=True)
+class Inputs:
+    """The inputs of the action (see ``action.yml``)."""
+
+    repository: str
+    output_dir: Path
+    caller_repository: str
+    ref_name: str
+    registry: str = GHCR_HOST
+    images: Sequence[str] = ()
+    scan_source: bool = True
+    scan_images: bool = True
+    scan_release_source: bool = True
+    osv_enabled: bool = True
+    early_warning_enabled: bool = True
+    targets_filter: str = ""
+    config: str = ""
+    token: str | None = None
+
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str]) -> Inputs:
+        """Read and validate the inputs, which the action passes as environment
+        variables (``REPOSITORY``, ``SCAN_SOURCE``, ...)."""
+
+        def flag(name: str) -> bool:
+            return parse_bool(environ.get(name, "true"), name.lower().replace("_", "-"))
+
+        repository = environ.get("REPOSITORY", "")
+        if not REPOSITORY_NAME.fullmatch(repository):
+            raise ResolveError(f"repository must be 'owner/name', got {repository!r}")
+        caller_repository = environ.get("GITHUB_REPOSITORY", "")
+        if not REPOSITORY_NAME.fullmatch(caller_repository):
+            raise ResolveError(
+                f"caller repository must be 'owner/name', got {caller_repository!r}"
+            )
+        ref_name = environ.get("GITHUB_REF_NAME", "")
+        if not ref_name:
+            raise ResolveError("the branch or tag of the run is unknown (no ref name)")
+        if not environ.get("OUTPUT_DIR"):
+            raise ResolveError("OUTPUT_DIR is not set")
+        return cls(
+            repository=repository,
+            output_dir=Path(environ["OUTPUT_DIR"]),
+            caller_repository=caller_repository,
+            ref_name=ref_name,
+            registry=environ.get("REGISTRY") or GHCR_HOST,
+            images=tuple(parse_images(environ.get("IMAGES", ""))),
+            scan_source=flag("SCAN_SOURCE"),
+            scan_images=flag("SCAN_IMAGES"),
+            scan_release_source=flag("SCAN_RELEASE_SOURCE"),
+            osv_enabled=flag("OSV_ENABLED"),
+            early_warning_enabled=flag("EARLY_WARNING_ENABLED"),
+            targets_filter=environ.get("TARGETS", ""),
+            config=environ.get("CONFIG", ""),
+            token=environ.get("GITHUB_TOKEN") or None,
+        )
+
+
 def resolve_targets(
-    *,
-    repository: str,
-    registry_name: str,
-    images: Sequence[str],
-    release_lines: int,
-    scan_source: bool,
-    scan_images: bool,
-    scan_release_source: bool,
-    osv_enabled: bool,
+    inputs: Inputs,
     github: GitHubClient,
     registry: RegistryClient,
     environ: Mapping[str, str],
     now: datetime,
-    caller_repository: str,
-    ref_name: str,
-    config_input: str = "",
-    targets_filter: str = "",
-    early_warning_enabled: bool = True,
 ) -> dict[str, Any]:
     """Build the targets.json document. Raises ResolveError without a snapshot (or
     for a ``targets_filter`` pattern that matches no target) and ConfigError for an
     invalid SCA configuration.
 
-    ``targets_filter`` keeps only the targets whose id matches one of its patterns;
-    the OSV twins follow their Trivy targets. The run is ``partial`` (``run_kind``)
-    if the filter or a switch narrows the scan, or if ``ref_name`` is not the default
-    branch of ``caller_repository``.
+    One release is scanned (``resolve_release``): its source and, in every image, its
+    tag. ``targets_filter`` keeps only the targets whose id matches one of its
+    patterns; the OSV twins follow their Trivy targets. The run is ``partial``
+    (``run_kind``) if the filter or a switch narrows the scan, or if the run is not on
+    the default branch of the calling repository.
 
-    Order: the development source, the release sources (newest first), then the
-    images of each image in ``images`` order.
+    Order: the development source, the release source, then the images of each image
+    in ``images`` order.
     """
+    repository = inputs.repository
     default_branch = github.default_branch(repository)
     commit_sha = github.commit_sha(repository, default_branch)
-    config = resolve_config(github, repository, commit_sha, config_input)
+    config = resolve_config(github, repository, commit_sha, inputs.config)
 
-    with_images = scan_images and bool(images)
-    with_release_source = scan_source and scan_release_source
-    latest_release: str | None = None
-    release_error: str | None = None
-    if (with_images or with_release_source) and release_lines == 1:
-        try:
-            latest_release = github.latest_release_tag(repository)
-        except ResolveError as err:
-            release_error = str(err)
+    with_images = inputs.scan_images and bool(inputs.images)
+    with_release_source = inputs.scan_source and inputs.scan_release_source
+    release = Release(None)
+    if with_images or with_release_source:
+        release = resolve_release(github, repository)
 
     targets: list[dict[str, Any]] = []
-    if scan_source:
-        targets.append(make_source_target(default_branch, commit_sha))
-    if with_release_source:
-        targets.extend(
-            resolve_release_source_targets(
-                github, repository, latest_release, release_lines, release_error
+    if inputs.scan_source:
+        targets.append(
+            make_target(
+                KIND_FS,
+                STATUS_PENDING,
+                git_ref=default_branch,
+                commit_sha=commit_sha,
             )
         )
+    if with_release_source:
+        targets.append(resolve_release_source_target(github, repository, release))
     if with_images:
-        for image in images:
-            targets.extend(
-                resolve_image_targets(
-                    registry, image, latest_release, release_lines, release_error
-                )
-            )
-    patterns = parse_target_patterns(targets_filter)
+        for image in inputs.images:
+            targets.extend(resolve_image_targets(registry, image, release))
+    patterns = parse_target_patterns(inputs.targets_filter)
     targets = filter_targets(targets, patterns)
     kind, kind_reasons = run_kind(
         patterns=patterns,
-        scan_source=scan_source,
-        scan_images=scan_images,
-        scan_release_source=scan_release_source,
-        osv_enabled=osv_enabled,
-        early_warning_enabled=early_warning_enabled,
-        ref_name=ref_name,
-        default_branch=github.default_branch(caller_repository),
+        scan_source=inputs.scan_source,
+        scan_images=inputs.scan_images,
+        scan_release_source=inputs.scan_release_source,
+        osv_enabled=inputs.osv_enabled,
+        early_warning_enabled=inputs.early_warning_enabled,
+        ref_name=inputs.ref_name,
+        default_branch=github.default_branch(inputs.caller_repository),
     )
-    if osv_enabled:
+    if inputs.osv_enabled:
         # After all trivy targets, in the same order
         targets.extend([make_osv_target(t) for t in targets])
     check_unique_ids(targets)
 
     server = environ.get("GITHUB_SERVER_URL", "https://github.com")
     run_id = environ.get("GITHUB_RUN_ID", "")
-    run_repository = environ.get("GITHUB_REPOSITORY", "")
     return {
         "repo": repository,
         "default_branch": default_branch,
         "commit_sha": commit_sha,
         "config": config,
-        "registry": registry_name,
-        "release_lines": release_lines,
+        "registry": inputs.registry,
         "run_kind": kind,
         "run_kind_reasons": kind_reasons,
         "run_id": run_id,
-        "run_url": f"{server}/{run_repository}/actions/runs/{run_id}"
-        if run_id and run_repository
+        "run_url": f"{server}/{inputs.caller_repository}/actions/runs/{run_id}"
+        if run_id
         else "",
         "run_started_at": format_time(now),
         "targets": targets,
@@ -706,136 +710,23 @@ def describe_config(config: Mapping[str, Any]) -> str:
     )
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument(
-        "--repository",
-        required=True,
-        help="owner/name of the repository to scan",
-    )
-    parser.add_argument(
-        "--registry",
-        default=GHCR_HOST,
-        help="image registry host (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--images", default="", help="image names without registry, one per line"
-    )
-    parser.add_argument(
-        "--release-lines",
-        default="1",
-        help="number of latest stable release lines (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--scan-source", default="true", help="true/false (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--scan-images", default="true", help="true/false (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--scan-release-source",
-        default="true",
-        help="true/false (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--osv-enabled",
-        default="true",
-        help="true/false: add an OSV twin of every Trivy target (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--targets",
-        default="",
-        help=(
-            "only the targets whose id matches one of these patterns (commas or "
-            "newlines; * and ? work); default: all"
-        ),
-    )
-    parser.add_argument(
-        "--early-warning-enabled",
-        default="true",
-        help="true/false: whether the run has the early warning (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--caller-repository",
-        default=None,
-        help="owner/name of the repository that runs the workflow "
-        "(default: env GITHUB_REPOSITORY)",
-    )
-    parser.add_argument(
-        "--ref-name",
-        default=None,
-        help="branch or tag the workflow runs on (default: env GITHUB_REF_NAME)",
-    )
-    parser.add_argument(
-        "--config",
-        default="",
-        help="SCA configuration (YAML) that replaces .github/sca.yml of the repository",
-    )
-    parser.add_argument(
-        "--output-dir", required=True, type=Path, help="directory for targets.json"
-    )
-    parser.add_argument(
-        "--github-token", default=None, help="GitHub token (default: env GITHUB_TOKEN)"
-    )
-    return parser.parse_args(argv)
-
-
 def run(
-    args: argparse.Namespace,
-    runner: Runner | None,
     environ: Mapping[str, str],
-    now: datetime,
+    runner: Runner | None = None,
+    now: datetime | None = None,
 ) -> int:
-    if not REPOSITORY_NAME.fullmatch(args.repository):
-        raise ResolveError(f"repository must be 'owner/name', got {args.repository!r}")
-    if not args.release_lines.strip().isdigit() or int(args.release_lines) < 1:
-        raise ResolveError(
-            f"release-lines must be a positive integer, got {args.release_lines!r}"
-        )
-    release_lines = int(args.release_lines)
-    images = parse_images(args.images)
-    scan_source = parse_bool(args.scan_source, "scan-source")
-    scan_images = parse_bool(args.scan_images, "scan-images")
-    scan_release_source = parse_bool(args.scan_release_source, "scan-release-source")
-    osv_enabled = parse_bool(args.osv_enabled, "osv-enabled")
-    early_warning_enabled = parse_bool(
-        args.early_warning_enabled, "early-warning-enabled"
-    )
-    caller_repository = args.caller_repository or environ.get("GITHUB_REPOSITORY", "")
-    if not REPOSITORY_NAME.fullmatch(caller_repository):
-        raise ResolveError(
-            f"caller repository must be 'owner/name', got {caller_repository!r}"
-        )
-    ref_name = args.ref_name or environ.get("GITHUB_REF_NAME", "")
-    if not ref_name:
-        raise ResolveError("the branch or tag of the run is unknown (no ref name)")
-    token = args.github_token or environ.get("GITHUB_TOKEN") or None
-
-    run_tool = runner or make_runner(token)
-    github = GitHubClient(run_tool)
-    registry = RegistryClient(run_tool, args.registry, token)
+    inputs = Inputs.from_environ(environ)
+    run_tool = runner or make_runner(inputs.token)
     targets_doc = resolve_targets(
-        repository=args.repository,
-        registry_name=args.registry,
-        images=images,
-        release_lines=release_lines,
-        scan_source=scan_source,
-        scan_images=scan_images,
-        scan_release_source=scan_release_source,
-        osv_enabled=osv_enabled,
-        github=github,
-        registry=registry,
-        environ=environ,
-        now=now,
-        config_input=args.config,
-        targets_filter=args.targets,
-        early_warning_enabled=early_warning_enabled,
-        caller_repository=caller_repository,
-        ref_name=ref_name,
+        inputs,
+        GitHubClient(run_tool),
+        RegistryClient(run_tool, inputs.registry, inputs.token),
+        environ,
+        now or datetime.now(UTC),
     )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    targets_file = args.output_dir / "targets.json"
+    inputs.output_dir.mkdir(parents=True, exist_ok=True)
+    targets_file = inputs.output_dir / "targets.json"
     targets_file.write_text(json.dumps(targets_doc, indent=2) + "\n", encoding="utf-8")
 
     print(
@@ -856,7 +747,9 @@ def run(
             "targets-file": str(targets_file),
             "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
             # Decided here, once; the early warning job and the merge follow it
-            "early-warning-enabled": "true" if early_warning_enabled else "false",
+            "early-warning-enabled": "true"
+            if inputs.early_warning_enabled
+            else "false",
         }
         append_text(
             output_path, "".join(format_output(k, v) for k, v in outputs.items())
@@ -864,10 +757,9 @@ def run(
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
+def main() -> int:
     try:
-        return run(args, None, os.environ, datetime.now(UTC))
+        return run(os.environ)
     except ResolveError as err:
         print(
             f"::error title=Scan target resolution failed::{escape_command_data(err)}"

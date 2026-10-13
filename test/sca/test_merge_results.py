@@ -88,7 +88,6 @@ def make_targets_doc(*targets: dict[str, Any]) -> dict[str, Any]:
         "default_branch": "main",
         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
         "registry": "ghcr.io",
-        "release_lines": 1,
         "run_kind": "full",
         "run_kind_reasons": [],
         "run_id": "42",

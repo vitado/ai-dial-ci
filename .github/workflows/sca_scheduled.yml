@@ -13,12 +13,8 @@ on:
         default: "ghcr.io"
       repository:
         type: string
-        description: Repository (owner/name) whose code is scanned and whose releases are resolved. Defaults to the calling repository
+        description: Repository (owner/name) whose code is scanned and whose release is resolved. Defaults to the calling repository
         default: ""
-      release-lines:
-        type: number
-        description: Number of latest stable release lines to scan
-        default: 1
       java-version:
         type: string
         description: Java version to use to generate lockfiles (Gradle repositories only)
@@ -69,7 +65,7 @@ on:
         default: true
       scan-release-source:
         type: boolean
-        description: Scan the source code of the latest releases (git tags), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
+        description: Scan the source code of the latest release (git tag), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
         default: true
       config:
         type: string
@@ -100,7 +96,6 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           registry: ${{ inputs.registry }}
           images: ${{ inputs.images }}
-          release-lines: ${{ inputs.release-lines }}
           scan-source: ${{ inputs.scan-source }}
           scan-images: ${{ inputs.scan-images }}
           scan-release-source: ${{ inputs.scan-release-source }}

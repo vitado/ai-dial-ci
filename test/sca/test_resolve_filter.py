@@ -10,13 +10,13 @@ from typing import Any
 import pytest
 from test_resolve_targets import (
     CALLER,
-    ENV,
     NOW,
-    REPOSITORY,
     FakeRunner,
+    git_tags_route,
     github_routes,
     ok,
     rt,
+    run_env,
     run_resolve_targets,
     tag_routes,
     tags_out,
@@ -200,19 +200,13 @@ def test_the_default_branch_is_the_one_of_the_calling_repository() -> None:
 def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
     t = FakeRunner()
     two_images_with_a_release(t)
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--images",
-        "example/x",
-        "--targets",
-        "x-development",
-        "--early-warning-enabled",
-        "false",
-        "--output-dir",
-        str(tmp_path),
-    ]
-    assert rt.run(rt.parse_args(argv), t, ENV, NOW) == 0
+    env = run_env(
+        tmp_path,
+        IMAGES="example/x",
+        TARGETS="x-development",
+        EARLY_WARNING_ENABLED="false",
+    )
+    assert rt.run(env, t, NOW) == 0
     doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in doc["targets"]] == ["x-development", "x-development"]
     assert [x["scanner"] for x in doc["targets"]] == ["trivy", "osv"]
@@ -223,21 +217,13 @@ def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
     ]
 
 
-def test_caller_and_ref_arguments_win_over_the_environment(tmp_path: Path) -> None:
+def test_caller_and_ref_come_from_the_environment(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     t.add("repos/other/caller", ok({"default_branch": "main"}))
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--caller-repository",
-        "other/caller",
-        "--ref-name",
-        "main",
-        "--output-dir",
-        str(tmp_path),
-    ]
-    assert rt.run(rt.parse_args(argv), t, ENV, NOW) == 0
+    env = run_env(tmp_path, GITHUB_REPOSITORY="other/caller", GITHUB_REF_NAME="main")
+    assert rt.run(env, t, NOW) == 0
     doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert doc["run_kind"] == "full"
 
@@ -252,6 +238,5 @@ def test_caller_and_ref_arguments_win_over_the_environment(tmp_path: Path) -> No
 def test_run_needs_the_caller_and_the_ref(
     tmp_path: Path, env: dict[str, str], message: str
 ) -> None:
-    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path)]
     with pytest.raises(rt.ResolveError, match=message):
-        rt.run(rt.parse_args(argv), FakeRunner(), {**ENV, **env}, NOW)
+        rt.run(run_env(tmp_path, **env), FakeRunner(), NOW)

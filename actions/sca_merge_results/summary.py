@@ -326,7 +326,9 @@ def verdict_text(
     ]
 
     def lines_of(group: Sequence[Record]) -> str:
-        return ", ".join(release_lines(release_tags_of(group, trivy_targets(targets))))
+        return ", ".join(
+            release_branches(release_tags_of(group, trivy_targets(targets)))
+        )
 
     patch_suffix = (
         " already fixed in development" if development_scanned(targets) else ""
@@ -654,7 +656,7 @@ def release_line(tag: str) -> str:
     return f"release-{match.group(1)}.{match.group(2)}" if match else f"release-{tag}"
 
 
-def release_lines(tags: Iterable[str]) -> list[str]:
+def release_branches(tags: Iterable[str]) -> list[str]:
     lines: list[str] = []
     for tag in tags:
         append_unique(lines, release_line(tag))

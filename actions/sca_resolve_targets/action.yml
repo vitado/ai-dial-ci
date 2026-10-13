@@ -1,5 +1,5 @@
 name: Resolve SCA scan targets
-description: Resolve the default-branch snapshot, the sources of the latest releases and the container images (development and latest releases) that an SCA scheduled scan should cover
+description: Resolve the default-branch snapshot, the source of the latest release and the container images (development and latest release) that an SCA scheduled scan should cover
 
 inputs:
   repository:
@@ -11,9 +11,6 @@ inputs:
   images:
     description: Image names without registry, one per line (e.g. epam/ai-dial-chat). Empty means source scan only
     default: ""
-  release-lines:
-    description: Number of latest stable release lines to scan
-    default: "1"
   scan-source:
     description: Whether to include the source (filesystem) target
     default: "true"
@@ -21,7 +18,7 @@ inputs:
     description: Whether to include the image targets
     default: "true"
   scan-release-source:
-    description: Whether to include the source (filesystem) targets of the latest releases (needs scan-source). They work without images, too
+    description: Whether to include the source (filesystem) target of the latest release (needs scan-source). It works without images, too
     default: "true"
   osv-enabled:
     description: Whether to add an OSV twin of every Trivy target (the packages of the Trivy target are also checked against OSV)
@@ -84,7 +81,6 @@ runs:
         REPOSITORY: ${{ inputs.repository }}
         REGISTRY: ${{ inputs.registry }}
         IMAGES: ${{ inputs.images }}
-        RELEASE_LINES: ${{ inputs.release-lines }}
         SCAN_SOURCE: ${{ inputs.scan-source }}
         SCAN_IMAGES: ${{ inputs.scan-images }}
         SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
@@ -97,17 +93,4 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         # the shared code of the SCA actions: actions/_sca_lib, a sibling of this directory
         PYTHONPATH: ${{ github.action_path }}/..
-      run: >-
-        python "$ACTION_PATH/resolve_targets.py"
-        --repository "$REPOSITORY"
-        --registry "$REGISTRY"
-        --images "$IMAGES"
-        --release-lines "$RELEASE_LINES"
-        --scan-source "$SCAN_SOURCE"
-        --scan-images "$SCAN_IMAGES"
-        --scan-release-source "$SCAN_RELEASE_SOURCE"
-        --osv-enabled "$OSV_ENABLED"
-        --targets "$TARGETS"
-        --early-warning-enabled "$EARLY_WARNING_ENABLED"
-        --config "$CONFIG"
-        --output-dir "$OUTPUT_DIR"
+      run: python "$ACTION_PATH/resolve_targets.py"

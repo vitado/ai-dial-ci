@@ -127,7 +127,6 @@ def git_tags_route(runner: FakeRunner, *pages: list[str]) -> None:
 def run_resolve_targets(
     runner: FakeRunner,
     images: list[str],
-    release_lines: int = 1,
     scan_source: bool = True,
     scan_images: bool = True,
     scan_release_source: bool = False,
@@ -135,22 +134,29 @@ def run_resolve_targets(
     token: str | None = "tkn",
     **kwargs: Any,
 ) -> dict[str, Any]:
-    return rt.resolve_targets(
+    inputs = rt.Inputs(
         repository=REPOSITORY,
-        registry_name="ghcr.io",
+        output_dir=Path("unused"),
+        caller_repository=CALLER,
         images=images,
-        release_lines=release_lines,
         scan_source=scan_source,
         scan_images=scan_images,
         scan_release_source=scan_release_source,
         osv_enabled=osv_enabled,
-        github=rt.GitHubClient(runner),
-        registry=rt.RegistryClient(runner, "ghcr.io", token),
-        environ=ENV,
-        now=NOW,
-        caller_repository=CALLER,
         **{"ref_name": "development", **kwargs},
     )
+    return rt.resolve_targets(
+        inputs,
+        rt.GitHubClient(runner),
+        rt.RegistryClient(runner, "ghcr.io", token),
+        ENV,
+        NOW,
+    )
+
+
+def run_env(output_dir: Path, **overrides: str) -> dict[str, str]:
+    """The environment the action passes to the script."""
+    return {**ENV, "REPOSITORY": REPOSITORY, "OUTPUT_DIR": str(output_dir), **overrides}
 
 
 TARGET_KEYS = {"id", "kind", "image", "tag", "ref", "git_ref", "commit_sha"}
@@ -164,7 +170,7 @@ def by_id(targets_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def test_semver_numeric_not_lexical() -> None:
-    assert rt.latest_release_lines(["0.9.1", "0.12.0", "0.10.3"], 1) == ["0.12.0"]
+    assert rt.newest_stable_tag(["0.9.1", "0.12.0", "0.10.3"]) == "0.12.0"
     assert rt.parse_stable_semver("0.12.0") > rt.parse_stable_semver("0.9.1")
 
 
@@ -179,31 +185,25 @@ def test_semver_excludes_prereleases_and_noise() -> None:
         "sha-abc",
         "1.2.3.4",
     ]
-    assert rt.latest_release_lines(tags, 5) == ["1.2.0"]
+    assert rt.newest_stable_tag(tags) == "1.2.0"
 
 
-def test_semver_v_prefix_and_max_patch_per_line() -> None:
-    tags = ["v1.2.1", "v1.2.10", "v1.2.9", "1.1.5", "1.1.4"]
-    assert rt.latest_release_lines(tags, 5) == ["v1.2.10", "1.1.5"]
+def test_semver_v_prefix() -> None:
+    assert rt.newest_stable_tag(["v1.2.1", "v1.2.10", "v1.2.9", "1.1.5"]) == "v1.2.10"
 
 
 def test_semver_same_version_prefers_unprefixed() -> None:
-    assert rt.latest_release_lines(["v1.0.0", "1.0.0"], 1) == ["1.0.0"]
-
-
-def test_semver_n_highest_lines() -> None:
-    tags = ["0.9.1", "0.9.0", "0.12.0", "0.11.2", "0.11.1", "1.0.0"]
-    assert rt.latest_release_lines(tags, 3) == ["1.0.0", "0.12.0", "0.11.2"]
+    assert rt.newest_stable_tag(["v1.0.0", "1.0.0"]) == "1.0.0"
 
 
 def test_semver_no_stable_tags() -> None:
-    assert rt.latest_release_lines(["development", "1.0.0-rc.1"], 2) == []
+    assert rt.newest_stable_tag(["development", "1.0.0-rc.1"]) is None
 
 
 # --- targets ------------------------------------------------------------------
 
 
-def test_release_lines_1_uses_github_latest_release() -> None:
+def test_latest_github_release_is_scanned() -> None:
     t = FakeRunner()
     github_routes(t, release="1.1.14")
     t.add(
@@ -239,13 +239,12 @@ def test_resolve_document_metadata() -> None:
     assert targets_doc["default_branch"] == "development"
     assert targets_doc["commit_sha"] == "a" * 40
     assert targets_doc["registry"] == "ghcr.io"
-    assert targets_doc["release_lines"] == 1
     assert targets_doc["run_id"] == "42"
     assert targets_doc["run_url"] == "https://github.com/example/caller/actions/runs/42"
     assert targets_doc["run_started_at"] == "2026-10-11T12:00:00Z"
 
 
-def test_release_lines_1_matches_v_stripped_tag() -> None:
+def test_v_prefixed_release_matches_the_unprefixed_image_tag() -> None:
     t = FakeRunner()
     github_routes(t, release="v1.1.14")
     t.add(tags_url("example/x"), tags_out(["development", "1.1.14"]))
@@ -254,38 +253,11 @@ def test_release_lines_1_matches_v_stripped_tag() -> None:
     assert targets["x-1.1.14"]["ref"] == "ghcr.io/example/x:1.1.14"
 
 
-def test_release_lines_3_uses_registry_semver_and_skips_github_release() -> None:
-    t = FakeRunner()
-    github_routes(t)
-    tags = [
-        "development",
-        "0.9.1",
-        "0.12.0",
-        "0.12.1",
-        "0.11.4",
-        "0.13.0-rc.1",
-        "0.10.0",
-    ]
-    t.add(tags_url("example/x"), tags_out(tags))
-    targets_doc = run_resolve_targets(t, ["example/x"], release_lines=3)
-    pending = [x["id"] for x in targets_doc["targets"] if x["status"] == "pending"]
-    assert pending == [
-        "source-development",
-        "x-development",
-        "x-0.12.1",
-        "x-0.11.4",
-        "x-0.10.0",
-    ]
-    assert not any(url.endswith("/releases/latest") for url in t.urls)
-
-
-def test_no_github_release_falls_back_to_registry_semver() -> None:
+def test_no_github_release_falls_back_to_the_newest_git_tag() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    t.add(
-        tags_url("example/x"),
-        tags_out(["development", "0.9.1", "0.12.0", "0.12.0-rc.1"]),
-    )
+    git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
+    t.add(tags_url("example/x"), tags_out(["development", "0.9.1", "0.12.0"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-0.12.0"]["status"] == "pending"
     assert "x-0.9.1" not in targets
@@ -314,6 +286,7 @@ def test_missing_development_tag_is_not_applicable() -> None:
 def test_no_stable_tags_gives_single_not_applicable_release_target() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, ["1.0.0-rc.1"])
     t.add(tags_url("example/x"), tags_out(["development", "1.0.0-rc.1"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-release"]["status"] == "not_applicable"
@@ -324,6 +297,7 @@ def test_no_stable_tags_gives_single_not_applicable_release_target() -> None:
 def test_image_without_tags() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     t.add(tags_url("example/x"), tags_out([]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "not_applicable"
@@ -346,6 +320,7 @@ def test_registry_error_fails_only_that_image() -> None:
 def test_registry_tool_failure_fails_image() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     t.add(tags_url("example/x"), rt.ToolError("boom"))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "failed"
@@ -408,6 +383,7 @@ def test_scan_images_false() -> None:
 def test_id_collision_rejected() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     t.add(tags_url("a/x"), tags_out(["development"]))
     t.add(tags_url("b/x"), tags_out(["development"]))
     with pytest.raises(rt.ResolveError, match="collision"):
@@ -731,18 +707,14 @@ def test_run_writes_resolve_json_and_outputs(
     tag_routes(t, "1.1.14", "b" * 40)
     t.add(tags_url("example/x"), tags_out(["development"]))
     output_file = tmp_path / "github_output"
-    env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--images",
-        "example/x\n",
-        "--osv-enabled",
-        "false",
-        "--output-dir",
-        str(tmp_path / "out"),
-    ]
-    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    env = run_env(
+        tmp_path / "out",
+        GITHUB_OUTPUT=str(output_file),
+        GITHUB_TOKEN="tkn",
+        IMAGES="example/x\n",
+        OSV_ENABLED="false",
+    )
+    assert rt.run(env, t, NOW) == 0
 
     targets_doc = json.loads(
         (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
@@ -776,24 +748,34 @@ def test_run_uses_token_from_environment(
     github_routes(t)
     tokens: list[str | None] = []
     monkeypatch.setattr(rt, "make_runner", lambda token: tokens.append(token) or t)
-    args = rt.parse_args(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
-    rt.run(args, None, {**ENV, "GITHUB_TOKEN": "from-env"}, NOW)
+    rt.run(run_env(tmp_path, GITHUB_TOKEN="from-env"), None, NOW)
     assert tokens == ["from-env"]
 
 
 @pytest.mark.parametrize(
     "extra",
     [
-        ["--release-lines", "0"],
-        ["--release-lines", "x"],
-        ["--scan-source", "maybe"],
-        ["--repository", "nope"],
+        {"SCAN_SOURCE": "maybe"},
+        {"REPOSITORY": "nope"},
+        {"REPOSITORY": ""},
+        {"OUTPUT_DIR": ""},
     ],
 )
-def test_run_rejects_invalid_inputs(tmp_path: Path, extra: list[str]) -> None:
-    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path), *extra]
+def test_run_rejects_invalid_inputs(tmp_path: Path, extra: dict[str, str]) -> None:
     with pytest.raises(rt.ResolveError):
-        rt.run(rt.parse_args(argv), FakeRunner(), ENV, NOW)
+        rt.run(run_env(tmp_path, **extra), FakeRunner(), NOW)
+
+
+def test_run_defaults_the_registry_and_the_switches(tmp_path: Path) -> None:
+    inputs = rt.Inputs.from_environ(run_env(tmp_path))
+    assert inputs == rt.Inputs(
+        repository=REPOSITORY,
+        output_dir=tmp_path,
+        caller_repository=CALLER,
+        ref_name="development",
+    )
+    assert inputs.registry == "ghcr.io"
+    assert inputs.scan_source and inputs.scan_images and inputs.osv_enabled
 
 
 def test_main_reports_fatal_error_and_exits_non_zero(
@@ -802,7 +784,9 @@ def test_main_reports_fatal_error_and_exits_non_zero(
     t = FakeRunner()
     t.add(f"repos/{REPOSITORY}", http_error(404))
     monkeypatch.setattr(rt, "make_runner", lambda token: t)
-    code = rt.main(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
+    for name, value in run_env(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    code = rt.main()
     assert code == 1
     assert "::error" in capsys.readouterr().out
     assert not (tmp_path / "targets.json").exists()
@@ -876,7 +860,7 @@ def test_release_source_target_of_latest_release() -> None:
     matrix = rt.build_matrix(targets_doc)
     assert all(set(m) == TARGET_KEYS for m in matrix)
     assert [m["id"] for m in matrix][:2] == ["source-development", "source-0.12.0"]
-    # one line needs no git tag listing
+    # the GitHub release needs no git tag listing
     assert not any("/tags?" in url for url in t.urls)
 
 
@@ -923,30 +907,13 @@ def test_release_source_without_images_python_package() -> None:
     assert not any(url.startswith("ghcr.io/") for url in t.urls)
 
 
-def test_release_source_falls_back_to_git_tags_without_github_release() -> None:
+def test_release_source_falls_back_to_the_newest_git_tag() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
     git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
     tag_routes(t, "0.12.0", "b" * 40)
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
     assert list(targets) == ["source-development", "source-0.12.0"]
-
-
-def test_release_source_lines_from_git_tags_newest_first() -> None:
-    t = FakeRunner()
-    github_routes(t)
-    git_tags_route(t, ["0.9.1", "0.10.0", "0.12.0", "0.12.1", "0.11.4", "0.13.0-rc.1"])
-    for tag in ("0.12.1", "0.11.4", "0.10.0"):
-        tag_routes(t, tag, "b" * 40)
-    targets_doc = run_resolve_targets(t, [], release_lines=3, scan_release_source=True)
-    assert [x["id"] for x in targets_doc["targets"]] == [
-        "source-development",
-        "source-0.12.1",
-        "source-0.11.4",
-        "source-0.10.0",
-    ]
-    # several lines: the git tags decide, not the latest GitHub release
-    assert not any(url.endswith("/releases/latest") for url in t.urls)
 
 
 def test_release_source_git_tag_listing_is_paginated() -> None:
@@ -1009,26 +976,18 @@ def test_run_scan_release_source_flag(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release="0.12.0")
     tag_routes(t, "0.12.0", "b" * 40)
-    base = [
-        "--repository",
-        REPOSITORY,
-        "--osv-enabled",
-        "false",
-        "--output-dir",
-        str(tmp_path),
-    ]
-    assert rt.run(rt.parse_args(base), t, ENV, NOW) == 0  # on by default
+    base = run_env(tmp_path, OSV_ENABLED="false")
+    assert rt.run(base, t, NOW) == 0  # on by default
     targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in targets_doc["targets"]] == [
         "source-development",
         "source-0.12.0",
     ]
-    off = [*base, "--scan-release-source", "false"]
-    assert rt.run(rt.parse_args(off), t, ENV, NOW) == 0
+    assert rt.run({**base, "SCAN_RELEASE_SOURCE": "false"}, t, NOW) == 0
     targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
     with pytest.raises(rt.ResolveError, match="scan-release-source"):
-        rt.run(rt.parse_args([*base, "--scan-release-source", "maybe"]), t, ENV, NOW)
+        rt.run({**base, "SCAN_RELEASE_SOURCE": "maybe"}, t, NOW)
 
 
 # --- OSV targets --------------------------------------------------------------
@@ -1174,8 +1133,8 @@ def test_run_adds_osv_twins_by_default(tmp_path: Path) -> None:
     tag_routes(t, "1.1.14", "b" * 40)
     output_file = tmp_path / "github_output"
     env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
-    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")]
-    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    env = {**run_env(tmp_path / "out"), **env}
+    assert rt.run(env, t, NOW) == 0
     outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
     assert [m["id"] for m in json.loads(outputs["matrix"])] == [
         "source-development",
@@ -1196,15 +1155,8 @@ def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t)
     tag_routes(t, "1.1.14", "b" * 40)
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--osv-enabled",
-        "false",
-        "--output-dir",
-        str(tmp_path / "out"),
-    ]
-    assert rt.run(rt.parse_args(argv), t, ENV, NOW) == 0
+    env = run_env(tmp_path / "out", OSV_ENABLED="false")
+    assert rt.run(env, t, NOW) == 0
     targets_doc = json.loads(
         (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
     )
@@ -1212,16 +1164,8 @@ def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
 
 
 def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--osv-enabled",
-        "maybe",
-        "--output-dir",
-        str(tmp_path),
-    ]
     with pytest.raises(rt.ResolveError):
-        rt.run(rt.parse_args(argv), FakeRunner(), ENV, NOW)
+        rt.run(run_env(tmp_path, OSV_ENABLED="maybe"), FakeRunner(), NOW)
 
 
 # --- repository configuration (.github/sca.yml) ------------------------------
@@ -1240,23 +1184,9 @@ def config_file_route(transport: FakeRunner, text: str) -> None:
 
 def resolve_config_of(transport: FakeRunner, config_input: str = "") -> dict[str, Any]:
     github_routes(transport, release=None)
-    return rt.resolve_targets(
-        repository=REPOSITORY,
-        registry_name="ghcr.io",
-        images=[],
-        release_lines=1,
-        scan_source=True,
-        scan_images=False,
-        scan_release_source=False,
-        osv_enabled=False,
-        github=rt.GitHubClient(transport),
-        registry=rt.RegistryClient(transport, "ghcr.io", "tkn"),
-        environ=ENV,
-        now=NOW,
-        caller_repository=CALLER,
-        ref_name="development",
-        config_input=config_input,
-    )["config"]
+    return run_resolve_targets(transport, [], scan_images=False, config=config_input)[
+        "config"
+    ]
 
 
 def test_no_config_file_means_the_defaults() -> None:
@@ -1352,22 +1282,15 @@ def test_run_passes_the_config_input_and_outputs_the_skip_mode(
     t = FakeRunner()
     github_routes(t, release=None)
     output_file = tmp_path / "github_output"
-    argv = [
-        "--repository",
-        REPOSITORY,
-        "--scan-images",
-        "false",
-        "--scan-release-source",
-        "false",
-        "--osv-enabled",
-        "false",
-        "--config",
-        "schema_version: 1\ntrivy_skip_paths: apply\n",
-        "--output-dir",
-        str(tmp_path / "out"),
-    ]
-    env = {**ENV, "GITHUB_OUTPUT": str(output_file)}
-    assert rt.run(rt.parse_args(argv), t, env, NOW) == 0
+    env = run_env(
+        tmp_path / "out",
+        SCAN_IMAGES="false",
+        SCAN_RELEASE_SOURCE="false",
+        OSV_ENABLED="false",
+        CONFIG="schema_version: 1\ntrivy_skip_paths: apply\n",
+        GITHUB_OUTPUT=str(output_file),
+    )
+    assert rt.run(env, t, NOW) == 0
     doc = json.loads((tmp_path / "out" / "targets.json").read_text())
     assert doc["config"]["source"] == "input"
     assert parse_github_output(output_file.read_text())["trivy-skip-paths"] == "apply"
@@ -1380,9 +1303,9 @@ def test_run_passes_the_config_input_and_outputs_the_skip_mode(
 def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     output_file = tmp_path / "github_output"
-    argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")]
-    rt.run(rt.parse_args(argv), t, {**ENV, "GITHUB_OUTPUT": str(output_file)}, NOW)
+    rt.run(run_env(tmp_path / "out", GITHUB_OUTPUT=str(output_file)), t, NOW)
     outputs = parse_github_output(output_file.read_text())
     assert outputs["trivy-skip-paths"] == "as_non_shipped"
     assert outputs["early-warning-enabled"] == "true"
@@ -1391,12 +1314,14 @@ def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> Non
 def test_run_outputs_whether_the_early_warning_is_enabled(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
+    git_tags_route(t, [])
     output_file = tmp_path / "github_output"
-    argv = [
-        *("--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")),
-        *("--early-warning-enabled", "false"),
-    ]
-    rt.run(rt.parse_args(argv), t, {**ENV, "GITHUB_OUTPUT": str(output_file)}, NOW)
+    env = run_env(
+        tmp_path / "out",
+        EARLY_WARNING_ENABLED="false",
+        GITHUB_OUTPUT=str(output_file),
+    )
+    rt.run(env, t, NOW)
     outputs = parse_github_output(output_file.read_text())
     assert outputs["early-warning-enabled"] == "false"
 
@@ -1408,9 +1333,9 @@ def test_main_reports_an_invalid_configuration_and_writes_nothing(
     github_routes(t, release=None)
     config_file_route(t, "schema_version: 7\n")
     monkeypatch.setattr(rt, "make_runner", lambda token: t)
-    monkeypatch.setenv("GITHUB_REPOSITORY", CALLER)
-    monkeypatch.setenv("GITHUB_REF_NAME", "development")
-    code = rt.main(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
+    for name, value in run_env(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    code = rt.main()
     assert code == 1
     out = capsys.readouterr().out
     assert out.startswith("::error title=Invalid SCA configuration::")

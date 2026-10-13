@@ -352,11 +352,9 @@ def test_a_record_is_slimmed(net: FakeDownloader, tmp_path: Path) -> None:
     "member",
     [
         b"{not json",
-        json.dumps({"x": 1}),
-        json.dumps(cve_doc("CVE-2030-1", state="RESERVED")),
     ],
 )
-def test_a_record_of_an_unexpected_shape_fails(
+def test_a_record_that_is_not_json_fails(
     net: FakeDownloader, tmp_path: Path, member: bytes | str
 ) -> None:
     day = TODAY - timedelta(days=1)
@@ -364,6 +362,50 @@ def test_a_record_of_an_unexpected_shape_fails(
     net.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = zip_bytes(members)
     with pytest.raises(b.FormatError):
         deltas(net, tmp_path, day)
+
+
+@pytest.mark.parametrize(
+    "member",
+    [json.dumps({"x": 1}), json.dumps(cve_doc("CVE-2030-1", state="RESERVED"))],
+)
+def test_a_record_of_an_unusual_shape_is_skipped_and_counted(
+    net: FakeDownloader, tmp_path: Path, capsys: Any, member: str
+) -> None:
+    day = TODAY - timedelta(days=1)
+    good = cve_doc("CVE-2030-2", affected=[pkg_entry("a")])
+    members = {
+        "cves/2030/0xxx/CVE-2030-1.json": member,
+        "cves/2030/0xxx/CVE-2030-2.json": good,
+    }
+    net.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = zip_bytes(members)
+    records, feed = deltas(net, tmp_path, day)
+    assert list(records) == ["CVE-2030-2"]
+    assert feed.skipped == {"CVE-2030-1"}
+    assert "::warning title=CVE record skipped::CVE-2030-1 is not indexed" in (
+        capsys.readouterr().out
+    )
+
+
+def test_the_skipped_records_are_counted_in_the_metadata(
+    net: FakeDownloader, tmp_path: Path
+) -> None:
+    net.whole(TODAY, cve_doc("CVE-2030-1", state="RESERVED"))
+    built = run_build(net, tmp_path)
+    assert built.records == {}
+    assert built.metadata["counts"]["skipped"] == 1
+
+
+def test_a_fetched_record_of_an_unusual_shape_is_skipped_and_is_no_gap(
+    net: FakeDownloader, tmp_path: Path, capsys: Any
+) -> None:
+    odd = cve_doc("CVE-2030-1001", published=stamp(10, 0), updated=stamp(10, 7))
+    net.log(("2030-01-10T07:40:00.000Z", [odd], []))
+    net.files[b.record_url(b.RECORDS_URL, "CVE-2030-1001")] = b'{"x": 1}'
+    built = run_build(net, tmp_path)
+    assert "CVE-2030-1001" not in built.records
+    assert built.metadata["gaps"] == []
+    assert built.metadata["counts"]["skipped"] == 1
+    assert "CVE-2030-1001 is not indexed" in capsys.readouterr().out
 
 
 def test_a_delta_that_is_not_a_zip_fails(net: FakeDownloader, tmp_path: Path) -> None:

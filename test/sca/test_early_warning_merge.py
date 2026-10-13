@@ -15,6 +15,7 @@ from test_merge_results import (
     Workspace,
     make_targets_doc,
     mr,
+    plain,
     records_by_id,
 )
 
@@ -126,7 +127,7 @@ def merge(ws: Workspace, enabled: bool = True) -> dict[str, Any]:
 
 
 def summary(ws: Workspace) -> str:
-    return (ws.out / "summary.md").read_text(encoding="utf-8")
+    return plain((ws.out / "summary.md").read_text(encoding="utf-8"))
 
 
 def entries(ws: Workspace) -> list[dict[str, Any]]:
@@ -181,7 +182,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "candidates": 1,
         "reported": 1,
         "packages": 1,
-        "index": INDEX,
+        "index": {**INDEX, "stale": False},
     }
     document = ws.json("_report/early_warning.json")
     assert document["schema_version"] == 1
@@ -672,7 +673,7 @@ def test_footer_is_there_when_nothing_is_reported(ws: Workspace) -> None:
 
 def test_the_report_has_the_index_of_a_failed_part_too(ws: Workspace) -> None:
     write_part(ws, status="failed", reason="the delta cannot be read")
-    assert merge(ws)["index"] == INDEX
+    assert merge(ws)["index"] == {**INDEX, "stale": False}
     write_part(ws, status="failed", reason="cannot pull the index", index=None)
     assert merge(ws)["index"] is None
 
@@ -787,3 +788,15 @@ def test_cli_flag_enables_the_early_warning(ws: Workspace) -> None:
     assert mr.main(args) == 0
     assert ws.json("_report/scan_report.json")["early_warning"]["reported"] == 1
     assert mr.parse_args(args[:-2]).early_warning_enabled is False
+
+
+def test_a_stale_index_is_in_the_report_and_the_footer(ws: Workspace) -> None:
+    write_part(ws, [candidate()], index={**INDEX, "stale": True})
+    assert merge(ws)["index"]["stale"] is True
+    assert "the index is more than 2 days old" in summary(ws)
+
+
+def test_a_fresh_index_has_no_staleness_note(ws: Workspace) -> None:
+    write_part(ws, [candidate()])
+    merge(ws)
+    assert "days old" not in summary(ws)

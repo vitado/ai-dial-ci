@@ -24,11 +24,14 @@ Outputs (``--output-dir``), ``schema_version: 1``:
   * ``metadata.json`` - when it was built, what it covers, the gaps of the feed,
     the counts.
 
-A feed with holes does not fail the build: every hour of every day of the covered
+A record of an unusual shape (cvelistV5 is written by many CNAs) does not fail the
+build either: it is skipped, with a warning that names it, and counted in
+``counts.skipped`` of ``metadata.json``; a record the previous index has stays as it
+was. A feed with holes does not fail the build: every hour of every day of the covered
 span must be covered by the ``end_of_day`` delta of its day or by its own hourly
 delta, and what is not is listed in ``gaps`` of ``metadata.json``. Anything else
 that is not as expected (a download that fails after its retries, a file that
-cannot be read, a record of an unknown shape) fails the build, and nothing is
+cannot be read) fails the build, and nothing is
 written: the index of the day before stays the latest one.
 
 The download layer is injectable (``Downloader.fetch(url, dest)``), so the logic is
@@ -177,6 +180,16 @@ class UrllibDownloader:
 # --------------------------------------------------------------------------
 
 
+def escape_command_data(text: object) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (scanner output, a repository, a feed), and
+    ``%``, CR and LF would end or forge the command. The same function is in every
+    module that prints commands (a shared package comes later).
+    """
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def format_time(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -203,9 +216,21 @@ def index_record(document: Any, where: str) -> dict[str, Any]:
     return record
 
 
-def read_cve_zip(path: Path, cutoff: datetime) -> Iterator[dict[str, Any]]:
+def skip_record(skipped: set[str], cve: str, err: Exception) -> None:
+    """Leave out a record that is not of a known shape, and say so."""
+    skipped.add(cve)
+    print(
+        "::warning title=CVE record skipped::"
+        + escape_command_data(f"{cve} is not indexed: {err}")
+    )
+
+
+def read_cve_zip(
+    path: Path, cutoff: datetime, skipped: set[str]
+) -> Iterator[dict[str, Any]]:
     """The records of a zip of CVE record files that were updated since the cutoff.
-    The members that are not ``CVE-*.json`` (indexes, directories) are skipped.
+    The members that are not ``CVE-*.json`` (indexes, directories) are skipped, and
+    so are, with their ids added to ``skipped``, the records of an unknown shape.
     """
     try:
         archive = zipfile.ZipFile(path)
@@ -223,7 +248,11 @@ def read_cve_zip(path: Path, cutoff: datetime) -> Iterator[dict[str, Any]]:
                 document = json.loads(archive.read(info))
             except (ValueError, zipfile.BadZipFile) as err:
                 raise FormatError(f"{where}: unreadable: {err}") from err
-            record = index_record(document, where)
+            try:
+                record = index_record(document, where)
+            except FormatError as err:
+                skip_record(skipped, base.removesuffix(".json"), err)
+                continue
             if ew.parse_time(record["updated"]) >= cutoff:  # type: ignore[operator]
                 yield record
 
@@ -253,6 +282,7 @@ def baseline_asset(day: date) -> str:
 @dataclass
 class Feed:
     gaps: set[datetime] = field(default_factory=set)  # hours without a delta
+    skipped: set[str] = field(default_factory=set)  # records of an unknown shape
     last_asset: str | None = None
 
 
@@ -272,7 +302,11 @@ class FeedClient:
 
 
 def load_baseline(
-    client: FeedClient, today: date, cutoff: datetime, records: dict[str, Any]
+    client: FeedClient,
+    today: date,
+    cutoff: datetime,
+    records: dict[str, Any],
+    skipped: set[str],
 ) -> date:
     """Merge the records of the whole list that were updated since the cutoff into
     ``records``; return the day of the snapshot (today's when it is published, else
@@ -294,7 +328,7 @@ def load_baseline(
             outer.unlink()
         inner = outer.parent / "cves.zip"
         try:
-            for record in read_cve_zip(inner, cutoff):
+            for record in read_cve_zip(inner, cutoff, skipped):
                 merge_record(records, record)
         finally:
             inner.unlink()
@@ -324,7 +358,7 @@ def apply_deltas(
         if path is None:
             return False
         try:
-            for record in read_cve_zip(path, cutoff):
+            for record in read_cve_zip(path, cutoff, feed.skipped):
                 merge_record(records, record)
         finally:
             path.unlink()
@@ -404,7 +438,10 @@ def reconcile(
     except (IndexBuildError, ValueError, TypeError, AttributeError) as err:
         # the span is not reconciled: say so, whole hours of it
         feed.gaps |= hours_between(since, now)
-        print(f"::warning title=CVE delta log::cannot reconcile: {err}")
+        print(
+            "::warning title=CVE delta log::"
+            + escape_command_data(f"cannot reconcile: {err}")
+        )
         return 0
     feed.gaps = {h for h in feed.gaps if h < hour_of(horizon)}
     fetched_records = 0
@@ -421,8 +458,15 @@ def reconcile(
             finally:
                 dest.unlink()
             merge_record(records, index_record(document, cve))
+        except FormatError as err:
+            # fetched, but not a record we can index: nothing a later build can mend
+            skip_record(feed.skipped, cve, err)
+            continue
         except (IndexBuildError, ValueError) as err:
-            print(f"::warning title=CVE record::{cve} cannot be fetched: {err}")
+            print(
+                "::warning title=CVE record::"
+                + escape_command_data(f"{cve} cannot be fetched: {err}")
+            )
         fetched_records += 1
         now_known = records.get(cve)
         if now_known is None or ew.parse_time(now_known["updated"]) < updated:  # type: ignore[operator]
@@ -554,7 +598,7 @@ def build(
         mode = "incremental"
     if previous is None or prev_to < cutoff:  # type: ignore[operator]
         # Nothing the deltas connect to: the whole list, then the deltas from its day
-        start = load_baseline(client, now.date(), cutoff, records)
+        start = load_baseline(client, now.date(), cutoff, records, feed.skipped)
         baseline = str(start)
         mode = "bootstrap"
     apply_deltas(records, client, start, now, cutoff, feed)
@@ -591,6 +635,7 @@ def build(
             "records": len(records),
             "rejected": sum(r["state"] == STATE_REJECTED for r in records.values()),
             "reconciled": reconciled,
+            "skipped": len(feed.skipped),
         },
     }
     return Built(records, metadata)
@@ -617,7 +662,8 @@ def summary_markdown(built: Built, out_dir: Path, seconds: float) -> str:
         "",
         f"- built {meta['built_at']} ({meta['mode']}, {seconds / 60:.1f} min), "
         f"window {meta['window_days']} days, covered to {meta['covered']['to']}",
-        f"- {counts['records']} records ({counts['rejected']} rejected)",
+        f"- {counts['records']} records ({counts['rejected']} rejected, "
+        f"{counts['skipped']} skipped for their shape)",
         f"- sizes: {sizes}",
         f"- feed gaps: {len(gaps)}" + (f" ({listed})" if gaps else ""),
     ]
@@ -659,7 +705,10 @@ def main(
         )
         write_index(built, args.output_dir)
     except IndexBuildError as err:
-        print(f"::error title=CVE index not built::{err}", file=sys.stderr)
+        print(
+            f"::error title=CVE index not built::{escape_command_data(err)}",
+            file=sys.stderr,
+        )
         return 1
     finally:
         shutil.rmtree(args.work_dir, ignore_errors=True)

@@ -89,6 +89,10 @@ jobs:
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
       trivy-skip-paths: ${{ steps.targets.outputs.trivy-skip-paths }}
+      # Resolved once here; the early-warning job and the merge follow this output, not the input
+      early-warning-enabled: ${{ steps.targets.outputs.early-warning-enabled }}
+    # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
+    timeout-minutes: 15
     steps:
       - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
         id: targets
@@ -110,22 +114,22 @@ jobs:
           path: ${{ steps.targets.outputs.targets-file }}
           retention-days: 1
           if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
 
-  # One Trivy DB snapshot per run: all targets scan against the same DB versions, and the matrix jobs neither
-  # download the DB each nor race to save the same cache keys (this job is the single cache writer)
+  # One Trivy DB snapshot per run: all targets scan against the same DB versions, and the matrix jobs do not download
+  # the DB each. The snapshot (about 1 GiB) is an artifact of the run that expires after a day, not a cache entry: a
+  # cache entry of that size, unique per run, would evict the caches of the repositories from the 10 GiB quota
   trivy-db:
     if: ${{ inputs.scan-source || inputs.scan-images }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
     outputs:
-      cache-key: ${{ steps.key.outputs.cache-key }}
       db-info: ${{ steps.info.outputs.db-info }}
+    # Two downloads from the mirrors (tried in order) and the upload of the snapshot, a few minutes in the pilot; the
+    # bound only stops a mirror that is up but crawling
+    timeout-minutes: 20
     steps:
-      # First, so that the key is published even if a later step fails
-      - name: Define DB cache key
-        id: key
-        run: echo "cache-key=trivy-db-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
       - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
         with:
           version: ${{ inputs.trivy-version }}
@@ -148,10 +152,14 @@ jobs:
           db_info="$(jq -c '{vulnerability_db_updated_at: .VulnerabilityDB.UpdatedAt, java_db_updated_at: .JavaDB.UpdatedAt}' "$RUNNER_TEMP/trivy-version.json")"
           echo "db-info=$db_info" >> "$GITHUB_OUTPUT"
           echo "Trivy DB snapshot: $db_info" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      # Artifacts are scoped to the run, so the name is the same for every run
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          name: sca-trivy-db
           path: ${{ runner.temp }}/trivy-cache
-          key: ${{ steps.key.outputs.cache-key }}
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
 
   trivy:
     needs: [targets, trivy-db]
@@ -162,6 +170,10 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # A target is a checkout, a scan and, for a Gradle repository, a Gradle run that resolves every configuration: the
+    # long part, up to about 30 minutes in the pilot (an image or a lockfile scan takes a few). 45 minutes leave room
+    # for a slow dependency registry and stop a build that hangs
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -188,14 +200,13 @@ jobs:
     steps:
       - name: Prepare output directory
         run: mkdir -p "$RUNNER_TEMP/sca-out/trivy"
-      # The DB snapshot of the trivy-db job; a miss fails the target instead of silently downloading another DB
+      # The DB snapshot of the trivy-db job; a missing artifact fails the target instead of silently downloading another DB
       - name: Restore Trivy databases
         id: db
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          name: sca-trivy-db
           path: ${{ runner.temp }}/trivy-cache
-          key: ${{ needs.trivy-db.outputs.cache-key }}
-          fail-on-cache-miss: true
       - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
         id: setup
         with:
@@ -324,6 +335,7 @@ jobs:
           path: ${{ runner.temp }}/sca-out/
           retention-days: 1
           if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
 
   # OSV is asked (by osv-scanner, over a BOM that Trivy converts from its result) about the language packages Trivy
   # found (OS packages are not queried), so it runs after the Trivy matrix. A broken query is a failed target like a
@@ -361,6 +373,7 @@ jobs:
           path: ${{ runner.temp }}/sca-out/
           retention-days: 1
           if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
 
   # The early warning matches the CNA data of recent CVE records with the language packages Trivy found, for CVEs that no
   # scanner of the run reports because no database maps them to a package yet. One job per run, after the Trivy matrix.
@@ -368,7 +381,7 @@ jobs:
   # the job
   early-warning:
     needs: [targets, trivy]
-    if: ${{ !cancelled() && needs.targets.result == 'success' && inputs.early-warning-enabled && needs.targets.outputs.matrix != '[]' }}
+    if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.early-warning-enabled == 'true' && needs.targets.outputs.matrix != '[]' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
@@ -399,6 +412,7 @@ jobs:
           path: ${{ runner.temp }}/sca-out/
           retention-days: 1
           if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
 
   report:
     needs: [targets, trivy-db, trivy, osv, early-warning]
@@ -407,6 +421,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
+    # Downloads the parts and merges them: a minute or two in the pilot
+    timeout-minutes: 20
     steps:
       # The targets part is always there, so the download does not fail when no target was scanned
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -421,7 +437,7 @@ jobs:
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca
           trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
-          early-warning-enabled: ${{ inputs.early-warning-enabled }}
+          early-warning-enabled: ${{ needs.targets.outputs.early-warning-enabled }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
@@ -429,6 +445,7 @@ jobs:
           path: ${{ runner.temp }}/sca/
           retention-days: ${{ inputs.retention-days }}
           if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
       # After the upload, so that the report is available even if some targets failed
       - name: Fail on failed targets
         if: ${{ steps.merge.outputs.failed-count != '0' }}

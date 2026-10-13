@@ -16,10 +16,13 @@ Inputs:
 
 Outputs (in the output directory, ``osv/``), per OSV target id:
   * ``<id>.status.json`` - ``{id, status, reason, packages_queried,
-    packages_skipped, queried_at, scanner_version}``; status is ``ok``,
+    packages_skipped, packages_unread, queried_at, scanner_version}``; status is ``ok``,
     ``failed`` or ``not_applicable``; ``packages_queried`` counts the packages in
     the osv-scanner output (``--all-packages``, so the clean ones too),
-    ``packages_skipped`` the language packages without a package URL;
+    ``packages_skipped`` the language packages without a package URL,
+    ``packages_unread`` the BOM packages (after the filter) that are not in that
+    output (osv-scanner did not read them: they were not queried; reported, not a
+    failure);
   * ``<id>.json`` (``ok`` only) - the osv-scanner JSON output, unmodified.
 
 osv-scanner exits 0 (nothing found) or 1 (vulnerabilities found); any other exit
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -57,6 +61,8 @@ OS_PURL_TYPES = frozenset({"deb", "apk", "rpm"})
 EXIT_CODES_OK = (0, 1)
 EXIT_NOT_FOUND = 127
 REASON_LIMIT = 400
+# The unread packages shown in a warning
+UNREAD_LISTED = 5
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
@@ -73,6 +79,15 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         )
     except OSError as err:
         return subprocess.CompletedProcess(command, EXIT_NOT_FOUND, "", str(err))
+
+
+def escape_command_data(text: str) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (a package name of a scanned repository), and
+    ``%``, CR and LF would end or forge the command.
+    """
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def tail(text: str) -> str:
@@ -159,12 +174,37 @@ def filter_bom(bom: dict[str, Any]) -> tuple[dict[str, Any], int]:
     }, skipped
 
 
+def package_key(name: Any, version: Any) -> tuple[str, str]:
+    """A package as the BOM and the osv-scanner output name it (the ecosystems
+    normalise names differently, hence the loose comparison).
+    """
+    return re.sub(r"[-_.]+", "-", str(name).lower()), str(version or "")
+
+
+def unread_packages(bom: dict[str, Any], output: Any) -> list[str]:
+    """The ``name@version`` of the BOM packages that the osv-scanner output lacks."""
+    read = {
+        package_key(p["package"]["name"], p["package"]["version"])
+        for result in output["results"]
+        for p in result["packages"]
+    }
+    unread = {
+        f"{c.get('name')}@{c.get('version') or '?'}"
+        for c in bom["components"]
+        # the image itself (a container component) is no package for osv-scanner
+        if c.get("type") == "library"
+        and package_key(c.get("name"), c.get("version")) not in read
+    }
+    return sorted(unread)
+
+
 @dataclass
 class Outcome:
     status: str
     reason: str | None = None
     packages_queried: int | None = None
     packages_skipped: int | None = None
+    packages_unread: list[str] | None = None
 
 
 def scan_target(
@@ -195,15 +235,17 @@ def scan_target(
     else:
         write_json(output, {"results": []})
     try:
+        result = read_json(output)
         packages = {
             (p["package"]["ecosystem"], p["package"]["name"], p["package"]["version"])
-            for result in read_json(output)["results"]
-            for p in result["packages"]
+            for r in result["results"]
+            for p in r["packages"]
         }
+        unread = unread_packages(bom, result)
     except (OSError, ValueError, KeyError, TypeError) as err:
         reason = f"osv-scanner wrote no valid result: {err!r}"
         return Outcome(STATUS_FAILED, reason, queried, skipped)
-    return Outcome(STATUS_OK, None, len(packages), skipped)
+    return Outcome(STATUS_OK, None, len(packages), skipped, unread)
 
 
 def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
@@ -246,6 +288,11 @@ def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
                     "reason": outcome.reason,
                     "packages_queried": outcome.packages_queried,
                     "packages_skipped": outcome.packages_skipped,
+                    "packages_unread": (
+                        None
+                        if outcome.packages_unread is None
+                        else len(outcome.packages_unread)
+                    ),
                     "queried_at": queried_at if applicable else None,
                     "scanner_version": version if applicable else None,
                 },
@@ -257,6 +304,18 @@ def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
                 print(
                     f"::notice title=OSV skipped packages::{tid}: "
                     f"{outcome.packages_skipped} package(s) without a package URL"
+                )
+            if outcome.packages_unread:
+                listed = outcome.packages_unread[:UNREAD_LISTED]
+                more = len(outcome.packages_unread) - len(listed)
+                names = ", ".join(listed) + (f" and {more} more" if more else "")
+                print(
+                    "::warning title=OSV did not read packages::"
+                    + escape_command_data(
+                        f"{tid}: osv-scanner did not read "
+                        f"{len(outcome.packages_unread)} package(s) of the BOM "
+                        f"({names}); they were not checked against OSV"
+                    )
                 )
     return failed
 
@@ -294,7 +353,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run_all(args, run_command, datetime.now(UTC))
     except InputError as err:
-        print(f"::error title=Invalid OSV query input::{err}", file=sys.stderr)
+        print(
+            f"::error title=Invalid OSV query input::{escape_command_data(str(err))}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

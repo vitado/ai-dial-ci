@@ -15,6 +15,7 @@ from test_merge_results import (
     Workspace,
     make_targets_doc,
     mr,
+    plain,
     records_by_id,
 )
 
@@ -265,7 +266,7 @@ def test_summary_marks_not_shipped_locations_and_names_the_configuration(
 ) -> None:
     ws = workspace(tmp_path, ["app/", "core/"])
     ws.run()
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "app/gradle.lockfile (not shipped)" in md
     assert "core/gradle.lockfile (not shipped)" in md
     assert "package-lock.json (not shipped)" not in md
@@ -301,7 +302,7 @@ def test_summary_names_an_input_that_replaces_the_file(tmp_path: Path) -> None:
 def test_headline_of_a_run_whose_only_findings_are_not_shipped(tmp_path: Path) -> None:
     ws = workspace(tmp_path, ["app/", "core/", "package-lock.json"])
     ws.run()
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "> | Source only (build / test / not shipped) |" in md
     assert (
         "> **No known vulnerabilities in development — 3 only in "
@@ -321,7 +322,7 @@ def test_skip_paths_scanned_as_non_shipped_count_as_not_shipped(
     recs = records_by_id(ws)
     assert recs["CVE-2000-0003"]["exposure"] == "source_only"
     assert recs["CVE-2000-0001"]["exposure"] == "development_only"
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "app/gradle.lockfile (not shipped)" in md
     assert (
         "trivy.yaml skip paths scanned, not shipped: app, core" in md

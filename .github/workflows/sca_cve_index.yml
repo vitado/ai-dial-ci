@@ -2,7 +2,9 @@ name: SCA CVE index
 
 # The daily index of the CVE records that the early warning of the SCA scheduled scan
 # reads (see "CVE index for the early warning" in the README). It is an OCI artifact
-# in the GitHub Container Registry.
+# in the GitHub Container Registry. Two jobs: the one that builds the index runs
+# code that downloads and parses outside data and may only read packages; the one
+# that publishes it may write them and runs nothing but ORAS and the cleanup.
 
 on:
   schedule:
@@ -16,7 +18,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: sca-cve-index
@@ -29,6 +30,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read # the previous index
     timeout-minutes: 60
     steps:
       - name: Check out
@@ -63,6 +67,42 @@ jobs:
         with:
           output-dir: ${{ runner.temp }}/index
           previous-dir: ${{ steps.previous.outputs.dir }}
+      # The index travels to the publishing job as an artifact: the job that parsed outside data has no right to write
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sca-cve-index
+          path: ${{ runner.temp }}/index
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true # a re-run of the failed jobs uploads again
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    # An index of about 30 MB: a push, and the cleanup of the old versions
+    timeout-minutes: 15
+    steps:
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+      - name: Name the artifact
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "IMAGE=ghcr.io/${OWNER,,}/ai-dial-sca-cve-index" >> "$GITHUB_ENV"
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: oras login ghcr.io --username "$ACTOR" --password-stdin <<< "$TOKEN"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sca-cve-index
+          path: ${{ runner.temp }}/index
       - name: Publish the index
         env:
           SOURCE: ${{ github.server_url }}/${{ github.repository }}

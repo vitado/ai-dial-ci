@@ -44,6 +44,16 @@ class ConfigError(Exception):
     """The Trivy configuration of the repository cannot be understood."""
 
 
+def escape_command_data(text: object) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (scanner output, a repository, a feed), and
+    ``%``, CR and LF would end or forge the command. The same function is in every
+    module that prints commands (a shared package comes later).
+    """
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def load_config(path: Path) -> dict[str, Any] | None:
     """The parsed trivy.yaml, None if there is no such file."""
     if not path.is_file():
@@ -150,7 +160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.generated_dir,
         )
     except ConfigError as err:
-        print(f"::error title=Invalid Trivy configuration::{err}")
+        print(f"::error title=Invalid Trivy configuration::{escape_command_data(err)}")
         return 1
     output_path = os.environ.get("GITHUB_OUTPUT")
     if output_path:

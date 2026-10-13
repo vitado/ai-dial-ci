@@ -29,9 +29,13 @@ Inputs:
 Outputs (``<output-dir>/early-warning/``):
   * ``status.json`` - ``{status, reason, window_days, records_scanned,
     candidates, index, diagnostics}``; status is ``ok``, ``failed`` or ``skipped``;
-    ``index`` is ``{ref, digest, built_at, gaps}`` (``gaps``: the hours of the
-    window for which the feed had no delta, the index's and those of the deltas
-    applied since), or null if no index was read;
+    ``index`` is ``{ref, digest, built_at, gaps, stale}`` (``gaps``: the hours of
+    the window for which the feed had no delta, the index's and those of the deltas
+    applied since; ``stale``: the index was built more than ``INDEX_STALE_DAYS``
+    days ago, which the builder's daily run should not allow: the early warning
+    goes on, from an older index plus the deltas, and says so), or null if no index
+    was read; ``diagnostics.index_records_skipped`` counts the records of an unknown
+    shape that the catch-up with the deltas left out;
   * ``candidates.json`` (``ok`` only) - ``{schema_version, generated_utc,
     generated_from, candidates[]}``; a candidate is one CVE for one package
     version, with the CNA data it was matched by, how it was matched (``match``) and
@@ -252,6 +256,16 @@ class HttpClient:
                 delay = _retry_after(response) or delay
             self._sleep(delay)
         raise AssertionError("unreachable")  # pragma: no cover
+
+
+def escape_command_data(text: object) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (scanner output, a repository, a feed), and
+    ``%``, CR and LF would end or forge the command. The same function is in every
+    module that prints commands (a shared package comes later).
+    """
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def _retry_after(response: Response) -> float | None:
@@ -1247,6 +1261,10 @@ def builder() -> Any:
     return build_cve_index
 
 
+# An index older than this is reported: the builder has not run for a while
+INDEX_STALE_DAYS = 2
+
+
 @dataclass
 class IndexData:
     """The CVE index as read: the records (the latest version of each), its metadata
@@ -1259,6 +1277,7 @@ class IndexData:
     ref: str
     digest: str | None = None
     gaps: list[dict[str, str]] = field(default_factory=list)
+    skipped: int = 0  # records of an unknown shape left out by the catch-up
 
 
 def pull_index(ref: str, dest: Path, run: Runner = subprocess.run) -> str:
@@ -1345,6 +1364,7 @@ def catch_up(
             index.records, downloader, work_dir / "reconcile", since, now, cutoff, feed
         )
         gaps = feed.gaps | {h for h in bci.gaps_of(index.gaps) if h < since}
+        index.skipped = len(feed.skipped)
     except bci.IndexBuildError as err:
         raise IndexUnavailable(str(err)) from err
     first_hour = cutoff.replace(minute=0, second=0)
@@ -1365,6 +1385,11 @@ def index_document(index: IndexData) -> dict[str, Any]:
         "built_at": index.metadata.get("built_at"),
         "gaps": index.gaps,
     }
+
+
+def index_is_stale(index: IndexData, now: datetime) -> bool:
+    built = parse_time(index.metadata.get("built_at"))
+    return built is not None and now - built > timedelta(days=INDEX_STALE_DAYS)
 
 
 # --------------------------------------------------------------------------
@@ -1769,6 +1794,7 @@ def analyse(
     matched = match_records(index.records.values(), match_index, inventory)
     diagnostics.update(
         index_records=len(index.records),
+        index_records_skipped=index.skipped,
         depsdev_requests=lookup.requests,
         depsdev_names_without_repo=lookup.without_repo,
         depsdev_errors=lookup.errors,
@@ -1790,7 +1816,7 @@ def analyse(
         window_days,
         len(index.records),
         len(matched.candidates),
-        index_document(index),
+        {**index_document(index), "stale": index_is_stale(index, now)},
         diagnostics,
     )
     return status, candidates_doc
@@ -1825,16 +1851,29 @@ def run(
             f"{status['diagnostics']['packages']} package version(s), "
             f"{status['candidates']} candidate(s)"
         )
+        if status["index"]["stale"]:
+            print(
+                "::warning title=Early warning index is stale::"
+                + escape_command_data(
+                    f"the CVE index was built {status['index']['built_at']}, more "
+                    f"than {INDEX_STALE_DAYS} days ago: the daily build of "
+                    "sca_cve_index.yml may be failing; the early warning used the "
+                    "deltas since"
+                )
+            )
         gaps = status["index"]["gaps"]
         if gaps:
             print(
                 "::warning title=Early warning feed gaps::no CVE feed delta for "
-                + ", ".join(f"{g['from']} to {g['to']}" for g in gaps)
+                + escape_command_data(
+                    ", ".join(f"{g['from']} to {g['to']}" for g in gaps)
+                )
             )
     elif status["status"] == STATUS_FAILED:
         print(
-            f"::warning title=Early warning unavailable::{status['reason']} "
-            "(the scan itself is not affected)"
+            "::warning title=Early warning unavailable::"
+            + escape_command_data(status["reason"])
+            + " (the scan itself is not affected)"
         )
     else:
         print(f"early warning skipped: {status['reason']}")
@@ -1877,7 +1916,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run(args, UrllibTransport(), datetime.now(UTC))
     except InputError as err:
-        print(f"::error title=Invalid early warning input::{err}", file=sys.stderr)
+        print(
+            f"::error title=Invalid early warning input::{escape_command_data(err)}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

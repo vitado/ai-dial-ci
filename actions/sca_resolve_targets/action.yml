@@ -52,6 +52,9 @@ outputs:
   trivy-skip-paths:
     description: How the skip-dirs and skip-files of the trivy.yaml of the repository are treated (as_non_shipped, apply or ignore), from the SCA configuration
     value: ${{ steps.targets.outputs.trivy-skip-paths }}
+  early-warning-enabled:
+    description: Whether the run has the early warning (true or false), the input as the run resolved it; what the early warning job and the merge follow
+    value: ${{ steps.targets.outputs.early-warning-enabled }}
 
 runs:
   using: "composite"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import sys
 import urllib.parse
@@ -28,6 +29,16 @@ def _load_merge_results():
 
 
 mr = _load_merge_results()
+
+
+def plain(markdown: str) -> str:
+    """The Markdown without the backslashes of the cell escapes, as a reader sees it."""
+    return re.sub(r"\\([|\[\]()!`])", r"\1", markdown)
+
+
+def plain_lines(lines: list[str]) -> list[str]:
+    return [plain(line) for line in lines]
+
 
 SOURCE = {
     "id": "source-development",
@@ -322,6 +333,7 @@ def test_totals_by_severity_and_exposure(full: Workspace) -> None:
         "locations_scanned",
         "findings",
         "queried_at",
+        "packages_unread",
     ]
 
 
@@ -526,7 +538,7 @@ def test_output_is_deterministic(tmp_path: Path) -> None:
 
 def test_summary_md_sections(full: Workspace) -> None:
     full.run()
-    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((full.out / "summary.md").read_text(encoding="utf-8"))
     assert md.startswith("# SCA · example/app\n")
     assert "## What to fix" in md
     assert "<summary>Scan coverage</summary>" in md
@@ -1360,7 +1372,7 @@ def test_scope_table_counts_each_record_once_per_scope(
             fix_available=True,
         ),
     ]
-    assert mr.scope_table(source_and_images, records) == [
+    assert plain_lines(mr.scope_table(source_and_images, records)) == [
         "| Scope | CRITICAL | HIGH | MEDIUM | LOW | Fixable | Base image |",
         "|---|---:|---:|---:|---:|---:|---:|",
         "| 1.0.0 (released) | 1 | 1 | 0 | 1 | 2 | 2 |",
@@ -1378,7 +1390,7 @@ def test_scope_table_has_a_row_per_release_and_an_unknown_column_if_needed() -> 
         rec("release_only", "UNKNOWN", scan_targets=["app-1.0.0", "app-0.9.0"]),
         rec("release_only", "HIGH", scan_targets=["app-0.9.0"]),
     ]
-    assert mr.scope_table({"targets": targets}, records) == [
+    assert plain_lines(mr.scope_table({"targets": targets}, records)) == [
         "| Scope | CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN | Fixable | Base image |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
         "| 1.0.0 (released) | 0 | 0 | 0 | 0 | 1 | 0 | 0 |",
@@ -2068,7 +2080,7 @@ def test_summary_md_shows_chains_in_actions_watch_and_paths_section(
         json.dumps({"Results": []}), encoding="utf-8"
     )
     ws.run()
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "> | Source only (build / test) | 0 | 2 | 0 | 0 | 1 | — |" in md
     # braces has no fix: watch section, the chain in "Introduced via"
     assert (
@@ -2208,7 +2220,7 @@ def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
     recs = records_by_id(ws)
     assert recs["CVE-1"]["upgrade_to"] == recs["CVE-3"]["upgrade_to"] == "2.9.1"
     assert recs["CVE-2"]["upgrade_to"] is None
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     fix = md.split("## What to fix")[1].split("<details")[0]
     assert (
         "| 1 | urllib3 · python | 2.7.0 → 2.9.1 | 1 HIGH, 1 LOW "
@@ -2609,7 +2621,7 @@ def test_release_only_finding_gets_paths_and_the_lockfile_of_its_tag(
         ["requests", "urllib3"],
     ]
     assert record["dependency_paths_total"] == 2
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert (
         "> **Release a patch from release-1.0 — 1 HIGH already fixed in development**"
         in md
@@ -2637,7 +2649,7 @@ def test_finding_only_in_release_sources_is_source_only_when_there_are_images(
     (record,) = ws.json("_report/vulnerabilities.json")["records"]
     assert record["scan_targets"] == ["source-1.0.0"]
     assert record["exposure"] == "source_only"
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     # a release source does not make a release verdict: the image decides
     assert (
         "> **No known vulnerabilities in 1.0.0 and development "
@@ -2679,7 +2691,7 @@ def test_run_without_images_is_classified_and_headlined_by_the_sources(
         "development_only": 1,
         "source_only": 0,
     }
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert (
         "> **Release a patch from release-1.0, release-0.9 — 1 HIGH already fixed "
         "in development · 1 CRITICAL/HIGH without a fix — see watch**" in md
@@ -2700,7 +2712,7 @@ def test_run_without_images_finding_in_tag_and_development_is_open_in_both(
     ws.run()
     (record,) = ws.json("_report/vulnerabilities.json")["records"]
     assert record["exposure"] == "release_and_development"
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "> **Fix 1 HIGH in development and backport to release-1.0**" in md
     assert "> | 1.0.0 (released) | 0 | 1 | 0 | 0 | 1 | 0 |" in md
     assert "> | development | 0 | 1 | 0 | 0 | 1 | 0 |" in md
@@ -4497,7 +4509,7 @@ def test_summary_marks_the_osv_only_vulnerability_and_counts_them(
     with_osv: Workspace,
 ) -> None:
     with_osv.run()
-    md = (with_osv.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((with_osv.out / "summary.md").read_text(encoding="utf-8"))
     assert (
         "[CVE-2030-0002](https://osv.dev/vulnerability/GHSA-aaaa-aaaa-0002) · OSV only"
         in md
@@ -4900,7 +4912,7 @@ def test_os_packages_are_one_base_image_row_with_the_packages_below(
     )
     trivy = {"app-development": image, "app-1.0.0": image}
     ws = merge_scan(tmp_path, trivy, {}, DEV, REL)
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     fix = md.split("## What to fix")[1].split("## No fix available")[0]
     # one row of the base image, after the dependency, naming no OS package
     assert "| 1 | leaf · python | 1.0 → 1.1 | 1 HIGH |" in fix
@@ -5008,7 +5020,7 @@ def test_base_image_rows_are_one_per_exposure_and_image_line(tmp_path: Path) -> 
     )
     trivy = {"app-development": development, "app-1.0.0": release}
     ws = merge_scan(tmp_path, trivy, {}, DEV, REL)
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     fix = md.split("## What to fix")[1].split("<details>")[0]
     assert "| Base image · ubuntu 22.04 / ubuntu 24.04 (1 package) " in fix
     assert (
@@ -5131,7 +5143,7 @@ def test_a_jar_listed_under_the_fixed_version_too_needs_no_upgrade(
     assert record["fix_available"] is True
     assert record["upgrade_to"] is None
     assert record["fixed_versions"] == ["10.2.4.jre11", "12.10.2.jre11", "13.2.1.jre11"]
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
+    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     # no wrong upgrade, and only the fixes that are above the installed version
     assert (
         f"| 1 | {MSSQL} · java | 12.10.2 → no upgrade computed "
@@ -5232,3 +5244,132 @@ def test_fixed_versions_text_names_the_fixes_above_the_installed_version() -> No
     assert mr.fixed_versions_text(["1.0", "1.1"], "2.0") == "1.0, 1.1"
     assert mr.fixed_versions_text(["abc", "def"], "1.0") == "abc, def"
     assert mr.fixed_versions_text([]) == ""
+
+
+# --- the safety of the output ---------------------------------------------------
+
+
+def test_md_cell_leaves_no_link_image_or_code_span_to_an_outside_text() -> None:
+    cell = mr.md_cell("[x](https://e.invalid) ![i](u) `c` a|b <b>")
+    assert plain(cell) == "[x](https://e.invalid) ![i](u) `c` a|b &lt;b&gt;"
+    for char in "[]()!`|":
+        assert all(
+            cell[i - 1] == "\\" for i, c in enumerate(cell) if c == char and i > 0
+        )
+    assert mr.md_cell("a\r\nb") == "a  b"
+    assert mr.md_cell(None) == "-"
+
+
+def test_md_link_is_a_link_that_md_cell_keeps() -> None:
+    link = mr.md_link("CVE-1 [x]", "https://e.invalid/a(b) c")
+    assert link == "[CVE-1 \\[x\\]](https://e.invalid/a%28b%29%20c)"
+    assert mr.md_cell(link) == link
+    joined = mr.md_join(", ", [link, "[plain](u)"])
+    assert mr.md_cell(joined).endswith(", \\[plain\\]\\(u\\)")
+
+
+def test_command_data_is_escaped() -> None:
+    assert mr.escape_command_data("a%b\r\nc") == "a%25b%0D%0Ac"
+
+
+def test_a_target_reason_cannot_forge_a_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path, make_targets_doc(SOURCE))
+    ws.add_part("source-development", None, status="failed", reason="a%b\n::error::x")
+    assert ws.run() == 1
+    lines = capsys.readouterr().out.splitlines()
+    (failed,) = [line for line in lines if "Scan target failed" in line]
+    assert failed.endswith("a%25b%0A::error::x")
+    assert not any(line.startswith("::error::x") for line in lines)
+
+
+# --- the step summary limit -----------------------------------------------------
+
+
+def test_a_summary_that_fits_is_written_as_it_is() -> None:
+    assert mr.truncate_summary("# SCA\n", None) == "# SCA\n"
+
+
+def test_a_summary_over_the_limit_is_cut_with_a_note_and_open_blocks_are_closed() -> (
+    None
+):
+    row = "| " + "x" * 100 + " |\n"
+    text = "# SCA\n\n<details>\n<summary>big</summary>\n\n" + row * 20000
+    assert len(text.encode()) > mr.STEP_SUMMARY_LIMIT_BYTES
+    cut = mr.truncate_summary(text, "https://github.com/o/r/actions/runs/1#artifacts")
+    assert len(cut.encode()) <= mr.STEP_SUMMARY_LIMIT_BYTES
+    assert cut.count("<details>") == cut.count("</details>")
+    assert "The summary is cut" in cut
+    assert "[this run](https://github.com/o/r/actions/runs/1#artifacts)" in cut
+    assert cut.startswith("# SCA")
+
+
+def test_main_writes_a_cut_summary_to_the_step_summary_and_keeps_the_file(
+    full: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mr, "STEP_SUMMARY_LIMIT_BYTES", 400)
+    step = tmp_path / "step.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(step))
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_RUN_ID", "7")
+    assert mr.main(cli_args(full)) == 0
+    whole = (full.out / "summary.md").read_text(encoding="utf-8")
+    written = step.read_text(encoding="utf-8")
+    assert len(whole.encode()) > 400
+    assert len(written.encode()) <= 400
+    assert "https://github.com/o/r/actions/runs/7#artifacts" in written
+
+
+# --- the freshness of the Trivy DB ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("updated", "stale"),
+    [
+        ("2030-01-03T00:00:00.123456789Z", None),
+        ("2030-01-02T00:00:00Z", 2),
+        ("2029-12-25T00:00:00Z", 10),
+        (None, None),
+        ("soon", None),
+    ],
+)
+def test_a_trivy_db_snapshot_of_two_days_or_more_is_stale(
+    updated: str | None, stale: int | None
+) -> None:
+    db = {"vulnerability_db_updated_at": updated, "java_db_updated_at": None}
+    assert mr.trivy_db_stale_days(db, "2030-01-04T00:00:00Z") == stale
+
+
+def test_a_stale_db_is_a_line_of_the_report_and_a_warning_and_not_a_failure(
+    full: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old = {"vulnerability_db_updated_at": "2020-01-01T06:00:00Z"}
+    assert mr.main(cli_args(full, "--trivy-db-info", json.dumps(old))) == 0
+    assert "::warning title=Trivy DB is stale::" in capsys.readouterr().out
+    md = (full.out / "summary.md").read_text(encoding="utf-8")
+    assert "DB vuln 2020-01-01 06:00Z" in md
+    assert " days old" in md
+
+
+def test_a_fresh_db_has_no_warning(
+    full: Workspace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert mr.main(cli_args(full, "--trivy-db-info", json.dumps(DB_INFO))) == 0
+    assert "stale" not in capsys.readouterr().out
+
+
+# --- the packages that osv-scanner did not read --------------------------------
+
+
+def test_unread_osv_packages_are_in_the_entry_and_the_coverage_note() -> None:
+    target = {"id": "t", "scanner": "osv"}
+    state = {"status": "ok", "reason": None, "packages_unread": 3}
+    native = {"results": []}
+    assert mr.build_target_entry(target, state, native)["packages_unread"] == 3
+    ok = {"status": "ok", "packages_unread": 3}
+    assert mr.unread_note(ok) == "OSV did not read 3 package(s)"
+    assert mr.unread_note({"status": "ok", "packages_unread": 0}) is None
+    assert mr.unread_note({"status": "failed", "packages_unread": 3}) is None
+    assert mr.unread_note(None) is None

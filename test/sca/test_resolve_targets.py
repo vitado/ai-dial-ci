@@ -1399,6 +1399,20 @@ def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> Non
     rt.run(rt.parse_args(argv), t, {**ENV, "GITHUB_OUTPUT": str(output_file)}, NOW)
     outputs = parse_github_output(output_file.read_text())
     assert outputs["trivy-skip-paths"] == "as_non_shipped"
+    assert outputs["early-warning-enabled"] == "true"
+
+
+def test_run_outputs_whether_the_early_warning_is_enabled(tmp_path: Path) -> None:
+    t = FakeRunner()
+    github_routes(t, release=None)
+    output_file = tmp_path / "github_output"
+    argv = [
+        *("--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")),
+        *("--early-warning-enabled", "false"),
+    ]
+    rt.run(rt.parse_args(argv), t, {**ENV, "GITHUB_OUTPUT": str(output_file)}, NOW)
+    outputs = parse_github_output(output_file.read_text())
+    assert outputs["early-warning-enabled"] == "false"
 
 
 def test_main_reports_an_invalid_configuration_and_writes_nothing(

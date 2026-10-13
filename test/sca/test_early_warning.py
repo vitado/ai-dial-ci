@@ -1716,6 +1716,7 @@ def test_run_writes_the_part(ws: Workspace, tmp_path: Path) -> None:
         "digest": None,
         "built_at": BUILT,
         "gaps": [],
+        "stale": False,
     }
     diagnostics = document["diagnostics"]
     assert diagnostics["packages"] == 2
@@ -1804,6 +1805,31 @@ def test_run_reports_the_gaps_of_the_feed(
         "::warning title=Early warning feed gaps::no CVE feed delta for "
         "2030-01-07T04:00:00Z to 2030-01-07T08:00:00Z" in capsys.readouterr().out
     )
+
+
+def test_run_warns_about_an_index_older_than_two_days_and_goes_on(
+    ws: Workspace, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws.add_target("source-development", trivy_native(*GUAVA_PURLS))
+    status = run_early_warning(
+        ws,
+        guava_network(),
+        index_dir=guava_index(tmp_path, built_at="2030-01-07T03:21:00Z"),
+        cve_index=None,
+    )
+    assert status == "ok"
+    assert ws.json("status.json")["index"]["stale"] is True
+    assert "::warning title=Early warning index is stale::" in capsys.readouterr().out
+
+
+def test_a_fresh_index_gives_no_staleness_warning(
+    ws: Workspace, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws.add_target("source-development", trivy_native(*GUAVA_PURLS))
+    run_early_warning(
+        ws, guava_network(), index_dir=guava_index(tmp_path), cve_index=None
+    )
+    assert "stale" not in capsys.readouterr().out
 
 
 def test_run_skips_without_a_scanned_trivy_target(ws: Workspace) -> None:

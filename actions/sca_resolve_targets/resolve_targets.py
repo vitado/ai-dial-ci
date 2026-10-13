@@ -83,6 +83,16 @@ class ToolError(Exception):
 Runner = Callable[[Sequence[str], str | None], str]
 
 
+def escape_command_data(text: object) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (scanner output, a repository, a feed), and
+    ``%``, CR and LF would end or forge the command. The same function is in every
+    module that prints commands (a shared package comes later).
+    """
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def make_runner(
     token: str | None,
     sleep: Callable[[float], None] = time.sleep,
@@ -688,12 +698,13 @@ def annotations(targets: Sequence[Mapping[str, Any]]) -> list[str]:
             continue
         if target["status"] == "not_applicable":
             lines.append(
-                f"::notice title=Scan target {target['id']} skipped::{target['reason']}"
+                f"::notice title=Scan target {target['id']} skipped"
+                f"::{escape_command_data(target['reason'])}"
             )
         elif target["status"] == "failed":
             lines.append(
                 f"::warning title=Scan target {target['id']} failed to resolve"
-                f"::{target['reason']}"
+                f"::{escape_command_data(target['reason'])}"
             )
     return lines
 
@@ -859,6 +870,8 @@ def run(
             "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
             "targets-file": str(targets_file),
             "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
+            # Decided here, once; the early warning job and the merge follow it
+            "early-warning-enabled": "true" if early_warning_enabled else "false",
         }
         with open(output_path, "a", encoding="utf-8", newline="\n") as out:
             out.writelines(format_output(k, v) for k, v in outputs.items())
@@ -870,10 +883,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return run(args, None, os.environ, datetime.now(UTC))
     except ResolveError as err:
-        print(f"::error title=Scan target resolution failed::{err}")
+        print(
+            f"::error title=Scan target resolution failed::{escape_command_data(err)}"
+        )
         return 1
     except sca_config.ConfigError as err:
-        print(f"::error title=Invalid SCA configuration::{err}")
+        print(f"::error title=Invalid SCA configuration::{escape_command_data(err)}")
         return 1
 
 

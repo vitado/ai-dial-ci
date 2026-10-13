@@ -107,6 +107,11 @@ CVE_PREFIX = "CVE-"
 RUN_KINDS = ("full", "partial")
 DIGEST_SHORT_LENGTH = 12
 TRIVY_DB_KEYS = ("vulnerability_db_updated_at", "java_db_updated_at")
+# The vulnerability DB is built daily; a snapshot older than this is reported
+TRIVY_DB_STALE_DAYS = 2
+# GitHub rejects a step summary over 1 MiB; the rest of the limit is left for the
+# parts of the summary that are not this one
+STEP_SUMMARY_LIMIT_BYTES = 1024 * 1024 - 16 * 1024
 MERGE_KEY = (
     "(repo, id x package x installed-version), merged across scan_targets and "
     "scanners; id is the one Trivy reports, for a vulnerability only OSV knows its "
@@ -229,6 +234,16 @@ class InputError(Exception):
 # --------------------------------------------------------------------------
 # Reading inputs
 # --------------------------------------------------------------------------
+
+
+def escape_command_data(text: object) -> str:
+    """Escape a text for the message of a workflow command (``::warning::``).
+
+    The text may come from outside (scanner output, a repository, a feed), and
+    ``%``, CR and LF would end or forge the command. The same function is in every
+    module that prints commands (a shared package comes later).
+    """
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def read_json(path: Path) -> Any:
@@ -381,6 +396,7 @@ def load_target_result(
         state.update(
             queried_at=status.get("queried_at"),
             scanner_version=status.get("scanner_version"),
+            packages_unread=status.get("packages_unread"),
         )
     return state, native
 
@@ -523,12 +539,16 @@ def apply_gradle_graph(
     graphs, problems = load_gradle_graphs(graph_dir)
     for problem in problems:
         print(
-            f"::warning title=Gradle dependency graph ignored::{target_id}: {problem}"
+            "::warning title=Gradle dependency graph ignored::"
+            + escape_command_data(f"{target_id}: {problem}")
         )
     for lockfile in enrich_gradle_results(native, graphs):
         print(
-            f"::warning title=No Gradle dependency graph::{target_id}: {lockfile} "
-            "has no dependency graph, so its findings have no dependency paths"
+            "::warning title=No Gradle dependency graph::"
+            + escape_command_data(
+                f"{target_id}: {lockfile} has no dependency graph, "
+                "so its findings have no dependency paths"
+            )
         )
 
 
@@ -2235,7 +2255,8 @@ def early_warning_report(
 
 def early_warning_index(status: Mapping[str, Any]) -> dict[str, Any] | None:
     """The CVE index the part was made from (``ref``, ``digest``, ``built_at``,
-    ``gaps``: ranges of hours without a feed delta); None if the part has none.
+    ``gaps``: ranges of hours without a feed delta, ``stale``: the index was built
+    long before the run); None if the part has none.
     """
     index = status.get("index")
     if index is None:
@@ -2248,6 +2269,7 @@ def early_warning_index(status: Mapping[str, Any]) -> dict[str, Any] | None:
             "gaps": [
                 {"from": str(g["from"]), "to": str(g["to"])} for g in index["gaps"]
             ],
+            "stale": bool(index.get("stale")),
         }
     except (KeyError, TypeError, AttributeError) as e:
         raise EarlyWarningPartError(
@@ -2529,6 +2551,7 @@ def build_target_entry(
         "locations_scanned": None,
         "findings": None,
         "queried_at": None,
+        "packages_unread": None,
     }
     if native is None:
         return entry
@@ -2536,6 +2559,7 @@ def build_target_entry(
         entry["packages_scanned"] = len(osv_packages(native))
         entry["findings"] = finding_stats(osv_findings(native).values())
         entry["queried_at"] = state.get("queried_at")
+        entry["packages_unread"] = state.get("packages_unread")
     else:
         entry.update(count_packages(native))
         entry["findings"] = finding_stats(target_findings(native).values())
@@ -2586,9 +2610,11 @@ def build_scan_report(
             if entry["packages_scanned"] == 0:
                 print(
                     "::warning title=No packages in scan result::"
-                    f"{target_name(target)}: "
-                    "0 packages were seen (an empty scan is suspicious: no lockfiles, "
-                    "an unsupported ecosystem or a missing package list)"
+                    + escape_command_data(
+                        f"{target_name(target)}: "
+                        "0 packages were seen (an empty scan is suspicious: no "
+                        "lockfiles, an unsupported ecosystem or a missing package list)"
+                    )
                 )
             if target["scanner"] == SCANNER_OSV:
                 osv_scanner_version = osv_scanner_version or state.get(
@@ -2634,6 +2660,33 @@ def build_vulnerabilities(
     }
 
 
+def trivy_db_age_days(
+    trivy_db: Mapping[str, str | None] | None, generated_utc: str
+) -> int | None:
+    """Whole days between the update of the vulnerability DB snapshot and the report;
+    None if either is unknown. Only the vulnerability DB is judged: it is the one
+    that is built daily.
+    """
+    # Trivy writes nanoseconds and the zone as Z: the first 19 characters are enough
+    try:
+        updated = datetime.strptime(
+            ((trivy_db or {}).get("vulnerability_db_updated_at") or "")[:19],
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        generated = datetime.strptime((generated_utc or "")[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (generated - updated).days
+
+
+def trivy_db_stale_days(
+    trivy_db: Mapping[str, str | None] | None, generated_utc: str
+) -> int | None:
+    """The age in days of a Trivy DB snapshot that is too old, else None."""
+    age = trivy_db_age_days(trivy_db, generated_utc)
+    return age if age is not None and age >= TRIVY_DB_STALE_DAYS else None
+
+
 def parse_trivy_db_info(raw: str) -> dict[str, str | None]:
     """Parse the ``--trivy-db-info`` JSON; empty or malformed means unknown.
 
@@ -2646,7 +2699,10 @@ def parse_trivy_db_info(raw: str) -> dict[str, str | None]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"::warning title=Trivy DB info ignored::not valid JSON: {e}")
+        print(
+            "::warning title=Trivy DB info ignored::not valid JSON: "
+            + escape_command_data(e)
+        )
         return info
     if not isinstance(parsed, dict):
         print("::warning title=Trivy DB info ignored::not a JSON object")
@@ -2662,13 +2718,41 @@ def parse_trivy_db_info(raw: str) -> dict[str, str | None]:
 # --------------------------------------------------------------------------
 
 
+class Markup(str):
+    """Markdown that the report itself wrote (a link): ``md_cell`` keeps it."""
+
+
+def md_escape(text: Any) -> str:
+    """A text of any source as plain text in a Markdown table cell: no link, image,
+    code span or HTML out of an outside text (an advisory title).
+    """
+    escaped = str(text).replace("\\", "\\\\")
+    for char in "|[]()!`":
+        escaped = escaped.replace(char, "\\" + char)
+    escaped = escaped.replace("<", "&lt;").replace(">", "&gt;")
+    return escaped.replace("\r", " ").replace("\n", " ")
+
+
+def md_link(text: Any, url: str) -> Markup:
+    """A link whose text is plain text and whose URL cannot end early."""
+    target = url.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+    return Markup(f"[{md_escape(text)}]({target})")
+
+
+def md_join(separator: str, parts: Iterable[Any]) -> Markup:
+    """Parts (``Markup`` as it is, the rest as plain text) joined by a separator."""
+    return Markup(
+        separator.join(p if isinstance(p, Markup) else md_escape(p) for p in parts)
+    )
+
+
 def md_cell(value: Any) -> str:
     """Render a value as one safe Markdown table cell."""
     if value is None or value == "":
         return "-"
-    text = str(value).replace("\\", "\\\\").replace("|", "\\|")
-    text = text.replace("<", "&lt;").replace(">", "&gt;")
-    return text.replace("\r", " ").replace("\n", " ")
+    if isinstance(value, Markup):
+        return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return md_escape(value)
 
 
 def md_table(
@@ -3674,11 +3758,14 @@ def is_osv_only(record: Mapping[str, Any]) -> bool:
     return record["scanners"] == [SCANNER_OSV]
 
 
-def id_cell(record: Record) -> str:
+def id_cell(record: Record) -> Markup:
     vuln_id = record["id"]
-    text = f"[{vuln_id}]({record['primary_url']})" if record["primary_url"] else vuln_id
-    text = f"{text} · OSV only" if is_osv_only(record) else text
-    return text
+    text = (
+        md_link(vuln_id, record["primary_url"])
+        if record["primary_url"]
+        else md_escape(vuln_id)
+    )
+    return Markup(f"{text} · OSV only" if is_osv_only(record) else text)
 
 
 def cvss_cell(record: Record) -> str | None:
@@ -3797,6 +3884,14 @@ def skip_paths_note(target: Mapping[str, Any] | None) -> str | None:
     }[skip["mode"]]
 
 
+def unread_note(osv: Mapping[str, Any] | None) -> str | None:
+    """The packages of the BOM that osv-scanner did not read, so OSV did not check."""
+    unread = (osv or {}).get("packages_unread")
+    if not unread or osv["status"] != STATUS_OK:  # type: ignore[index]
+        return None
+    return f"OSV did not read {unread} package(s)"
+
+
 def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     """One row per scanned subject (the id Trivy and OSV share), a cell per scanner."""
     several = has_several_images(targets)
@@ -3820,6 +3915,7 @@ def render_coverage(targets: Sequence[Mapping[str, Any]]) -> list[str]:
                     note
                     for note in (
                         "no packages seen" if empty else None,
+                        unread_note(osv),
                         skip_paths_note(trivy),
                     )
                     if note
@@ -3936,9 +4032,10 @@ def early_warning_row(
     """
     links = []
     for entry in group:
-        link = f"[{entry['cve']}]({CVE_RECORD_URL}{entry['cve']})"
+        link = md_link(entry["cve"], f"{CVE_RECORD_URL}{entry['cve']}")
         if len(group) > 1:
-            link += f" ({early_warning_severity_text(entry)})"
+            severity = md_escape(early_warning_severity_text(entry))
+            link = Markup(f"{link} ({severity})")
         links.append(link)
     cnas: list[str] = []
     dates: list[str] = []
@@ -3952,7 +4049,7 @@ def early_warning_row(
     return [
         f"{group[0]['pkg']} {group[0]['version']}",
         early_warning_severity_text(group[0]),
-        ", ".join(links),
+        md_join(", ", links),
         ", ".join(cnas),
         ", ".join(dates),
         " · ".join(ranges),
@@ -4029,6 +4126,8 @@ def early_warning_footer(early_warning: EarlyWarning | None) -> str | None:
         text += f" (since {start})"
     if report["records_scanned"] is not None:
         text += f", {report['records_scanned']} checked"
+    if index.get("stale"):
+        text += " · the index is more than 2 days old, its daily build is late"
     if early_warning.gaps:
         listed = early_warning.gaps[:EARLY_WARNING_GAPS_LISTED]
         more = len(early_warning.gaps) - len(listed)
@@ -4059,6 +4158,9 @@ def render_footer(
         ]
         java_db = format_timestamp(java_raw, with_date=not same_day)
         parts.append(f"{text} (java {java_db})" if java_db else text)
+        stale = trivy_db_stale_days(db, report["generated_utc"])
+        if stale is not None:
+            parts.append(f"DB is {stale} days old")
     generated = format_timestamp(report["generated_utc"])
     if generated:
         parts.append(f"generated {generated}")
@@ -4247,6 +4349,12 @@ def run_merge(
         early_warning,
     )
     vulns = build_vulnerabilities(repo, generated_utc, records)
+    if (stale := trivy_db_stale_days(trivy_db, generated_utc)) is not None:
+        print(
+            "::warning title=Trivy DB is stale::the vulnerability DB snapshot was "
+            f"updated {(trivy_db or {})['vulnerability_db_updated_at']}, {stale} "
+            "days before the report; a scan with it may miss recent advisories"
+        )
 
     dump_json(report_dir / "vulnerabilities.json", vulns)
     dump_json(report_dir / "scan_report.json", scan_report)
@@ -4255,7 +4363,7 @@ def run_merge(
         if early_warning.report["status"] == STATUS_FAILED:
             print(
                 "::warning title=Early warning unavailable::"
-                f"{early_warning.report['reason']}"
+                + escape_command_data(early_warning.report["reason"])
             )
     base_os = {
         t["id"]: label
@@ -4275,13 +4383,40 @@ def run_merge(
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]
     for t in failed:
         name = f"{t['id']} ({t['scanner']})"
-        print(f"::error title=Scan target failed::{name}: {t['reason']}")
+        print(
+            "::error title=Scan target failed::"
+            + escape_command_data(f"{name}: {t['reason']}")
+        )
     totals = scan_report["totals"]["findings"]
     print(
         f"canonical set: {totals['total']} records ({totals['fixable']} fixable); "
         f"{len(failed)} failed target(s)"
     )
     return len(failed)
+
+
+def truncate_summary(text: str, run_url: str | None) -> str:
+    """The summary as the job summary can take it: whole if it fits, else cut at a
+    line, with the ``<details>`` it left open closed and a note on where the whole
+    of it is.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= STEP_SUMMARY_LIMIT_BYTES:
+        return text
+    where = "the `sca-report` artifact of this run"
+    if run_url:
+        where = f"the `sca-report` artifact of [this run]({run_url})"
+    note = (
+        f"\n> The summary is cut: it is {len(data)} bytes and a job summary takes "
+        f"1 MiB. The whole `summary.md` is in {where}.\n"
+    )
+    close = "</details>" + "\n"
+    # room to close the blocks that the cut leaves open (they do not nest deeper)
+    room = STEP_SUMMARY_LIMIT_BYTES - len(note.encode("utf-8")) - 2 * len(close)
+    kept = data[:room].decode("utf-8", errors="ignore")
+    kept = kept[: kept.rfind("\n") + 1]
+    open_blocks = kept.count("<details") - kept.count("</details>")
+    return kept + close * max(open_blocks, 0) + note
 
 
 def append_text(path: str, text: str) -> None:
@@ -4359,13 +4494,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.early_warning_enabled,
         )
     except InputError as e:
-        print(f"::error title=Invalid merge input::{e}", file=sys.stderr)
+        print(
+            f"::error title=Invalid merge input::{escape_command_data(e)}",
+            file=sys.stderr,
+        )
         return 1
 
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if args.step_summary and step_summary:
         summary = (args.output_dir / "summary.md").read_text(encoding="utf-8")
-        append_text(step_summary, summary)
+        server = os.environ.get("GITHUB_SERVER_URL")
+        repository = os.environ.get("GITHUB_REPOSITORY")
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        run_url = (
+            f"{server}/{repository}/actions/runs/{run_id}#artifacts"
+            if server and repository and run_id
+            else None
+        )
+        append_text(step_summary, truncate_summary(summary, run_url))
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         append_text(github_output, f"failed-count={failed_count}\n")

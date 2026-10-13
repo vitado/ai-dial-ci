@@ -34,8 +34,14 @@ qo = _load_query_osv()
 
 
 def component(purl: str | None, kind: str = "library") -> dict[str, Any]:
-    name = (purl or "lockfile").split("/")[-1].split("@")[0]
-    return {"type": kind, "name": name, **({"purl": purl} if purl else {})}
+    last = (purl or "lockfile").split("/")[-1]
+    name, _, version = last.partition("@")
+    return {
+        "type": kind,
+        "name": name,
+        **({"version": version.split("?")[0]} if version else {}),
+        **({"purl": purl} if purl else {}),
+    }
 
 
 BOM = {
@@ -267,6 +273,7 @@ def test_exit_0_and_1_are_ok_and_the_output_is_kept_as_is(
         # the packages of the output (--all-packages), not the findings
         "packages_queried": 2,
         "packages_skipped": 1,
+        "packages_unread": 0,
         "queried_at": "2030-01-01T12:00:00Z",
         "scanner_version": "2.6.0",
     }
@@ -384,6 +391,36 @@ def test_skipped_packages_are_noticed(
     assert (
         "::notice title=OSV skipped packages::source-development: 1 package(s)" in out
     )
+
+
+def test_packages_of_the_bom_that_osv_scanner_did_not_read_are_counted_and_warned(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = Workspace(tmp_path)
+    output = osv_output(("npm", "lodash", "4.17.0"))
+    assert ws.run(FakeCommands(scanner_exit=0, scanner_output=output)) == 0
+    assert ws.status()["status"] == "ok"
+    assert ws.status()["packages_unread"] == 1
+    out = capsys.readouterr().out
+    assert "::warning title=OSV did not read packages::source-development:" in out
+    assert "requests@2.0.0" in out
+
+
+def test_all_packages_read_gives_no_unread_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Workspace(tmp_path).run(FakeCommands())
+    assert "did not read" not in capsys.readouterr().out
+
+
+def test_package_names_are_compared_loosely() -> None:
+    bom = {"components": [{"name": "Typing_Extensions", "version": "4.0"}]}
+    output = osv_output(("PyPI", "typing-extensions", "4.0"))
+    assert qo.unread_packages(bom, output) == []
+
+
+def test_command_data_is_escaped() -> None:
+    assert qo.escape_command_data("a%b\r\nc") == "a%25b%0D%0Ac"
 
 
 @pytest.mark.parametrize("trivy_status", ["failed", "not_applicable", None, "ok-ish"])

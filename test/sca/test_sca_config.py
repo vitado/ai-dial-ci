@@ -236,6 +236,13 @@ def test_empty_file_is_invalid_not_defaults() -> None:
 # ----------------------------------------------------- dependency handling
 
 
+def test_both_actions_pin_the_same_requirements() -> None:
+    actions = Path(__file__).resolve().parents[2] / "actions"
+    resolve = (actions / "sca_resolve_targets" / "requirements.txt").read_bytes()
+    prepare = (actions / "sca_prepare_trivy_config" / "requirements.txt").read_bytes()
+    assert resolve == prepare
+
+
 def test_requirements_pin_every_package_with_hashes() -> None:
     path = Path(__file__).resolve().parents[2]
     text = (path / "actions" / "sca_resolve_targets" / "requirements.txt").read_text()

@@ -29,7 +29,6 @@ from trivy_source import (
     canonical_package_name,
     combine_dependency_info,
     finding_key,
-    fixed_in_place,
     iter_findings,
     new_record,
     package_dev_flag,
@@ -38,13 +37,12 @@ from trivy_source import (
 
 
 class MergeResult(NamedTuple):
-    """What the merge knows: the records, where each was seen and which are fixed in
-    place (see ``fixed_in_place``); the last two are keyed by ``(id, pkg, version)``.
+    """What the merge knows: the records and where each was seen (keyed by
+    ``(id, pkg, version)``).
     """
 
     records: list[Record]
     sightings: Sightings
-    fixed_in_place: frozenset[tuple[Any, Any, Any]]
 
 
 class RecordSet:
@@ -66,8 +64,6 @@ class RecordSet:
         self._named_by_image: set[FindingKey] = set()
         self._dev_packages: dict[FindingKey, list[Mapping[str, Any]]] = {}
         self._chains: dict[FindingKey, dict[tuple[Any, Any], DependencyInfo]] = {}
-        # key -> whether every sighting found the fix in the package's own file
-        self._in_place: dict[FindingKey, bool] = {}
 
     def _add_record(self, key: FindingKey, record: Record) -> None:
         self.by_key[key] = record
@@ -88,9 +84,6 @@ class RecordSet:
         if tid in self.image_ids and key not in self._named_by_image:
             self._named_by_image.add(key)
             self.by_key[key]["pkg"] = pkg_name
-        self._in_place[key] = self._in_place.get(key, True) and fixed_in_place(
-            packages, self.by_key[key]["fixed_versions"], index
-        )
         self._dev_packages.setdefault(key, []).extend(packages)
         for package in packages:
             # one chain set per package of a lockfile, however many targets saw it
@@ -197,12 +190,7 @@ class RecordSet:
             (r["id"], r["pkg"], r["version"]): self.sightings[key]
             for key, r in self.by_key.items()
         }
-        in_place = frozenset(
-            (r["id"], r["pkg"], r["version"])
-            for key, r in self.by_key.items()
-            if self._in_place.get(key)
-        )
-        return MergeResult(list(self.by_key.values()), by_record, in_place)
+        return MergeResult(list(self.by_key.values()), by_record)
 
 
 def merge_records(
@@ -216,8 +204,8 @@ def merge_records(
     ``scans`` is ``(target id, scanner, native JSON)`` of the Trivy targets in
     targets-file order, which is also the order of each record's ``scan_targets``;
     ``osv_scans`` are the OSV targets, merged into the Trivy records. Returns the
-    records (unordered, not enriched yet), where each finding was seen and which
-    findings are fixed in place, keyed by ``(id, pkg, version)`` of the record. A
+    records (unordered, not enriched yet) and where each finding was seen, keyed by
+    ``(id, pkg, version)`` of the record. A
     package seen under several spellings (see ``canonical_package_name``) is shown
     under the spelling of its first image record, else of its first record.
     """

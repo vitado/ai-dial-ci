@@ -15,11 +15,9 @@ from summary import (
     md_join,
     md_link,
     package_families,
-    release_line,
     release_tags_of,
     render_footer,
     scope_table,
-    severity_phrase,
     shortest_path_text,
     strip_package_prefix,
     totals_line,
@@ -62,23 +60,6 @@ def test_markdown_cells_are_escaped() -> None:
     assert md_cell("back\\slash|x") == "back\\\\slash\\|x"
     assert md_cell(None) == "-"
     assert md_cell(0) == "0"
-
-
-@pytest.mark.parametrize(
-    ("severities", "expected"),
-    [
-        (["CRITICAL", "HIGH", "HIGH", "LOW"], "3 CRITICAL/HIGH"),
-        (["HIGH", "MEDIUM"], "1 HIGH"),
-        (["CRITICAL"], "1 CRITICAL"),
-        (["MEDIUM", "LOW", "LOW"], "3 MEDIUM/LOW"),
-        (["LOW"], "1 LOW"),
-        (["UNKNOWN"], "1 UNKNOWN"),
-    ],
-)
-def test_severity_phrase_counts_the_findings_that_matter(
-    severities: list[str], expected: str
-) -> None:
-    assert severity_phrase([rec("release_only", s) for s in severities]) == expected
 
 
 @pytest.mark.parametrize(
@@ -183,14 +164,6 @@ def test_shortest_path_text_and_more_paths() -> None:
     cut = record([["a", "t"]], 1000, True)
     assert shortest_path_text([cut]) == "a › t (+999+ more paths)"
     assert shortest_path_text([record([], 0)]) == ""
-
-
-@pytest.mark.parametrize(
-    ("tag", "expected"),
-    [("1.1.14", "release-1.1"), ("v2.10.0", "release-2.10"), ("rc", "release-rc")],
-)
-def test_release_line(tag: str, expected: str) -> None:
-    assert release_line(tag) == expected
 
 
 def test_exposure_labels() -> None:

@@ -10,7 +10,6 @@ from test_merge_results import (
     gradle_result,
     graph_file,
     info_for,
-    jar,
     ladder,
     pkg,
 )
@@ -24,7 +23,6 @@ from trivy_source import (
     combine_dependency_info,
     count_packages,
     enrich_gradle_results,
-    fixed_in_place,
     load_gradle_graphs,
     lockfile_project_dir,
     normalize_project_dir,
@@ -288,24 +286,3 @@ def test_lockfile_project_dir_and_graph_project_dir_are_comparable() -> None:
     assert normalize_project_dir("./app") == "app"
     data = graph_file(":", ".", {"g:a:1.0": []}, ["g:a:1.0"])
     assert parse_project_graph(data)[0] == "."
-
-
-def test_a_lockfile_has_no_other_versions_of_a_package_in_its_file() -> None:
-    packages = [
-        {"Name": "a", "Version": "1.0"},  # no FilePath
-        {"Name": "a", "Version": "1.1"},
-    ]
-    index = PackageIndex(packages, "npm")
-    assert index.other_versions_in_file(packages[0]) == []
-    assert fixed_in_place([packages[0]], ["1.1"], index) is False
-
-
-def test_fixed_in_place_needs_a_package_and_a_comparable_fix() -> None:
-    packages = [jar("a", "1.0"), jar("a", "1.2")]
-    index = PackageIndex(packages, "jar")
-    assert fixed_in_place([packages[0]], ["1.1"], index) is True  # 1.2 is above
-    assert fixed_in_place([packages[0]], ["1.2"], index) is True
-    assert fixed_in_place([packages[0]], ["1.3"], index) is False
-    assert fixed_in_place([packages[0]], ["abc"], index) is False  # incomparable
-    assert fixed_in_place([packages[0]], [], index) is False
-    assert fixed_in_place([], ["1.1"], index) is False

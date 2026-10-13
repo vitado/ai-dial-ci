@@ -23,7 +23,7 @@ def test_merge_records_unions_scanners_sorted() -> None:
             }
         ]
     }
-    records, sightings, _ = merge_records(
+    records, sightings = merge_records(
         "example/app",
         [
             ("source-development", "trivy", native),
@@ -43,7 +43,7 @@ def test_merge_records_unions_scanners_sorted() -> None:
 
 
 def test_display_name_falls_back_to_first_seen_without_an_image() -> None:
-    records, sightings, _ = merge_records(
+    records, sightings = merge_records(
         "r",
         [
             ("a", "trivy", python_native("poetry.lock", "poetry", "Mako")),
@@ -58,7 +58,7 @@ def test_display_name_falls_back_to_first_seen_without_an_image() -> None:
 
 
 def test_case_sensitive_ecosystems_are_not_merged() -> None:
-    records, _, _ = merge_records(
+    records, _ = merge_records(
         "r",
         [
             ("a", "trivy", python_native("package-lock.json", "npm", "Lodash")),

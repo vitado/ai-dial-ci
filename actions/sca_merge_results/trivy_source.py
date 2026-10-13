@@ -11,7 +11,6 @@ from typing import Any, NamedTuple
 
 from _sca_lib.gha import escape_command_data
 from _sca_lib.jsonio import read_json
-from _sca_lib.versions import compare_tokens
 from records import (
     SEV_ORDER,
     UNKNOWN_SEVERITY,
@@ -20,7 +19,6 @@ from records import (
     absorb_sighting,
     append_unique,
     blank_record,
-    minimal_fix,
 )
 
 GRADLE_RESULT_TYPE = "gradle"
@@ -239,8 +237,6 @@ class PackageIndex:
     by_name: dict[tuple[Any, Any], list[Mapping[str, Any]]] = field(
         default_factory=dict, init=False
     )
-    # (file, canonical name) -> versions the package has in that file
-    by_file: dict[tuple[str, Any], list[Any]] = field(default_factory=dict, init=False)
     parents: dict[str, list[str]] = field(default_factory=dict, init=False)
     _info: dict[str, DependencyInfo] = field(default_factory=dict, init=False)
 
@@ -253,10 +249,6 @@ class PackageIndex:
                 self.by_id.setdefault(package["ID"], package)
             name = canonical_package_name(package.get("Name"), self.result_type)
             self.by_name.setdefault((name, package.get("Version")), []).append(package)
-            if package.get("FilePath"):
-                self.by_file.setdefault((package["FilePath"], name), []).append(
-                    package.get("Version")
-                )
             for child in package.get("DependsOn") or []:
                 if package.get("ID"):
                     self.parents.setdefault(child, []).append(package["ID"])
@@ -272,18 +264,6 @@ class PackageIndex:
             return [self.by_id[vuln["PkgID"]]]
         name = canonical_package_name(vuln.get("PkgName"), self.result_type)
         return self.by_name.get((name, vuln.get("InstalledVersion")), [])
-
-    def other_versions_in_file(self, package: Mapping[str, Any]) -> list[str]:
-        """The other versions this inventory lists for the package in its own file.
-
-        Only a package with a ``FilePath`` (a jar, a Python distribution) has any: a
-        lockfile lists one version per package.
-        """
-        name = canonical_package_name(package.get("Name"), self.result_type)
-        versions = self.by_file.get((package.get("FilePath") or "", name), [])
-        return [
-            v for v in versions if isinstance(v, str) and v != package.get("Version")
-        ]
 
     def _is_direct(self, package_id: str) -> bool:
         return self.by_id[package_id].get("Relationship") == "direct"
@@ -576,36 +556,6 @@ def select_cvss(vuln: Mapping[str, Any]) -> Record | None:
     preferred = [vuln.get("SeveritySource"), "nvd", "ghsa", *sorted(entries)]
     source = next(name for name in preferred if name in entries)
     return entries[source]
-
-
-def fixed_in_place(
-    packages: Sequence[Mapping[str, Any]],
-    fixed_versions: Sequence[str],
-    index: PackageIndex,
-) -> bool:
-    """Whether the file of each of the packages already holds a fixed version of it.
-
-    Trivy can list one artifact under two version strings, e.g. a jar whose manifest
-    says ``12.10.2`` and whose POM says ``12.10.2.jre11`` (Maven orders the second
-    above the first). The advisory then matches the first, but the file ships the
-    second, which is the fix: there is nothing to upgrade to. The comparison is the
-    one of ``minimal_fix``, so it is as tolerant as the rest of the module.
-    """
-    if not packages:
-        return False
-    for package in packages:
-        installed = package.get("Version")
-        minimal = (
-            minimal_fix(installed, fixed_versions)
-            if isinstance(installed, str)
-            else None
-        )
-        if minimal is None or not any(
-            compare_tokens(other, minimal) in (0, 1)
-            for other in index.other_versions_in_file(package)
-        ):
-            return False
-    return True
 
 
 def new_record(

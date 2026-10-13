@@ -56,7 +56,7 @@ an alias of any record (a database maps them now, so a scanner reports them),
 classifies the rest by exposure like a record and reports them in
 ``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
 section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
-not in the scope table, not in the verdict. Every entry carries the ``match`` the
+not in the scope table, not in the headline. Every entry carries the ``match`` the
 part computed, how it was matched (``package_name``, ``source_repo``, ``product_name``
 or ``repo_module``); the merge shows it and neither filters nor tiers by it. The part
 says which CVE index it read (``index``: ref, digest, built_at, feed gaps), and the
@@ -71,7 +71,7 @@ The script is the orchestration only; the layers are modules of this directory,
 each depending on the ones listed before it:
 
   * ``records``: the record model, keys, exposure (``release_only`` ...), the paths
-    that are not shipped, upgrades, ordering;
+    that are not shipped, ordering;
   * ``trivy_source``: Trivy results (CVSS selection, Gradle graph, dependency chains,
     base image) into records;
   * ``osv_source``: osv-scanner output into OSV vulnerabilities and records;
@@ -391,11 +391,11 @@ def run_merge(
     osv_scans = resolve_osv_targets(results, {tid: n for tid, _, n in ok_scans})
     repo = targets_doc.get("repo")
     image_ids = {t["id"] for t in trivy_only if t.get("kind") == KIND_IMAGE}
-    merged, sightings, in_place = merge_records(repo, ok_scans, image_ids, osv_scans)
+    merged, sightings = merge_records(repo, ok_scans, image_ids, osv_scans)
     not_shipped = NotShipped(
         targets_doc["config"][KEY_NON_SHIPPED_PATHS], trivy_configs
     )
-    records = finalize_records(merged, trivy_only, in_place, sightings, not_shipped)
+    records = finalize_records(merged, trivy_only, sightings, not_shipped)
     early_warning = None
     if early_warning_enabled:
         early_warning = build_early_warning(
@@ -435,7 +435,7 @@ def run_merge(
             )
     write_text(
         output_dir / "summary.md",
-        build_summary_md(scan_report, vulns, sightings, in_place, early_warning),
+        build_summary_md(scan_report, vulns, sightings, early_warning),
     )
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]

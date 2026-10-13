@@ -1,4 +1,4 @@
-"""The record model of the SCA merge: keys, exposure, upgrades and ordering.
+"""The record model of the SCA merge: keys, exposure and ordering.
 
 A record is one vulnerable package version of one repository (see ``MERGE_KEY``).
 This module is the base of the others: it depends on none of them.
@@ -10,8 +10,6 @@ import posixpath
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
-
-from _sca_lib.versions import compare_tokens
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
@@ -75,53 +73,6 @@ FindingKey = tuple[str | None, str | None, str | None]
 Sightings = dict[FindingKey, dict[str, list[str]]]
 
 
-def minimal_fix(installed: str, fixed_versions: Iterable[str]) -> str | None:
-    """The lowest of ``fixed_versions`` that is above ``installed``.
-
-    None if there is none or if a comparison is not possible.
-    """
-    best: str | None = None
-    for candidate in fixed_versions:
-        against_installed = compare_tokens(candidate, installed)
-        if against_installed is None:
-            return None
-        if against_installed <= 0:
-            continue
-        if best is None:
-            best = candidate
-            continue
-        against_best = compare_tokens(candidate, best)
-        if against_best is None:
-            return None
-        if against_best < 0:
-            best = candidate
-    return best
-
-
-def upgrade_target(
-    installed: str, fixed_per_cve: Iterable[Sequence[str]]
-) -> str | None:
-    """The version that fixes all CVEs of a package: max of the per-CVE minimal fixes.
-
-    None if any CVE has no fix above the installed version, or versions are not
-    comparable (a partial upgrade would leave the package vulnerable).
-    """
-    target: str | None = None
-    for fixed_versions in fixed_per_cve:
-        minimal = minimal_fix(installed, fixed_versions)
-        if minimal is None:
-            return None
-        if target is None:
-            target = minimal
-            continue
-        against_target = compare_tokens(minimal, target)
-        if against_target is None:
-            return None
-        if against_target > 0:
-            target = minimal
-    return target
-
-
 def blank_record(
     repo: str | None,
     vuln_id: str | None,
@@ -170,7 +121,6 @@ def blank_record(
         "status": None,
         "fixed_versions": [],
         "fix_available": False,
-        "upgrade_to": None,
         "title": None,
         "cwe": None,
         "published": None,
@@ -473,37 +423,6 @@ def assign_exposure(
         record["exposure"] = classify_exposure(classes, has_images)  # type: ignore[arg-type]
 
 
-def assign_upgrades(
-    records: Sequence[Record],
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
-) -> None:
-    """Set ``upgrade_to`` on the fixable records of each package version.
-
-    It is the version that resolves all of the package's fixable CVEs; records
-    without a fix keep ``None``, and so do the ``in_place`` ones (see
-    ``fixed_in_place``): no upgrade is needed, so none is named, and they do not
-    count for the upgrade of the other records of the package.
-    """
-
-    def needs_upgrade(record: Record) -> bool:
-        identity = record_identity(record)
-        return record["fix_available"] and identity not in in_place
-
-    fixed_by_package: dict[tuple[Any, Any], list[list[str]]] = {}
-    for record in records:
-        if needs_upgrade(record):
-            key = (record["pkg"], record["version"])
-            fixed_by_package.setdefault(key, []).append(record["fixed_versions"])
-    for record in records:
-        installed = record["version"]
-        fixed = fixed_by_package.get((record["pkg"], installed))
-        record["upgrade_to"] = (
-            upgrade_target(installed, fixed)
-            if fixed and needs_upgrade(record) and isinstance(installed, str)
-            else None
-        )
-
-
 def record_sort_key(record: Record) -> tuple[Any, ...]:
     """Urgency, severity, CVSS score (highest first, none last), then identity."""
     score = (record.get("cvss") or {}).get("score")
@@ -521,14 +440,12 @@ def record_sort_key(record: Record) -> tuple[Any, ...]:
 def finalize_records(
     records: Iterable[Record],
     targets: Sequence[Target],
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     sightings: Sightings | None = None,
     not_shipped: NotShipped | None = None,
 ) -> list[Record]:
-    """Enrich the merged records (exposure, upgrade_to) and put them in report order."""
+    """Enrich the merged records (exposure) and put them in report order."""
     records = list(records)
     assign_exposure(records, targets, sightings, not_shipped)
-    assign_upgrades(records, in_place)
     return sorted(records, key=record_sort_key)
 
 

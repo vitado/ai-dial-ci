@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import pytest
 from records import (
-    assign_upgrades,
     classify_exposure,
     cve_of,
-    minimal_fix,
     record_sort_key,
     release_class,
     target_class,
-    upgrade_target,
 )
 from test_merge_results import DEV, REL, RELEASE_SOURCE, SOURCE, Record
 
@@ -63,39 +60,6 @@ def test_target_class() -> None:
     assert target_class(DEV) == "development"
     assert target_class(REL) == "release"
     assert target_class({"kind": "other"}) is None
-
-
-@pytest.mark.parametrize(
-    ("installed", "fixed", "expected"),
-    [
-        ("15.5.24", ["15.5.27", "16.3.8"], "15.5.27"),
-        ("15.5.24", ["16.3.8", "15.5.27"], "15.5.27"),
-        ("1.3.2-r0", ["1.3.2-r1"], "1.3.2-r1"),
-        ("2.0", ["1.9", "2.0"], None),
-        ("2.0", [], None),
-        ("1.0", ["weird"], None),
-    ],
-)
-def test_minimal_fix(installed: str, fixed: list[str], expected: str | None) -> None:
-    assert minimal_fix(installed, fixed) == expected
-
-
-@pytest.mark.parametrize(
-    ("installed", "fixed_per_cve", "expected"),
-    [
-        ("15.5.24", [["15.5.27", "16.3.8"]], "15.5.27"),
-        ("1.3.2-r0", [["1.3.2-r1"]], "1.3.2-r1"),
-        ("2.7.0", [["2.8.0"], ["2.9.1"]], "2.9.1"),
-        ("2.7.0", [["2.9.1"], ["2.8.0"]], "2.9.1"),
-        ("2.7.0", [["2.8.0"], []], None),
-        ("2.7.0", [], None),
-        ("2.7.0", [["x"]], None),
-    ],
-)
-def test_upgrade_target(
-    installed: str, fixed_per_cve: list[list[str]], expected: str | None
-) -> None:
-    assert upgrade_target(installed, fixed_per_cve) == expected
 
 
 def test_target_class_of_release_source() -> None:
@@ -156,20 +120,3 @@ def test_the_cve_of_a_record_is_its_id_or_the_first_cve_of_its_aliases(
     vuln_id: str, aliases: list[str], expected: str | None
 ) -> None:
     assert cve_of({"id": vuln_id, "aliases": aliases}) == expected
-
-
-def test_a_cve_fixed_in_place_does_not_hold_back_the_upgrade_of_the_others() -> None:
-    def record(vuln_id: str, fixed: list[str]) -> Record:
-        return {
-            "id": vuln_id,
-            "pkg": "lib",
-            "version": "1.0",
-            "fix_available": True,
-            "fixed_versions": fixed,
-        }
-
-    records = [record("CVE-1", ["1.1"]), record("CVE-2", ["2.0"])]
-    assign_upgrades(records, {("CVE-1", "lib", "1.0")})
-    assert [r["upgrade_to"] for r in records] == [None, "2.0"]
-    assign_upgrades(records)
-    assert [r["upgrade_to"] for r in records] == ["2.0", "2.0"]

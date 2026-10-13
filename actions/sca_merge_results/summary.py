@@ -1,4 +1,4 @@
-"""The ``summary.md`` of the SCA merge: verdict, tables, early warning, footer.
+"""The ``summary.md`` of the SCA merge: facts, tables, early warning, footer.
 
 The whole Markdown rendering lives here (also the cut of the text to the limit of
 the GitHub step summary). It depends on the record model and the report; they do
@@ -231,21 +231,6 @@ def development_scanned(targets: Iterable[Mapping[str, Any]]) -> bool:
     )
 
 
-def join_names(names: Sequence[str]) -> str:
-    """``a``, ``a and b``, ``a, b and c``."""
-    if len(names) < 2:
-        return "".join(names)
-    return f"{', '.join(names[:-1])} and {names[-1]}"
-
-
-def severity_phrase(records: Sequence[Record]) -> str:
-    """``46 CRITICAL/HIGH``: the findings that matter, else the rest, by count."""
-    counts = count_by_severity(r["severity"] for r in records)
-    tier = SEVERITIES[:2] if counts["CRITICAL"] + counts["HIGH"] else SEVERITIES[2:]
-    present = [s for s in tier if counts[s]]
-    return f"{sum(counts[s] for s in present)} {'/'.join(present)}"
-
-
 def report_not_shipped(report: Mapping[str, Any]) -> NotShipped:
     """The not shipped locations of a run, from its scan_report.json."""
     config = report.get("config") or default_config()
@@ -257,149 +242,49 @@ def report_not_shipped(report: Mapping[str, Any]) -> NotShipped:
     return NotShipped(config[KEY_NON_SHIPPED_PATHS], configs)
 
 
-def source_only_what(report: Mapping[str, Any]) -> str:
-    """What a ``source_only`` finding is in: build / test dependencies, and, if the
-    run knows not shipped paths, those paths.
-    """
-    base = "build / test dependencies"
-    return f"{base} or not shipped paths" if report_not_shipped(report) else base
+def join_names(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def shipped_early_warning_text(early_warning: EarlyWarning | None) -> str | None:
-    """``1 HIGH early warning to verify``: the CRITICAL / HIGH early warnings (per
-    package version, by its worst severity) that are in a shipped artifact, not only
-    in the source; None if there are none. It is not an action of the verdict (an
-    early warning is not a finding), only a caveat to a verdict that would
-    otherwise read as clean.
-    """
-    if early_warning is None or early_warning.report["status"] != STATUS_OK:
-        return None
-    worst = [
-        min(
-            (e["severity"] for e in group),
-            key=lambda s: SEV_ORDER.get(s, len(SEV_ORDER)),
-        )
-        for group in early_warning_groups(
-            e for e in early_warning.entries if e["exposure"] != EXPOSURE_SOURCE_ONLY
-        )
-    ]
-    counts = count_by_severity(s for s in worst if s in HEADLINE_SEVERITIES)
-    total = sum(counts.values())
-    if not total:
-        return None
-    plural = "s" if total > 1 else ""
-    return f"{format_severity_counts(counts, ', ')} early warning{plural} to verify"
-
-
-def verdict_text(
+def facts_text(
     report: Mapping[str, Any],
     records: Sequence[Record],
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
 ) -> str:
-    """What to do, derived from the exposure of the (unique) records: one clause per
-    action, in at most two sentences, the most severe first (then the larger, then
-    the more urgent exposure). Records fixed in place need no action, so they do
-    not make a clause. CRITICAL / HIGH early warnings in shipped artifacts are
-    never an action, but a verdict without a CRITICAL / HIGH clause says that there
-    are some (``caveat``), so that it does not read as clean.
+    """The facts of the run in one line: the (unique) findings by severity, where
+    they are (a finding in a release and in development counts in both), how many
+    have a fix in the databases and the early warnings; or that there are none.
     """
-    targets = report["targets"]
-    by_exposure: dict[str, list[Record]] = {}
-    for record in records:
-        by_exposure.setdefault(record["exposure"], []).append(record)
-    # Only what an upgrade resolves is an action; what has no fix is watched
-    actionable = {
-        exposure: [
-            r
-            for r in group
-            if r["fix_available"] and record_identity(r) not in in_place
-        ]
-        for exposure, group in by_exposure.items()
-    }
-    unfixed = [
-        r
-        for exposure, group in by_exposure.items()
-        if exposure != EXPOSURE_SOURCE_ONLY
-        for r in group
-        if not r["fix_available"]
-    ]
-
-    def lines_of(group: Sequence[Record]) -> str:
-        return ", ".join(
-            release_branches(release_tags_of(group, trivy_targets(targets)))
-        )
-
-    patch_suffix = (
-        " already fixed in development" if development_scanned(targets) else ""
-    )
-    texts = {
-        EXPOSURE_RELEASE_AND_DEVELOPMENT: lambda g: (
-            f"Fix {severity_phrase(g)} in development and backport to {lines_of(g)}"
-        ),
-        EXPOSURE_RELEASE_ONLY: lambda g: (
-            f"Release a patch from {lines_of(g)} — {severity_phrase(g)}{patch_suffix}"
-        ),
-        EXPOSURE_DEVELOPMENT_ONLY: lambda g: (
-            f"Fix {severity_phrase(g)} in development before the next release"
-        ),
-    }
-    ranked = sorted(
-        (
-            (
-                min(SEV_ORDER.get(r["severity"], len(SEV_ORDER)) for r in group),
-                -len(group),
-                EXPOSURE_ORDER[exposure],
-                texts[exposure](group),
-            )
-            for exposure, group in actionable.items()
-            if group and exposure in texts
-        )
-    )
-    clauses = [text for *_, text in ranked]
-    top_unfixed = [r for r in unfixed if r["severity"] in SEVERITIES[:2]]
-    top_actionable = any(
-        r["severity"] in HEADLINE_SEVERITIES for g in actionable.values() for r in g
-    )
-    caveat = (
-        None
-        if top_actionable or top_unfixed
-        else shipped_early_warning_text(early_warning)
-    )
-    in_base_image = sum(is_base_image(r) for r in top_unfixed)
-    where = f" ({in_base_image} in the base image)" if in_base_image else ""
-    watch = f"{len(top_unfixed)} CRITICAL/HIGH without a fix{where} — see watch"
-    if not clauses and unfixed:
-        # nothing to upgrade is not "no vulnerabilities"
-        text = f"Nothing to upgrade — {severity_phrase(unfixed)} without a fix"
-        text += f"{where} — see watch" if top_unfixed else ", see watch"
-        if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
-            text += f" · {only_sources} only in {source_only_what(report)}"
-        return f"{text} · {caveat}" if caveat else text
-    if not clauses:
+    warning = early_warning_headline(early_warning)
+    if not records:
+        targets = report["targets"]
         names = [*release_subjects(targets)]
         if development_scanned(targets):
             names.append(DEVELOPMENT_TAG)
-        where_text = join_names(names) or "the scanned targets"
-        # "No known vulnerabilities" is about the databases; say so when a CNA record
-        # is not yet mapped by them
-        text = (
-            f"No known vulnerabilities in vulnerability databases for {where_text}"
-            if caveat
-            else f"No known vulnerabilities in {where_text}"
-        )
-        if only_sources := len(by_exposure.get(EXPOSURE_SOURCE_ONLY, ())):
-            text += f" — {only_sources} only in {source_only_what(report)}"
-        return f"{text} — {caveat}" if caveat else text
-    # The first action is a sentence, the others follow in a second: "…; fix …"
-    rest = "; ".join(c[0].lower() + c[1:] for c in clauses[2:])
-    sentences = clauses[:2]
-    if rest:
-        sentences[-1] += f"; {rest}"
-    text = ". ".join(sentences)
-    if top_unfixed:
-        text = f"{text} · {watch}"
-    return f"{text} · {caveat}" if caveat else text
+        where = join_names(names) or "the scanned targets"
+        text = f"No known vulnerabilities in {where}"
+        return f"{text} · {warning}" if warning else text
+    counts = count_by_severity(r["severity"] for r in records)
+    severities = ", ".join(f"{counts[s]} {s}" for s in SEVERITIES if counts[s])
+    total = len(records)
+    parts = [f"{total} finding{'s' if total > 1 else ''}: {severities}"]
+    exposures = [r["exposure"] for r in records]
+    in_release = (EXPOSURE_RELEASE_AND_DEVELOPMENT, EXPOSURE_RELEASE_ONLY)
+    in_development = (EXPOSURE_RELEASE_AND_DEVELOPMENT, EXPOSURE_DEVELOPMENT_ONLY)
+    where_counts = [
+        (sum(e in in_release for e in exposures), "in release"),
+        (sum(e in in_development for e in exposures), "in development"),
+        (sum(e == EXPOSURE_SOURCE_ONLY for e in exposures), "only in source"),
+    ]
+    parts.append(", ".join(f"{n} {label}" for n, label in where_counts if n))
+    if fixable := sum(r["fix_available"] for r in records):
+        parts.append(f"{fixable} with a fix in the database")
+    if warning:
+        parts.append(warning)
+    return " · ".join(p for p in parts if p)
 
 
 def scope_row(
@@ -458,11 +343,8 @@ def totals_line(
     report: Mapping[str, Any],
     osv_only: int = 0,
     packages: int | None = None,
-    early_warning: str | None = None,
 ) -> str:
-    """Coverage of the run: ``8/8 targets scanned · 10 found only by OSV``;
-    ``early_warning`` is the text of the early warning part of the line, if any.
-    """
+    """Coverage of the run: ``8/8 targets scanned · 10 found only by OSV``."""
     counts = report["totals"]["targets"]
     applicable = counts["total"] - counts["not_applicable"]
     line = f"{counts['ok']}/{applicable} targets scanned"
@@ -470,8 +352,6 @@ def totals_line(
         line += f" · {packages} packages"
     if osv_only:
         line += f" · {osv_only} found only by OSV"
-    if early_warning:
-        line += f" · {early_warning}"
     if counts["not_applicable"]:
         line += f" · {counts['not_applicable']} not applicable"
     return line
@@ -480,10 +360,9 @@ def totals_line(
 def headline_blocks(
     report: Mapping[str, Any],
     records: Sequence[Record],
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
 ) -> list[list[str]]:
-    """The paragraphs of the headline: failures, the verdict, the scope table, the
+    """The paragraphs of the headline: failures, the facts, the scope table, the
     coverage of the run.
     """
     targets = report["targets"]
@@ -503,15 +382,14 @@ def headline_blocks(
         return [*blocks, [text]]
 
     osv_only = sum(is_osv_only(r) for r in records)
-    warning = early_warning_headline(early_warning)
-    blocks.append([f"**{verdict_text(report, records, in_place, early_warning)}**"])
+    blocks.append([f"**{facts_text(report, records, early_warning)}**"])
     if records:
         if table := scope_table(report, records):
             blocks.append(table)
-        blocks.append([totals_line(report, osv_only, early_warning=warning)])
+        blocks.append([totals_line(report, osv_only)])
     else:
         packages = sum(t["packages_scanned"] or 0 for t in ok)
-        blocks.append([totals_line(report, osv_only, packages, warning)])
+        blocks.append([totals_line(report, osv_only, packages)])
     if report["run_kind"] != "full":
         reasons = "; ".join(report["run_kind_reasons"])
         blocks.append([f"Partial run ({reasons}): not a full scan of the repository"])
@@ -648,19 +526,6 @@ def release_tags_of(
         if target["id"] in found and target_class(target) == kind:
             append_unique(tags, target["tag"])
     return tags
-
-
-def release_line(tag: str) -> str:
-    """Release branch of a tag: ``1.1.14`` -> ``release-1.1``."""
-    match = RELEASE_LINE_RE.match(tag)
-    return f"release-{match.group(1)}.{match.group(2)}" if match else f"release-{tag}"
-
-
-def release_branches(tags: Iterable[str]) -> list[str]:
-    lines: list[str] = []
-    for tag in tags:
-        append_unique(lines, release_line(tag))
-    return lines
 
 
 def exposure_label(
@@ -814,13 +679,13 @@ def scope_cell(group: Sequence[Record]) -> str:
     return f"{scope}, {relationship}" if relationship else scope
 
 
-def render_watch(
+def render_unfixed(
     records: Sequence[Record],
     targets: Sequence[Mapping[str, Any]],
     sightings: Sightings,
     not_shipped: NotShipped | None = None,
 ) -> list[str]:
-    """Findings without a fix: nothing to upgrade to, so watch, mitigate or replace.
+    """Findings without a fix in the databases.
 
     The dependencies are open if anything HIGH or CRITICAL is in them, else
     collapsed; the OS packages of the base image are always collapsed.
@@ -830,18 +695,18 @@ def render_watch(
     os_records = [r for r in unfixed if is_base_image(r)]
     lines: list[str] = []
     if dependencies:
-        lines += render_watch_dependencies(
+        lines += render_unfixed_dependencies(
             dependencies, targets, sightings, not_shipped
         )
     if os_records:
         lines += [
             "",
-            *render_watch_base_image(os_records, targets, sightings, not_shipped),
+            *render_unfixed_base_image(os_records, targets, sightings, not_shipped),
         ]
     return lines
 
 
-def render_watch_dependencies(
+def render_unfixed_dependencies(
     unfixed: Sequence[Record],
     targets: Sequence[Mapping[str, Any]],
     sightings: Sightings,
@@ -851,11 +716,6 @@ def render_watch_dependencies(
     for group in group_fixes(unfixed):
         counts = count_by_severity(r["severity"] for r in group)
         family = package_families(group)
-        suggested = (
-            "Accept as dev-only risk or replace the parent; re-check on next scan"
-            if group_dev(group)
-            else "Mitigate or replace the package; re-check on next scan"
-        )
         rows.append(
             [
                 f"{group[0]['pkg']} {group[0]['version']}"
@@ -864,7 +724,6 @@ def render_watch_dependencies(
                 scope_cell(group),
                 shortest_path_text(group),
                 group_exposure_label(group, targets, sightings, not_shipped),
-                suggested,
             ]
         )
     header = [
@@ -873,22 +732,21 @@ def render_watch_dependencies(
         "Scope",
         "Introduced via",
         "Exposure",
-        "Suggested",
     ]
     table = md_table(["#", *header], ([i, *row] for i, row in enumerate(rows, 1)))
-    title = "No fix available — watch"
+    title = "No fix available"
     if any(r["severity"] in ("CRITICAL", "HIGH") for r in unfixed):
         return ["", f"## {title}", "", *table]
     return ["", *md_details(f"{title} ({len(unfixed)})", table)]
 
 
-def render_watch_base_image(
+def render_unfixed_base_image(
     unfixed: Sequence[Record],
     targets: Sequence[Mapping[str, Any]],
     sightings: Sightings,
     not_shipped: NotShipped | None,
 ) -> list[str]:
-    """OS packages without a fix: a new base image may bring one, and so may a wait."""
+    """OS packages without a fix in the databases."""
     rows = []
     for group in group_fixes(unfixed):
         counts = count_by_severity(r["severity"] for r in group)
@@ -897,11 +755,9 @@ def render_watch_base_image(
                 f"{group[0]['pkg']} {group[0]['version']}",
                 format_severity_counts(counts, ", "),
                 group_exposure_label(group, targets, sightings, not_shipped),
-                "Wait for a distribution fix or change the base image; "
-                "re-check on next scan",
             ]
         )
-    header = ["#", "Package", "Severity", "Exposure", "Suggested"]
+    header = ["#", "Package", "Severity", "Exposure"]
     table = md_table(header, ([i, *row] for i, row in enumerate(rows, 1)))
     title = f"No fix available — base image (OS packages) ({len(unfixed)})"
     return md_details(title, table)
@@ -931,15 +787,6 @@ def cvss_cell(record: Record) -> str | None:
     return f"{score} ({cvss['source']})"
 
 
-def installed_to_fixed_cell(record: Record) -> str:
-    fixed = (
-        record["upgrade_to"]
-        or fixed_versions_text(record["fixed_versions"], record["version"])
-        or "no fix"
-    )
-    return f"{record['version']} → {fixed}"
-
-
 def render_severity_section(
     severity: str,
     records: Sequence[Record],
@@ -951,7 +798,8 @@ def render_severity_section(
         [
             id_cell(r),
             r["pkg"],
-            installed_to_fixed_cell(r),
+            r["version"],
+            fixed_versions_text(r["fixed_versions"], r["version"]),
             cvss_cell(r),
             (r["published"] or "")[:10],
             group_exposure_label([r], targets, sightings, not_shipped),
@@ -962,7 +810,8 @@ def render_severity_section(
     header = [
         "ID",
         "Package",
-        "Installed → Fixed",
+        "Installed",
+        "Fixed in",
         "CVSS",
         "Published",
         "Exposure",
@@ -1122,7 +971,7 @@ EARLY_WARNING_TITLE = "Early warning — not yet in vulnerability databases"
 
 EARLY_WARNING_EXPLANATION = (
     "CVE records of their CNAs match these packages, but no vulnerability database "
-    "maps them to a package yet; verify and upgrade if confirmed."
+    "maps them to a package yet."
 )
 
 
@@ -1340,21 +1189,18 @@ def build_summary_md(
     report: Mapping[str, Any],
     vulns: Mapping[str, Any],
     sightings: Sightings,
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
 ) -> str:
-    """``in_place`` the findings that are fixed in place (see ``fixed_in_place``),
-    ``early_warning`` the early warning of the run, if it has one.
-    """
+    """``early_warning`` is the early warning of the run, if it has one."""
     records = vulns["records"]
     targets = report["targets"]
     # The findings sections are about the records, so about the Trivy targets only
     record_targets = trivy_targets(targets)
     not_shipped = report_not_shipped(report)
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
-    lines += render_headline(headline_blocks(report, records, in_place, early_warning))
+    lines += render_headline(headline_blocks(report, records, early_warning))
     if records:
-        lines += render_watch(records, record_targets, sightings, not_shipped)
+        lines += render_unfixed(records, record_targets, sightings, not_shipped)
     lines += render_early_warning(early_warning, record_targets, not_shipped)
     if records:
         lines += render_severity_sections(

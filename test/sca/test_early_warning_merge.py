@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from merge_results import main, parse_args
 from records import blank_record, record_ids
-from summary import early_warning_severity_text, short_digest, totals_line
+from summary import early_warning_severity_text, short_digest
 from test_merge_results import (
     DEV,
     REL,
@@ -406,7 +406,7 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
     assert (
         "## Early warning — not yet in vulnerability databases (2)\n\n"
         "CVE records of their CNAs match these packages, but no vulnerability database "
-        "maps them to a package yet; verify and upgrade if confirmed."
+        "maps them to a package yet."
     ) in text
     lines = text.splitlines()
     header = (
@@ -569,9 +569,9 @@ def test_section_is_there_without_any_records(tmp_path: Path) -> None:
 
 
 def headline(ws: Workspace) -> str:
-    quoted = [line for line in summary(ws).splitlines() if line.startswith("> ")]
-    # the paragraph with the totals line, the one that reports the early warnings
-    return next(line for line in quoted if " targets scanned" in line)
+    quoted = [line for line in summary(ws).splitlines() if line.startswith("> **")]
+    # the facts line, the one that reports the early warnings
+    return quoted[-1].removeprefix("> **").removesuffix("**")
 
 
 def test_headline_counts_early_warnings_and_names_the_urgent_ones(
@@ -622,16 +622,6 @@ def test_headline_is_unchanged_without_early_warnings(ws: Workspace) -> None:
     merge(ws)
     assert headline(ws) == plain
     assert "## Early warning" not in summary(ws)
-
-
-def test_totals_line_places_the_early_warning_after_the_osv_count() -> None:
-    report = {
-        "totals": {"targets": {"total": 8, "ok": 8, "failed": 0, "not_applicable": 1}}
-    }
-    assert totals_line(report, osv_only=3, early_warning="2 early warnings") == (
-        "8/7 targets scanned · 3 found only by OSV · 2 early warnings "
-        "· 1 not applicable"
-    )
 
 
 # ------------------------------------------------------------------- footer

@@ -338,8 +338,8 @@ def test_headline_of_a_run_whose_only_findings_are_not_shipped(tmp_path: Path) -
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
     assert "> | Source only (build / test / not shipped) |" in md
     assert (
-        "> **No known vulnerabilities in development — 3 only in "
-        "build / test dependencies or not shipped paths**" in md
+        "> **3 findings: 1 CRITICAL, 1 HIGH, 1 MEDIUM · 3 only in source "
+        "· 2 with a fix in the database**" in md
     )
 
 

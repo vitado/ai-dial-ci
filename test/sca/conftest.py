@@ -3,8 +3,7 @@
 import sys
 from pathlib import Path
 
-# resolve_targets.py imports its sibling module sca_config, as it does when it runs
-# from its action directory
-sys.path.insert(
-    0, str(Path(__file__).resolve().parents[2] / "actions" / "sca_resolve_targets")
-)
+# resolve_targets.py and merge_results.py import their sibling modules (sca_config,
+# sca_diff), as they do when they run from their action directories
+for action in ("sca_resolve_targets", "sca_merge_results"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "actions" / action))

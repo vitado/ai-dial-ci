@@ -680,7 +680,7 @@ def run_kind(
 
     A run is ``partial`` if the ``targets`` filter is set, if a part of the scan is
     switched off, or if it does not run on the default branch of the calling
-    repository.
+    repository. Only a full run is a baseline for the diff of later runs.
     """
     narrowing = [
         (bool(patterns), f"targets filter: {', '.join(patterns)}"),
@@ -736,7 +736,7 @@ def resolve_targets(
     ``targets_filter`` keeps only the targets whose id matches one of its patterns;
     the OSV twins follow their Trivy targets. The run is ``partial`` (``run_kind``)
     if the filter or a switch narrows the scan, or if ``ref_name`` is not the default
-    branch of ``caller_repository``.
+    branch of ``caller_repository``: such a run is never the baseline of a diff.
 
     Order: the development source, the release sources (newest first), then the
     images of each image in ``images`` order.

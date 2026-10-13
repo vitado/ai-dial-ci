@@ -16,6 +16,7 @@ from test_merge_results import (
     make_targets_doc,
     mr,
     records_by_cve,
+    without_diff,
 )
 
 GUAVA = {
@@ -198,7 +199,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
     assert document["generated_from"] == GENERATED_FROM
     assert document["status"] == "ok"
     (entry,) = document["entries"]
-    assert entry == {
+    assert without_diff(entry) == {
         "cve": "CVE-2030-0001",
         "aliases": [],
         "cna": "Google",

@@ -9,30 +9,30 @@ from typing import Any
 
 import pytest
 from test_resolve_targets import (
-    API,
     CALLER,
     ENV,
     NOW,
     REPOSITORY,
-    FakeTransport,
+    FakeRunner,
     github_routes,
     ok,
     rt,
     run_resolve_targets,
     tag_routes,
+    tags_out,
     tags_url,
 )
 
 
-def two_images_with_a_release(t: FakeTransport) -> None:
+def two_images_with_a_release(t: FakeRunner) -> None:
     github_routes(t, release="1.1.14")
     tag_routes(t, "1.1.14", "c" * 40)
-    t.add(tags_url("example/x"), ok({"tags": ["development", "1.1.14"]}))
-    t.add(tags_url("example/y"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "1.1.14"]))
+    t.add(tags_url("example/y"), tags_out(["development"]))
 
 
 def filtered_ids(raw: str, osv_enabled: bool = False) -> list[str]:
-    t = FakeTransport()
+    t = FakeRunner()
     two_images_with_a_release(t)
     doc = run_resolve_targets(
         t,
@@ -101,7 +101,7 @@ def test_osv_twins_follow_their_trivy_target() -> None:
 
 
 def test_filter_keeps_targets_that_are_not_applicable() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     two_images_with_a_release(t)
     doc = run_resolve_targets(t, ["example/x", "example/y"], targets_filter="y-1.1.14")
     (target,) = doc["targets"]
@@ -125,7 +125,7 @@ def test_a_pattern_with_a_separator_missing_matches_nothing() -> None:
 
 
 def test_a_filter_for_a_source_that_is_not_scanned_is_an_error() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     two_images_with_a_release(t)
     with pytest.raises(rt.ResolveError, match=r"no target matches 'source-\*'"):
         run_resolve_targets(
@@ -137,7 +137,7 @@ def test_a_filter_for_a_source_that_is_not_scanned_is_an_error() -> None:
 
 
 def kind_of(**kwargs: Any) -> tuple[str, list[str]]:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     doc = run_resolve_targets(t, [], **kwargs)
     return doc["run_kind"], doc["run_kind_reasons"]
@@ -184,21 +184,21 @@ def test_every_narrowing_is_listed() -> None:
 
 def test_the_default_branch_is_the_one_of_the_calling_repository() -> None:
     # the scanned repository (a fork scanning epam/*) has another default branch
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None, branch="main")
     doc = run_resolve_targets(
         t, [], ref_name="development", osv_enabled=True, scan_release_source=True
     )
     assert doc["default_branch"] == "main"
     assert doc["run_kind"] == "full"
-    assert f"{API}/repos/{CALLER}" in [url for url, _ in t.calls]
+    assert f"repos/{CALLER}" in [url for url in t.urls]
 
 
 # ------------------------------------------------------------------------ CLI
 
 
 def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     two_images_with_a_release(t)
     argv = [
         "--repository",
@@ -224,9 +224,9 @@ def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
 
 
 def test_caller_and_ref_arguments_win_over_the_environment(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(f"{API}/repos/other/caller", ok({"default_branch": "main"}))
+    t.add("repos/other/caller", ok({"default_branch": "main"}))
     argv = [
         "--repository",
         REPOSITORY,
@@ -254,4 +254,4 @@ def test_run_needs_the_caller_and_the_ref(
 ) -> None:
     argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path)]
     with pytest.raises(rt.ResolveError, match=message):
-        rt.run(rt.parse_args(argv), FakeTransport(), {**ENV, **env}, NOW)
+        rt.run(rt.parse_args(argv), FakeRunner(), {**ENV, **env}, NOW)

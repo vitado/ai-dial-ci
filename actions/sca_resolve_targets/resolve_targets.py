@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Resolve the scan targets (source snapshot + container images) of one repository.
 
-Used by the SCA scheduled scan. Talks only to the GitHub REST API and to the
-OCI distribution API of the image registry. Besides the standard library it needs
-PyYAML, for the repository configuration (``.github/sca.yml``, see ``sca_config``).
+Used by the SCA scheduled scan. Asks the GitHub REST API through ``gh api`` and the
+image registry through ``oras repo tags`` (both are on the runner). Besides the
+standard library it needs PyYAML, for the repository configuration
+(``.github/sca.yml``, see ``sca_config``).
 
-The HTTP layer is injectable: every network call goes through a ``Transport``
-(a callable ``(url, headers) -> Response``), so the logic can be tested with a
-fake transport and no network.
+Every call of an external tool goes through a ``Runner`` (a callable
+``(argv, stdin) -> stdout``), so the logic can be tested with a fake runner and no
+network.
 """
 
 from __future__ import annotations
@@ -20,20 +21,17 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import sca_config
 
-DEFAULT_GITHUB_API_URL = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 DOCKER_HUB_REGISTRY_HOST = "registry-1.docker.io"
 DOCKER_HUB_ALIASES = {
@@ -41,6 +39,7 @@ DOCKER_HUB_ALIASES = {
     "index.docker.io": DOCKER_HUB_REGISTRY_HOST,
 }
 GHCR_HOST = "ghcr.io"
+GHCR_USERNAME = "github-actions"  # any username works with a token
 
 SCANNER_TRIVY = "trivy"
 SCANNER_OSV = "osv"
@@ -50,23 +49,19 @@ KIND_FS = "fs"
 STATUS_PENDING = "pending"
 STATUS_NOT_APPLICABLE = "not_applicable"
 
-TAGS_PAGE_SIZE = 1000
-MAX_TAG_PAGES = 100
 GITHUB_TAGS_PAGE_SIZE = 100
-MAX_TAG_PEEL_DEPTH = 5  # tag objects pointing at tag objects, before a commit
-REQUEST_TIMEOUT_SECONDS = 30.0
+TOOL_TIMEOUT_SECONDS = 120.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
-MAX_RETRY_AFTER_SECONDS = 60.0
-RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 STABLE_SEMVER = re.compile(r"(v?)(\d+)\.(\d+)\.(\d+)", re.ASCII)
 _NAME_PART = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
 IMAGE_NAME = re.compile(rf"{_NAME_PART}(?:/{_NAME_PART})*", re.ASCII)
 REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", re.ASCII)
 UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
-CHALLENGE_PARAM = re.compile(r'(\w+)="([^"]*)"')
-LINK_NEXT = re.compile(r'<([^>]*)>\s*;[^,]*\brel="?next"?', re.IGNORECASE)
+# A client error (not rate limiting) will not go away by itself: no retry.
+PERMANENT_ERROR = re.compile(r"(?:HTTP|status code:?) (?!429)4\d\d", re.IGNORECASE)
+NOT_FOUND = re.compile(r"(?:HTTP|status code:?) 404", re.IGNORECASE)
 
 
 class ResolveError(Exception):
@@ -77,136 +72,91 @@ class RegistryError(Exception):
     """A registry problem affecting a single image."""
 
 
-class TransportError(Exception):
-    """A network-level failure (DNS, connection, timeout)."""
+class ToolError(Exception):
+    """An external tool (``gh``, ``oras``) failed; the message is its stderr."""
+
+    @property
+    def not_found(self) -> bool:
+        return NOT_FOUND.search(str(self)) is not None
 
 
-@dataclass(frozen=True)
-class Response:
-    status: int
-    headers: Mapping[str, str] = field(default_factory=dict)
-    body: bytes = b""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "headers", {k.lower(): v for k, v in self.headers.items()}
-        )
-
-    def header(self, name: str) -> str | None:
-        return self.headers.get(name.lower())
-
-    def json(self) -> Any:
-        return json.loads(self.body)
+Runner = Callable[[Sequence[str], str | None], str]
 
 
-Transport = Callable[[str, Mapping[str, str]], Response]
+def make_runner(
+    token: str | None,
+    sleep: Callable[[float], None] = time.sleep,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> Runner:
+    """The production runner: ``subprocess.run`` with a timeout and bounded retries.
 
+    ``gh`` gets the token as ``GH_TOKEN``. A failure is retried with a growing delay
+    unless it is a client error (HTTP 4xx other than 429).
+    """
+    env = {**os.environ, **({"GH_TOKEN": token} if token else {})}
 
-class UrllibTransport:
-    """Production transport: a plain HTTPS GET through urllib with a timeout."""
-
-    def __init__(self, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
-        self._timeout = timeout
-
-    def __call__(self, url: str, headers: Mapping[str, str]) -> Response:
-        if urllib.parse.urlsplit(url).scheme != "https":
-            raise TransportError(f"refusing non-HTTPS URL: {url}")
-        request = urllib.request.Request(url, headers=dict(headers), method="GET")
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                return Response(resp.status, dict(resp.headers), resp.read())
-        except urllib.error.HTTPError as err:
-            return Response(err.code, dict(err.headers), err.read())
-        except (urllib.error.URLError, TimeoutError, OSError) as err:
-            raise TransportError(f"{url}: {err}") from err
-
-
-class HttpClient:
-    """Adds bounded retries with backoff (429/5xx, network errors) to a Transport."""
-
-    def __init__(
-        self,
-        transport: Transport,
-        sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = MAX_ATTEMPTS,
-    ) -> None:
-        self._transport = transport
-        self._sleep = sleep
-        self._max_attempts = max_attempts
-
-    def get(self, url: str, headers: Mapping[str, str]) -> Response:
-        for attempt in range(1, self._max_attempts + 1):
-            delay = BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+    def run_tool(argv: Sequence[str], stdin: str | None = None) -> str:
+        for attempt in range(1, max_attempts + 1):
             try:
-                response = self._transport(url, headers)
-            except TransportError:
-                if attempt == self._max_attempts:
-                    raise
-            else:
-                if (
-                    response.status not in RETRY_STATUSES
-                    or attempt == self._max_attempts
-                ):
-                    return response
-                delay = _retry_after(response) or delay
-            self._sleep(delay)
+                done = subprocess.run(
+                    list(argv),
+                    input=stdin,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=TOOL_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if done.returncode == 0:
+                    return done.stdout
+                message = done.stderr.strip() or f"{argv[0]} exited {done.returncode}"
+            except subprocess.TimeoutExpired:
+                message = f"{argv[0]} timed out after {TOOL_TIMEOUT_SECONDS:.0f}s"
+            except OSError as err:
+                raise ToolError(f"cannot run {argv[0]}: {err}") from err
+            if attempt == max_attempts or PERMANENT_ERROR.search(message):
+                raise ToolError(message)
+            sleep(BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
         raise AssertionError("unreachable")  # pragma: no cover
 
-
-def _retry_after(response: Response) -> float | None:
-    value = response.header("Retry-After")
-    if value is None or not value.strip().isdigit():
-        return None
-    return min(float(value), MAX_RETRY_AFTER_SECONDS)
+    return run_tool
 
 
 class GitHubClient:
-    def __init__(self, http: HttpClient, token: str | None, api_url: str) -> None:
-        self._http = http
-        self._api_url = api_url.rstrip("/")
-        self._headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        }
-        if token:
-            self._headers["Authorization"] = f"Bearer {token}"
+    """The GitHub REST API through ``gh api``."""
 
-    def _get(self, path: str) -> Response:
+    def __init__(self, run: Runner) -> None:
+        self._run = run
+
+    def _api(self, path: str, *flags: str, missing_ok: bool = False) -> Any:
+        """The JSON response of GET ``path``; None for HTTP 404 if ``missing_ok``."""
+        argv = ["gh", "api", "-H", f"X-GitHub-Api-Version: {GITHUB_API_VERSION}"]
         try:
-            return self._http.get(f"{self._api_url}{path}", self._headers)
-        except TransportError as err:
-            raise ResolveError(f"GitHub API request failed: {err}") from err
-
-    def _get_json(self, path: str) -> Any:
-        response = self._get(path)
-        if response.status != 200:
-            raise ResolveError(f"GitHub API GET {path} returned HTTP {response.status}")
-        return response.json()
+            return json.loads(self._run([*argv, *flags, path], None))
+        except ToolError as err:
+            if missing_ok and err.not_found:
+                return None
+            raise ResolveError(f"GitHub API GET {path} failed: {err}") from err
+        except ValueError as err:
+            raise ResolveError(f"GitHub API GET {path}: invalid JSON: {err}") from err
 
     def default_branch(self, repo: str) -> str:
-        return str(self._get_json(f"/repos/{repo}")["default_branch"])
+        return str(self._api(f"repos/{repo}")["default_branch"])
 
     def commit_sha(self, repo: str, ref: str) -> str:
-        return str(
-            self._get_json(f"/repos/{repo}/commits/{urllib.parse.quote(ref, safe='')}")[
-                "sha"
-            ]
-        )
+        quoted = urllib.parse.quote(ref, safe="")
+        return str(self._api(f"repos/{repo}/commits/{quoted}")["sha"])
 
     def file_text(self, repo: str, path: str, ref: str) -> str | None:
         """Text of a file of the repository at a commit, or None if there is none."""
         quoted = urllib.parse.quote(path, safe="/")
         ref_query = urllib.parse.quote(ref, safe="")
-        response = self._get(f"/repos/{repo}/contents/{quoted}?ref={ref_query}")
-        if response.status == 404:
+        body = self._api(
+            f"repos/{repo}/contents/{quoted}?ref={ref_query}", missing_ok=True
+        )
+        if body is None:
             return None
-        if response.status != 200:
-            raise ResolveError(
-                f"GitHub API GET contents of {path} in {repo}@{ref} "
-                f"returned HTTP {response.status}"
-            )
         try:
-            body = response.json()
             if (
                 not isinstance(body, dict)
                 or body.get("type") != "file"
@@ -222,64 +172,34 @@ class GitHubClient:
 
     def latest_release_tag(self, repo: str) -> str | None:
         """Tag of the latest stable release, or None if the repo has none (HTTP 404)."""
-        response = self._get(f"/repos/{repo}/releases/latest")
-        if response.status == 404:
-            return None
-        if response.status != 200:
-            raise ResolveError(
-                f"GitHub API GET releases/latest of {repo} "
-                f"returned HTTP {response.status}"
-            )
-        return str(response.json()["tag_name"])
+        release = self._api(f"repos/{repo}/releases/latest", missing_ok=True)
+        return None if release is None else str(release["tag_name"])
 
     def repository_tags(self, repo: str) -> list[str]:
-        """Names of all git tags of the repository (paginated)."""
-        names: list[str] = []
-        for page in range(1, MAX_TAG_PAGES + 1):
-            batch = self._get_json(
-                f"/repos/{repo}/tags?per_page={GITHUB_TAGS_PAGE_SIZE}&page={page}"
-            )
-            names.extend(str(tag["name"]) for tag in batch)
-            if len(batch) < GITHUB_TAGS_PAGE_SIZE:
-                return names
-        raise ResolveError(
-            f"tag list of {repo} exceeds {MAX_TAG_PAGES * GITHUB_TAGS_PAGE_SIZE} tags"
+        """Names of all git tags of the repository."""
+        pages = self._api(
+            f"repos/{repo}/tags?per_page={GITHUB_TAGS_PAGE_SIZE}",
+            "--paginate",
+            "--slurp",
         )
+        return [str(tag["name"]) for page in pages for tag in page]
 
     def tag_commit_sha(self, repo: str, tag: str) -> str:
-        """Commit a git tag points to; an annotated tag is peeled to its commit."""
+        """Commit a git tag points to (the API peels an annotated tag to its commit)."""
         quoted = urllib.parse.quote(tag, safe="/")
-        try:
-            target = self._get_json(f"/repos/{repo}/git/ref/tags/{quoted}")["object"]
-            for _ in range(MAX_TAG_PEEL_DEPTH):
-                if target["type"] == "commit":
-                    return str(target["sha"])
-                if target["type"] != "tag":
-                    raise ResolveError(
-                        f"tag {tag} of {repo} points to a {target['type']}, "
-                        "not a commit"
-                    )
-                target = self._get_json(f"/repos/{repo}/git/tags/{target['sha']}")[
-                    "object"
-                ]
-        except (KeyError, TypeError) as err:
-            raise ResolveError(
-                f"unexpected GitHub API response for tag {tag} of {repo}: {err!r}"
-            ) from err
-        raise ResolveError(f"tag {tag} of {repo} is nested deeper than expected")
+        return str(self._api(f"repos/{repo}/commits/refs/tags/{quoted}")["sha"])
 
 
 class RegistryClient:
-    """Lists image tags through the OCI distribution API (any compliant registry)."""
+    """Lists image tags with ``oras repo tags`` (any OCI registry)."""
 
     def __init__(
-        self, http: HttpClient, registry: str, github_token: str | None = None
+        self, run: Runner, registry: str, github_token: str | None = None
     ) -> None:
         self.registry = registry
         self._host = DOCKER_HUB_ALIASES.get(registry, registry)
-        self._http = http
+        self._run = run
         self._github_token = github_token
-        self._bearer: dict[str, str] = {}  # scope -> token
         self._tags_cache: dict[str, list[str]] = {}
 
     def tags(self, image: str) -> list[str]:
@@ -288,103 +208,23 @@ class RegistryClient:
             self._tags_cache[image] = self._list_tags(image)
         return self._tags_cache[image]
 
-    def _repository(self, image: str) -> str:
-        if self._host == DOCKER_HUB_REGISTRY_HOST and "/" not in image:
-            return f"library/{image}"
-        return image
-
     def _list_tags(self, image: str) -> list[str]:
-        repository = self._repository(image)
-        url: str | None = (
-            f"https://{self._host}/v2/{repository}/tags/list?n={TAGS_PAGE_SIZE}"
-        )
-        tags: list[str] = []
-        for _ in range(MAX_TAG_PAGES):
-            response = self._get(url, repository)
-            if response.status != 200:
-                raise RegistryError(
-                    f"{self.registry}: listing tags of {image} "
-                    f"returned HTTP {response.status}"
-                )
-            try:
-                tags.extend(response.json().get("tags") or [])
-            except (ValueError, AttributeError) as err:
-                raise RegistryError(
-                    f"{self.registry}: invalid tag list for {image}: {err}"
-                ) from err
-            url = self._next_url(response, url)
-            if url is None:
-                return tags
-        raise RegistryError(
-            f"{self.registry}: tag list of {image} exceeds {MAX_TAG_PAGES} pages"
-        )
-
-    @staticmethod
-    def _next_url(response: Response, current: str) -> str | None:
-        link = response.header("Link")
-        match = LINK_NEXT.search(link) if link else None
-        return urllib.parse.urljoin(current, match.group(1)) if match else None
-
-    def _get(self, url: str, repository: str) -> Response:
-        scope = f"repository:{repository}:pull"
+        repository = image
+        if self._host == DOCKER_HUB_REGISTRY_HOST and "/" not in image:
+            repository = f"library/{image}"
+        argv = ["oras", "repo", "tags"]
+        stdin = None
+        # Credentials go to ghcr.io only; every other registry is asked anonymously.
+        if self._github_token and self._host == GHCR_HOST:
+            argv += ["--username", GHCR_USERNAME, "--password-stdin"]
+            stdin = self._github_token
+        argv.append(f"{self._host}/{repository}")
         try:
-            response = self._http.get(url, self._auth_headers(scope))
-            if response.status == 401:
-                challenge = response.header("WWW-Authenticate")
-                if not challenge:
-                    return response
-                self._bearer[scope] = self._fetch_token(challenge, scope)
-                response = self._http.get(url, self._auth_headers(scope))
-            return response
-        except TransportError as err:
-            raise RegistryError(f"{self.registry}: {err}") from err
-
-    def _auth_headers(self, scope: str) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if scope in self._bearer:
-            headers["Authorization"] = f"Bearer {self._bearer[scope]}"
-        return headers
-
-    def _fetch_token(self, challenge: str, scope: str) -> str:
-        scheme, _, rest = challenge.partition(" ")
-        params = dict(CHALLENGE_PARAM.findall(rest))
-        if scheme.lower() != "bearer" or "realm" not in params:
+            return self._run(argv, stdin).split()
+        except ToolError as err:
             raise RegistryError(
-                f"{self.registry}: unsupported authentication challenge: {challenge!r}"
-            )
-        realm = params["realm"]
-        realm_url = urllib.parse.urlsplit(realm)
-        if realm_url.scheme != "https":
-            raise RegistryError(
-                f"{self.registry}: refusing non-HTTPS token realm {realm!r}"
-            )
-        query = {"scope": params.get("scope", scope)}
-        if "service" in params:
-            query["service"] = params["service"]
-        headers = {"Accept": "application/json"}
-        # Credentials go only to ghcr.io's own token endpoint (any username works).
-        if (
-            self._github_token
-            and self._host == GHCR_HOST
-            and realm_url.hostname == GHCR_HOST
-        ):
-            basic = base64.b64encode(
-                f"github-actions:{self._github_token}".encode()
-            ).decode()
-            headers["Authorization"] = f"Basic {basic}"
-        separator = "&" if realm_url.query else "?"
-        response = self._http.get(
-            f"{realm}{separator}{urllib.parse.urlencode(query)}", headers
-        )
-        if response.status != 200:
-            raise RegistryError(
-                f"{self.registry}: token endpoint returned HTTP {response.status}"
-            )
-        body = response.json()
-        token = body.get("token") or body.get("access_token")
-        if not token:
-            raise RegistryError(f"{self.registry}: token endpoint returned no token")
-        return str(token)
+                f"{self.registry}: listing tags of {image} failed: {err}"
+            ) from err
 
 
 def parse_stable_semver(tag: str) -> tuple[int, int, int] | None:
@@ -946,7 +786,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def run(
     args: argparse.Namespace,
-    transport: Transport,
+    runner: Runner | None,
     environ: Mapping[str, str],
     now: datetime,
 ) -> int:
@@ -975,11 +815,9 @@ def run(
         raise ResolveError("the branch or tag of the run is unknown (no ref name)")
     token = args.github_token or environ.get("GITHUB_TOKEN") or None
 
-    http = HttpClient(transport)
-    github = GitHubClient(
-        http, token, environ.get("GITHUB_API_URL") or DEFAULT_GITHUB_API_URL
-    )
-    registry = RegistryClient(http, args.registry, token)
+    run_tool = runner or make_runner(token)
+    github = GitHubClient(run_tool)
+    registry = RegistryClient(run_tool, args.registry, token)
     targets_doc = resolve_targets(
         repository=args.repository,
         registry_name=args.registry,
@@ -1030,7 +868,7 @@ def run(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        return run(args, UrllibTransport(), os.environ, datetime.now(UTC))
+        return run(args, None, os.environ, datetime.now(UTC))
     except ResolveError as err:
         print(f"::error title=Scan target resolution failed::{err}")
         return 1

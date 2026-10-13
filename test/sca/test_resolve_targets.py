@@ -3,9 +3,10 @@
 import base64
 import importlib.util
 import json
+import subprocess
 import sys
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,13 +26,11 @@ rt = importlib.util.module_from_spec(_spec)
 sys.modules["resolve_targets"] = rt
 _spec.loader.exec_module(rt)
 
-API = "https://api.github.test"
 REPOSITORY = "example/app"
 NOW = datetime(2026, 10, 11, 12, 0, 0, tzinfo=UTC)
 SHA = "a" * 40
-CONFIG_URL = f"{API}/repos/{REPOSITORY}/contents/.github/sca.yml?ref={SHA}"
+CONFIG_URL = f"repos/{REPOSITORY}/contents/.github/sca.yml?ref={SHA}"
 ENV = {
-    "GITHUB_API_URL": API,
     "GITHUB_RUN_ID": "42",
     "GITHUB_SERVER_URL": "https://github.com",
     "GITHUB_REPOSITORY": "example/caller",
@@ -40,22 +39,28 @@ ENV = {
 CALLER = "example/caller"
 
 
-class FakeTransport:
-    """Routes URLs to canned responses and records every call."""
+class FakeRunner:
+    """Stands in for ``gh`` and ``oras``: routes the last argument (the API path or
+    the image reference) to a canned output, and records every call.
+    """
 
     def __init__(self) -> None:
         self.routes: dict[str, Any] = {}
-        self.calls: list[tuple[str, dict[str, str]]] = []
+        self.calls: list[tuple[list[str], str | None]] = []
+
+    @property
+    def urls(self) -> list[str]:
+        return [argv[-1] for argv, _ in self.calls]
 
     def add(self, url: str, response: Any) -> None:
-        """``response``: a Response, an exception or a list (consumed in order)."""
+        """``response``: stdout, a ToolError or a list (consumed in order)."""
         self.routes[url] = response
 
-    def __call__(self, url: str, headers: Mapping[str, str]) -> Any:
-        self.calls.append((url, dict(headers)))
-        route = self.routes.get(url)
+    def __call__(self, argv: Sequence[str], stdin: str | None = None) -> str:
+        self.calls.append((list(argv), stdin))
+        route = self.routes.get(argv[-1])
         if route is None:
-            return rt.Response(599, {}, b"unrouted")
+            raise rt.ToolError("unrouted")
         current = (
             (route.pop(0) if len(route) > 1 else route[0])
             if isinstance(route, list)
@@ -63,72 +68,64 @@ class FakeTransport:
         )
         if isinstance(current, Exception):
             raise current
-        return current
+        return str(current)
 
 
-def ok(payload: Any, headers: Mapping[str, str] | None = None) -> Any:
-    return rt.Response(200, headers or {}, json.dumps(payload).encode())
+def ok(payload: Any) -> str:
+    """The stdout of ``gh api`` for a JSON response."""
+    return json.dumps(payload)
+
+
+def http_error(status: int) -> rt.ToolError:
+    return rt.ToolError(f"gh: error (HTTP {status})")
+
+
+def tags_out(tags: list[str]) -> str:
+    """The stdout of ``oras repo tags``: one tag per line."""
+    return "".join(f"{tag}\n" for tag in tags)
 
 
 def tags_url(image: str, host: str = "ghcr.io") -> str:
-    return f"https://{host}/v2/{image}/tags/list?n=1000"
+    return f"{host}/{image}"
 
 
 def github_routes(
-    transport: FakeTransport,
+    runner: FakeRunner,
     release: str | None = "1.1.14",
     release_status: int | None = None,
     branch: str = "development",
 ) -> None:
-    transport.add(f"{API}/repos/{REPOSITORY}", ok({"default_branch": branch}))
+    runner.add(f"repos/{REPOSITORY}", ok({"default_branch": branch}))
     # the repository that runs the workflow, to tell a run on its default branch
-    transport.routes.setdefault(
-        f"{API}/repos/{CALLER}", ok({"default_branch": "development"})
-    )
+    runner.routes.setdefault(f"repos/{CALLER}", ok({"default_branch": "development"}))
     quoted = urllib.parse.quote(branch, safe="")
-    transport.add(f"{API}/repos/{REPOSITORY}/commits/{quoted}", ok({"sha": "a" * 40}))
+    runner.add(f"repos/{REPOSITORY}/commits/{quoted}", ok({"sha": "a" * 40}))
     # no .github/sca.yml: the defaults
-    transport.routes.setdefault(CONFIG_URL, rt.Response(404))
-    latest = f"{API}/repos/{REPOSITORY}/releases/latest"
+    runner.routes.setdefault(CONFIG_URL, http_error(404))
+    latest = f"repos/{REPOSITORY}/releases/latest"
     if release_status is not None:
-        transport.add(latest, rt.Response(release_status))
+        runner.add(latest, http_error(release_status))
     elif release is None:
-        transport.add(latest, rt.Response(404))
+        runner.add(latest, http_error(404))
     else:
-        transport.add(latest, ok({"tag_name": release}))
+        runner.add(latest, ok({"tag_name": release}))
 
 
-def tag_routes(
-    transport: FakeTransport,
-    tag: str,
-    sha: str,
-    annotated_as: str | None = None,
-) -> None:
-    """A git tag at ``sha``, annotated (via tag object ``annotated_as``) or not."""
-    ref = f"{API}/repos/{REPOSITORY}/git/ref/tags/{tag}"
-    if annotated_as is None:
-        transport.add(ref, ok({"object": {"type": "commit", "sha": sha}}))
-        return
-    transport.add(ref, ok({"object": {"type": "tag", "sha": annotated_as}}))
-    transport.add(
-        f"{API}/repos/{REPOSITORY}/git/tags/{annotated_as}",
-        ok({"object": {"type": "commit", "sha": sha}}),
+def tag_routes(runner: FakeRunner, tag: str, sha: str) -> None:
+    """A git tag at the commit ``sha`` (the API peels annotated tags itself)."""
+    runner.add(f"repos/{REPOSITORY}/commits/refs/tags/{tag}", ok({"sha": sha}))
+
+
+def git_tags_route(runner: FakeRunner, *pages: list[str]) -> None:
+    """The git tags of the repository, as ``gh api --paginate --slurp`` gives them."""
+    runner.add(
+        f"repos/{REPOSITORY}/tags?per_page=100",
+        ok([[{"name": name} for name in page] for page in pages]),
     )
-
-
-def git_tags_route(transport: FakeTransport, names: list[str], page: int = 1) -> None:
-    transport.add(
-        f"{API}/repos/{REPOSITORY}/tags?per_page=100&page={page}",
-        ok([{"name": name} for name in names]),
-    )
-
-
-def no_sleep_http(transport: FakeTransport) -> Any:
-    return rt.HttpClient(transport, sleep=lambda _: None)
 
 
 def run_resolve_targets(
-    transport: FakeTransport,
+    runner: FakeRunner,
     images: list[str],
     release_lines: int = 1,
     scan_source: bool = True,
@@ -138,7 +135,6 @@ def run_resolve_targets(
     token: str | None = "tkn",
     **kwargs: Any,
 ) -> dict[str, Any]:
-    http = no_sleep_http(transport)
     return rt.resolve_targets(
         repository=REPOSITORY,
         registry_name="ghcr.io",
@@ -148,8 +144,8 @@ def run_resolve_targets(
         scan_images=scan_images,
         scan_release_source=scan_release_source,
         osv_enabled=osv_enabled,
-        github=rt.GitHubClient(http, token, API),
-        registry=rt.RegistryClient(http, "ghcr.io", token),
+        github=rt.GitHubClient(runner),
+        registry=rt.RegistryClient(runner, "ghcr.io", token),
         environ=ENV,
         now=NOW,
         caller_repository=CALLER,
@@ -208,11 +204,11 @@ def test_semver_no_stable_tags() -> None:
 
 
 def test_release_lines_1_uses_github_latest_release() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
     t.add(
         tags_url("example/app"),
-        ok({"tags": ["development", "1.1.14", "1.2.0", "1.1.13"]}),
+        tags_out(["development", "1.1.14", "1.2.0", "1.1.13"]),
     )
     targets = by_id(run_resolve_targets(t, ["example/app"]))
     assert list(targets) == [
@@ -236,7 +232,7 @@ def test_release_lines_1_uses_github_latest_release() -> None:
 
 
 def test_resolve_document_metadata() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     targets_doc = run_resolve_targets(t, [])
     assert targets_doc["repo"] == REPOSITORY
@@ -250,16 +246,16 @@ def test_resolve_document_metadata() -> None:
 
 
 def test_release_lines_1_matches_v_stripped_tag() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="v1.1.14")
-    t.add(tags_url("example/x"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "1.1.14"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-1.1.14"]["status"] == "pending"
     assert targets["x-1.1.14"]["ref"] == "ghcr.io/example/x:1.1.14"
 
 
 def test_release_lines_3_uses_registry_semver_and_skips_github_release() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     tags = [
         "development",
@@ -270,7 +266,7 @@ def test_release_lines_3_uses_registry_semver_and_skips_github_release() -> None
         "0.13.0-rc.1",
         "0.10.0",
     ]
-    t.add(tags_url("example/x"), ok({"tags": tags}))
+    t.add(tags_url("example/x"), tags_out(tags))
     targets_doc = run_resolve_targets(t, ["example/x"], release_lines=3)
     pending = [x["id"] for x in targets_doc["targets"] if x["status"] == "pending"]
     assert pending == [
@@ -280,15 +276,15 @@ def test_release_lines_3_uses_registry_semver_and_skips_github_release() -> None
         "x-0.11.4",
         "x-0.10.0",
     ]
-    assert not any(url.endswith("/releases/latest") for url, _ in t.calls)
+    assert not any(url.endswith("/releases/latest") for url in t.urls)
 
 
 def test_no_github_release_falls_back_to_registry_semver() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     t.add(
         tags_url("example/x"),
-        ok({"tags": ["development", "0.9.1", "0.12.0", "0.12.0-rc.1"]}),
+        tags_out(["development", "0.9.1", "0.12.0", "0.12.0-rc.1"]),
     )
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-0.12.0"]["status"] == "pending"
@@ -296,9 +292,9 @@ def test_no_github_release_falls_back_to_registry_semver() -> None:
 
 
 def test_release_tag_missing_for_image_is_not_applicable() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app-bff"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/app-bff"), tags_out(["development"]))
     targets = by_id(run_resolve_targets(t, ["example/app-bff"]))
     assert targets["app-bff-development"]["status"] == "pending"
     missing = targets["app-bff-1.1.14"]
@@ -307,38 +303,38 @@ def test_release_tag_missing_for_image_is_not_applicable() -> None:
 
 
 def test_missing_development_tag_is_not_applicable() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.0.0")
-    t.add(tags_url("example/x"), ok({"tags": ["1.0.0"]}))
+    t.add(tags_url("example/x"), tags_out(["1.0.0"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "not_applicable"
     assert targets["x-1.0.0"]["status"] == "pending"
 
 
 def test_no_stable_tags_gives_single_not_applicable_release_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(tags_url("example/x"), ok({"tags": ["development", "1.0.0-rc.1"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "1.0.0-rc.1"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-release"]["status"] == "not_applicable"
     assert targets["x-release"]["tag"] is None
     assert targets["x-release"]["ref"] is None
 
 
-def test_null_tags_in_registry_response() -> None:
-    t = FakeTransport()
+def test_image_without_tags() -> None:
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(tags_url("example/x"), ok({"name": "example/x", "tags": None}))
+    t.add(tags_url("example/x"), tags_out([]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "not_applicable"
     assert targets["x-release"]["status"] == "not_applicable"
 
 
 def test_registry_error_fails_only_that_image() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.0.0")
-    t.add(tags_url("example/bad"), rt.Response(404))
-    t.add(tags_url("example/good"), ok({"tags": ["development", "1.0.0"]}))
+    t.add(tags_url("example/bad"), http_error(404))
+    t.add(tags_url("example/good"), tags_out(["development", "1.0.0"]))
     targets = by_id(run_resolve_targets(t, ["example/bad", "example/good"]))
     assert targets["bad-development"]["status"] == "failed"
     assert "HTTP 404" in targets["bad-development"]["reason"]
@@ -347,22 +343,19 @@ def test_registry_error_fails_only_that_image() -> None:
     assert targets["good-1.0.0"]["status"] == "pending"
 
 
-def test_registry_network_error_after_retries_fails_image() -> None:
-    t = FakeTransport()
+def test_registry_tool_failure_fails_image() -> None:
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(tags_url("example/x"), rt.TransportError("boom"))
+    t.add(tags_url("example/x"), rt.ToolError("boom"))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "failed"
     assert "boom" in targets["x-development"]["reason"]
-    assert (
-        sum(1 for url, _ in t.calls if url == tags_url("example/x")) == rt.MAX_ATTEMPTS
-    )
 
 
 def test_github_release_api_error_fails_release_targets_but_keeps_development() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release_status=403)
-    t.add(tags_url("example/x"), ok({"tags": ["development", "1.0.0"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "1.0.0"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "pending"
     assert targets["x-release"]["status"] == "failed"
@@ -371,61 +364,60 @@ def test_github_release_api_error_fails_release_targets_but_keeps_development() 
 
 @pytest.mark.parametrize("missing", ["repo", "commit"])
 def test_snapshot_failure_is_fatal(missing: str) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     t.add(
-        f"{API}/repos/{REPOSITORY}"
-        + ("/commits/development" if missing == "commit" else ""),
-        rt.Response(404),
+        f"repos/{REPOSITORY}" + ("/commits/development" if missing == "commit" else ""),
+        http_error(404),
     )
     with pytest.raises(rt.ResolveError, match="HTTP 404"):
         run_resolve_targets(t, [])
 
 
 def test_snapshot_network_failure_is_fatal() -> None:
-    t = FakeTransport()
-    t.add(f"{API}/repos/{REPOSITORY}", rt.TransportError("down"))
+    t = FakeRunner()
+    t.add(f"repos/{REPOSITORY}", rt.ToolError("down"))
     with pytest.raises(rt.ResolveError, match="down"):
         run_resolve_targets(t, [])
 
 
 def test_empty_images_only_source() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     targets_doc = run_resolve_targets(t, [])
     assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
-    assert not any("/v2/" in url for url, _ in t.calls)
+    assert not any(url.startswith("ghcr.io/") for url in t.urls)
 
 
 def test_scan_source_false() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
-    t.add(tags_url("example/x"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "1.1.14"]))
     targets = by_id(run_resolve_targets(t, ["example/x"], scan_source=False))
     assert "source-development" not in targets
     assert "x-development" in targets
 
 
 def test_scan_images_false() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     targets_doc = run_resolve_targets(t, ["example/x"], scan_images=False)
     assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
 
 
 def test_id_collision_rejected() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(tags_url("a/x"), ok({"tags": ["development"]}))
-    t.add(tags_url("b/x"), ok({"tags": ["development"]}))
+    t.add(tags_url("a/x"), tags_out(["development"]))
+    t.add(tags_url("b/x"), tags_out(["development"]))
     with pytest.raises(rt.ResolveError, match="collision"):
         run_resolve_targets(t, ["a/x", "b/x"])
 
 
 def test_matrix_has_only_pending_targets_without_status() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/bff"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/bff"), tags_out(["development"]))
     matrix = rt.build_matrix(run_resolve_targets(t, ["example/bff"]))
     assert [m["id"] for m in matrix] == ["source-development", "bff-development"]
     assert all(set(m) == TARGET_KEYS for m in matrix)
@@ -439,7 +431,7 @@ def test_source_target_id_from_git_ref() -> None:
 
 
 def test_source_target_id_sanitized_and_independent_of_sha() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, branch="release/1.2")
     targets = by_id(run_resolve_targets(t, []))
     assert list(targets) == ["source-release-1.2"]
@@ -448,7 +440,7 @@ def test_source_target_id_sanitized_and_independent_of_sha() -> None:
 
 
 def test_fs_target_carries_git_ref_and_commit_sha() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     targets_doc = run_resolve_targets(t, [])
     assert targets_doc["targets"] == [
@@ -470,9 +462,9 @@ def test_fs_target_carries_git_ref_and_commit_sha() -> None:
 
 
 def test_target_schema_is_uniform() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/app"), tags_out(["development"]))
     targets_doc = run_resolve_targets(t, ["example/app"])
     kinds = {x["kind"] for x in targets_doc["targets"]}
     assert kinds == {"fs", "image"}
@@ -489,7 +481,7 @@ def test_target_schema_is_uniform() -> None:
 
 
 def test_matrix_carries_commit_sha_of_fs_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     (fs,) = rt.build_matrix(run_resolve_targets(t, []))
     assert (fs["git_ref"], fs["commit_sha"]) == ("development", "a" * 40)
@@ -531,177 +523,185 @@ def test_parse_bool() -> None:
         rt.parse_bool("yes", "x")
 
 
-# --- registry protocol --------------------------------------------------------
-
-CHALLENGE = 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:example/x:pull"'
-GHCR_TOKEN_URL = (
-    "https://ghcr.io/token?scope=repository%3Aexample%2Fx%3Apull&service=ghcr.io"
-)
+# --- registry (oras) ----------------------------------------------------------
 
 
-def test_registry_401_token_flow_with_ghcr_basic_auth() -> None:
-    t = FakeTransport()
-    t.add(
-        tags_url("example/x"),
-        [
-            rt.Response(401, {"WWW-Authenticate": CHALLENGE}),
-            ok({"tags": ["development"]}),
-        ],
-    )
-    t.add(GHCR_TOKEN_URL, ok({"token": "BEARER"}))
-    client = rt.RegistryClient(no_sleep_http(t), "ghcr.io", "gh-token")
-    assert client.tags("example/x") == ["development"]
-    (_, first), (token_url, token_headers), (_, retry) = t.calls
-    assert "Authorization" not in first
-    assert token_url == GHCR_TOKEN_URL
-    assert token_headers["Authorization"].startswith("Basic ")
-    assert retry["Authorization"] == "Bearer BEARER"
+def test_registry_lists_tags_anonymously_without_a_token() -> None:
+    t = FakeRunner()
+    t.add("ghcr.io/example/x", tags_out(["a", "b"]))
+    assert rt.RegistryClient(t, "ghcr.io").tags("example/x") == ["a", "b"]
+    assert t.calls == [(["oras", "repo", "tags", "ghcr.io/example/x"], None)]
 
 
-def test_registry_anonymous_token_without_github_token() -> None:
-    t = FakeTransport()
-    t.add(
-        tags_url("example/x"),
-        [rt.Response(401, {"WWW-Authenticate": CHALLENGE}), ok({"tags": ["a"]})],
-    )
-    t.add(GHCR_TOKEN_URL, ok({"token": "T"}))
-    client = rt.RegistryClient(no_sleep_http(t), "ghcr.io", None)
-    assert client.tags("example/x") == ["a"]
-    assert "Authorization" not in t.calls[1][1]
+def test_registry_logs_in_to_ghcr_with_the_github_token() -> None:
+    t = FakeRunner()
+    t.add("ghcr.io/example/x", tags_out(["development"]))
+    assert rt.RegistryClient(t, "ghcr.io", "gh-token").tags("example/x") == [
+        "development"
+    ]
+    argv, stdin = t.calls[0]
+    assert argv == [
+        "oras",
+        "repo",
+        "tags",
+        "--username",
+        "github-actions",
+        "--password-stdin",
+        "ghcr.io/example/x",
+    ]
+    assert stdin == "gh-token"
+    assert "gh-token" not in " ".join(argv)
 
 
 def test_github_token_not_sent_to_foreign_registry() -> None:
-    t = FakeTransport()
-    challenge = (
-        'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'
-    )
-    url = "https://registry-1.docker.io/v2/example/x/tags/list?n=1000"
-    t.add(
-        url,
-        [
-            rt.Response(401, {"WWW-Authenticate": challenge}),
-            ok({"tags": ["development"]}),
-        ],
-    )
-    realm = "https://auth.docker.io/token?scope=repository%3Aexample%2Fx%3Apull&service=registry.docker.io"
-    t.add(realm, ok({"access_token": "T"}))
-    client = rt.RegistryClient(no_sleep_http(t), "docker.io", "gh-token")
-    assert client.tags("example/x") == ["development"]
-    assert "Authorization" not in t.calls[1][1]
-    assert t.calls[2][1]["Authorization"] == "Bearer T"
-
-
-def test_docker_hub_official_images_use_library_namespace() -> None:
-    t = FakeTransport()
-    t.add(
-        "https://registry-1.docker.io/v2/library/nginx/tags/list?n=1000",
-        ok({"tags": ["1.0.0"]}),
-    )
-    assert rt.RegistryClient(no_sleep_http(t), "docker.io").tags("nginx") == ["1.0.0"]
-
-
-def test_registry_rejects_unsupported_challenge() -> None:
-    t = FakeTransport()
-    t.add(
-        tags_url("example/x"), rt.Response(401, {"WWW-Authenticate": 'Basic realm="x"'})
-    )
-    with pytest.raises(rt.RegistryError, match="unsupported"):
-        rt.RegistryClient(no_sleep_http(t), "ghcr.io").tags("example/x")
-
-
-def test_registry_401_without_challenge_is_error() -> None:
-    t = FakeTransport()
-    t.add(tags_url("example/x"), rt.Response(401))
-    with pytest.raises(rt.RegistryError, match="HTTP 401"):
-        rt.RegistryClient(no_sleep_http(t), "ghcr.io").tags("example/x")
-
-
-def test_registry_pagination_via_link_header() -> None:
-    t = FakeTransport()
-    page2 = "/v2/example/x/tags/list?last=b&n=1000"
-    page3 = "https://ghcr.io/v2/example/x/tags/list?last=c&n=1000"
-    t.add(
-        tags_url("example/x"),
-        ok({"tags": ["a", "b"]}, {"Link": f'<{page2}>; rel="next"'}),
-    )
-    t.add(
-        f"https://ghcr.io{page2}",
-        ok({"tags": ["c"]}, {"Link": f'<{page3}>; rel="next"'}),
-    )
-    t.add(page3, ok({"tags": ["d"]}))
-    assert rt.RegistryClient(no_sleep_http(t), "ghcr.io").tags("example/x") == [
-        "a",
-        "b",
-        "c",
-        "d",
+    t = FakeRunner()
+    t.add("registry-1.docker.io/example/x", tags_out(["development"]))
+    assert rt.RegistryClient(t, "docker.io", "gh-token").tags("example/x") == [
+        "development"
+    ]
+    assert t.calls == [
+        (["oras", "repo", "tags", "registry-1.docker.io/example/x"], None)
     ]
 
 
-def test_registry_pagination_loop_is_bounded() -> None:
-    t = FakeTransport()
-    t.add(
-        tags_url("example/x"),
-        ok({"tags": ["a"]}, {"Link": f'<{tags_url("example/x")}>; rel="next"'}),
-    )
-    with pytest.raises(rt.RegistryError, match="pages"):
-        rt.RegistryClient(no_sleep_http(t), "ghcr.io").tags("example/x")
+def test_docker_hub_official_images_use_library_namespace() -> None:
+    t = FakeRunner()
+    t.add("registry-1.docker.io/library/nginx", tags_out(["1.0.0"]))
+    assert rt.RegistryClient(t, "docker.io").tags("nginx") == ["1.0.0"]
+
+
+def test_registry_failure_is_a_registry_error() -> None:
+    t = FakeRunner()
+    t.add("ghcr.io/example/x", rt.ToolError("response status code 401: unauthorized"))
+    with pytest.raises(rt.RegistryError, match="listing tags of example/x.*401"):
+        rt.RegistryClient(t, "ghcr.io").tags("example/x")
 
 
 def test_registry_tags_cached_per_image() -> None:
-    t = FakeTransport()
-    t.add(tags_url("example/x"), ok({"tags": ["a"]}))
-    client = rt.RegistryClient(no_sleep_http(t), "ghcr.io")
+    t = FakeRunner()
+    t.add("ghcr.io/example/x", tags_out(["a"]))
+    client = rt.RegistryClient(t, "ghcr.io")
     client.tags("example/x")
     client.tags("example/x")
     assert len(t.calls) == 1
 
 
-# --- retry --------------------------------------------------------------------
+# --- GitHub (gh) --------------------------------------------------------------
 
 
-def test_retry_honours_retry_after_and_backoff() -> None:
-    t = FakeTransport()
-    t.add(
-        "https://h/x",
-        [rt.Response(429, {"Retry-After": "7"}), rt.Response(503), rt.Response(200)],
+def test_github_requests_go_through_gh_api() -> None:
+    t = FakeRunner()
+    github_routes(t)
+    run_resolve_targets(t, [])
+    for argv, stdin in t.calls:
+        assert argv[:2] == ["gh", "api"]
+        assert "X-GitHub-Api-Version: 2022-11-28" in argv
+        assert stdin is None
+
+
+def test_github_tags_of_all_pages_are_flattened() -> None:
+    t = FakeRunner()
+    git_tags_route(t, ["0.1.0", "0.1.1"], ["0.2.0"])
+    assert rt.GitHubClient(t).repository_tags(REPOSITORY) == ["0.1.0", "0.1.1", "0.2.0"]
+    assert "--paginate" in t.calls[0][0]
+
+
+def test_github_invalid_json_is_a_resolve_error() -> None:
+    t = FakeRunner()
+    t.add(f"repos/{REPOSITORY}", "not json")
+    with pytest.raises(rt.ResolveError, match="invalid JSON"):
+        rt.GitHubClient(t).default_branch(REPOSITORY)
+
+
+# --- the runner (subprocess) --------------------------------------------------
+
+
+class FakeProcesses:
+    """Replaces ``subprocess.run``: one canned result per call, in order."""
+
+    def __init__(self, *results: Any) -> None:
+        self.results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> Any:
+        self.calls.append({"argv": argv, **kwargs})
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def done(returncode: int = 0, stdout: str = "", stderr: str = "") -> Any:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def runner_with(
+    monkeypatch: pytest.MonkeyPatch, *results: Any
+) -> tuple[Any, FakeProcesses, list[float]]:
+    processes = FakeProcesses(*results)
+    monkeypatch.setattr(rt.subprocess, "run", processes)
+    sleeps: list[float] = []
+    return rt.make_runner("secret", sleep=sleeps.append), processes, sleeps
+
+
+def test_runner_returns_stdout_and_passes_token_and_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, processes, sleeps = runner_with(monkeypatch, done(stdout="out"))
+    assert run(["gh", "api", "x"], "input") == "out"
+    (call,) = processes.calls
+    assert call["env"]["GH_TOKEN"] == "secret"
+    assert call["input"] == "input"
+    assert call["timeout"] == rt.TOOL_TIMEOUT_SECONDS
+    assert sleeps == []
+
+
+def test_runner_retries_a_transient_failure_with_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, processes, sleeps = runner_with(
+        monkeypatch,
+        done(1, stderr="gh: Bad Gateway (HTTP 502)"),
+        subprocess.TimeoutExpired("gh", 1),
+        done(stdout="out"),
     )
-    sleeps: list[float] = []
-    assert rt.HttpClient(t, sleep=sleeps.append).get("https://h/x", {}).status == 200
-    assert sleeps == [7.0, 2.0]
+    assert run(["gh", "api", "x"], None) == "out"
+    assert len(processes.calls) == 3
+    assert sleeps == [1.0, 2.0]
 
 
-def test_retry_after_is_capped() -> None:
-    t = FakeTransport()
-    t.add("https://h/x", [rt.Response(429, {"Retry-After": "86400"}), rt.Response(200)])
-    sleeps: list[float] = []
-    rt.HttpClient(t, sleep=sleeps.append).get("https://h/x", {})
-    assert sleeps == [rt.MAX_RETRY_AFTER_SECONDS]
-
-
-def test_retry_gives_up_and_returns_last_response() -> None:
-    t = FakeTransport()
-    t.add("https://h/x", rt.Response(500))
-    sleeps: list[float] = []
-    assert rt.HttpClient(t, sleep=sleeps.append).get("https://h/x", {}).status == 500
-    assert len(t.calls) == rt.MAX_ATTEMPTS
+def test_runner_gives_up_after_the_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    run, processes, sleeps = runner_with(monkeypatch, done(1, stderr="HTTP 503"))
+    with pytest.raises(rt.ToolError, match="HTTP 503"):
+        run(["gh", "api", "x"], None)
+    assert len(processes.calls) == rt.MAX_ATTEMPTS
     assert len(sleeps) == rt.MAX_ATTEMPTS - 1
 
 
-def test_no_retry_on_client_error() -> None:
-    t = FakeTransport()
-    t.add("https://h/x", rt.Response(404))
-    assert no_sleep_http(t).get("https://h/x", {}).status == 404
-    assert len(t.calls) == 1
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
+def test_runner_does_not_retry_a_client_error(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    run, processes, _ = runner_with(
+        monkeypatch, done(1, stderr=f"gh: x (HTTP {status})")
+    )
+    with pytest.raises(rt.ToolError, match=f"HTTP {status}"):
+        run(["gh", "api", "x"], None)
+    assert len(processes.calls) == 1
 
 
-def test_github_requests_carry_required_headers() -> None:
-    t = FakeTransport()
-    github_routes(t)
-    run_resolve_targets(t, [], token="secret")
-    for _, headers in t.calls:
-        assert headers["Accept"] == "application/vnd.github+json"
-        assert headers["X-GitHub-Api-Version"] == "2022-11-28"
-        assert headers["Authorization"] == "Bearer secret"
+def test_runner_retries_rate_limiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    run, processes, _ = runner_with(
+        monkeypatch, done(1, stderr="gh: slow down (HTTP 429)"), done(stdout="out")
+    )
+    assert run(["gh", "api", "x"], None) == "out"
+    assert len(processes.calls) == 2
+
+
+def test_runner_reports_a_missing_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    run, _, _ = runner_with(monkeypatch, FileNotFoundError("no oras"))
+    with pytest.raises(rt.ToolError, match="cannot run oras"):
+        run(["oras", "repo", "tags", "x"], None)
 
 
 # --- output formatting and CLI ---------------------------------------------------
@@ -740,10 +740,10 @@ def parse_github_output(text: str) -> dict[str, str]:
 def test_run_writes_resolve_json_and_outputs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
     tag_routes(t, "1.1.14", "b" * 40)
-    t.add(tags_url("example/x"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/x"), tags_out(["development"]))
     output_file = tmp_path / "github_output"
     env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
     argv = [
@@ -783,12 +783,16 @@ def test_run_writes_resolve_json_and_outputs(
     assert "x-development" in console
 
 
-def test_run_uses_token_from_environment(tmp_path: Path) -> None:
-    t = FakeTransport()
+def test_run_uses_token_from_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    t = FakeRunner()
     github_routes(t)
+    tokens: list[str | None] = []
+    monkeypatch.setattr(rt, "make_runner", lambda token: tokens.append(token) or t)
     args = rt.parse_args(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
-    rt.run(args, t, {**ENV, "GITHUB_TOKEN": "from-env"}, NOW)
-    assert t.calls[0][1]["Authorization"] == "Bearer from-env"
+    rt.run(args, None, {**ENV, "GITHUB_TOKEN": "from-env"}, NOW)
+    assert tokens == ["from-env"]
 
 
 @pytest.mark.parametrize(
@@ -803,16 +807,15 @@ def test_run_uses_token_from_environment(tmp_path: Path) -> None:
 def test_run_rejects_invalid_inputs(tmp_path: Path, extra: list[str]) -> None:
     argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path), *extra]
     with pytest.raises(rt.ResolveError):
-        rt.run(rt.parse_args(argv), FakeTransport(), ENV, NOW)
+        rt.run(rt.parse_args(argv), FakeRunner(), ENV, NOW)
 
 
 def test_main_reports_fatal_error_and_exits_non_zero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    t = FakeTransport()
-    t.add(f"{API}/repos/{REPOSITORY}", rt.Response(404))
-    monkeypatch.setattr(rt, "UrllibTransport", lambda: t)
-    monkeypatch.setenv("GITHUB_API_URL", API)
+    t = FakeRunner()
+    t.add(f"repos/{REPOSITORY}", http_error(404))
+    monkeypatch.setattr(rt, "make_runner", lambda token: t)
     code = rt.main(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])
     assert code == 1
     assert "::error" in capsys.readouterr().out
@@ -859,10 +862,10 @@ def test_render_table_and_annotations() -> None:
 
 
 def test_release_source_target_of_latest_release() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="0.12.0")
     tag_routes(t, "0.12.0", "c" * 40)
-    t.add(tags_url("example/app"), ok({"tags": ["development", "0.12.0"]}))
+    t.add(tags_url("example/app"), tags_out(["development", "0.12.0"]))
     targets_doc = run_resolve_targets(t, ["example/app"], scan_release_source=True)
     assert [x["id"] for x in targets_doc["targets"]] == [
         "source-development",
@@ -888,37 +891,13 @@ def test_release_source_target_of_latest_release() -> None:
     assert all(set(m) == TARGET_KEYS for m in matrix)
     assert [m["id"] for m in matrix][:2] == ["source-development", "source-0.12.0"]
     # one line needs no git tag listing
-    assert not any("/tags?" in url for url, _ in t.calls)
-
-
-def test_release_source_peels_annotated_tag() -> None:
-    t = FakeTransport()
-    github_routes(t, release="0.12.0")
-    tag_routes(t, "0.12.0", "d" * 40, annotated_as="e" * 40)
-    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
-    assert targets["source-0.12.0"]["commit_sha"] == "d" * 40
-    assert targets["source-0.12.0"]["status"] == "pending"
-
-
-def test_release_source_tag_pointing_at_a_tree_fails() -> None:
-    t = FakeTransport()
-    github_routes(t, release="0.12.0")
-    t.add(
-        f"{API}/repos/{REPOSITORY}/git/ref/tags/0.12.0",
-        ok({"object": {"type": "tree", "sha": "f" * 40}}),
-    )
-    target = by_id(run_resolve_targets(t, [], scan_release_source=True))[
-        "source-0.12.0"
-    ]
-    assert target["status"] == "failed"
-    assert "not a commit" in target["reason"]
-    assert target["commit_sha"] is None
+    assert not any("/tags?" in url for url in t.urls)
 
 
 def test_release_source_tag_that_cannot_be_resolved_is_a_failed_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="0.12.0")
-    t.add(f"{API}/repos/{REPOSITORY}/git/ref/tags/0.12.0", rt.Response(404))
+    t.add(f"repos/{REPOSITORY}/commits/refs/tags/0.12.0", http_error(404))
     targets_doc = run_resolve_targets(t, [], scan_release_source=True)
     failed = by_id(targets_doc)["source-0.12.0"]
     assert failed["status"] == "failed"
@@ -937,7 +916,7 @@ def test_release_source_tag_that_cannot_be_resolved_is_a_failed_target() -> None
 
 
 def test_release_source_latest_release_lookup_failure_is_a_failed_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release_status=500)
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
     assert targets["source-development"]["status"] == "pending"
@@ -947,7 +926,7 @@ def test_release_source_latest_release_lookup_failure_is_a_failed_target() -> No
 
 
 def test_release_source_without_images_python_package() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.2.3")
     tag_routes(t, "1.2.3", "a1" * 20)
     targets_doc = run_resolve_targets(t, [], scan_release_source=True)
@@ -955,11 +934,11 @@ def test_release_source_without_images_python_package() -> None:
         "source-development",
         "source-1.2.3",
     ]
-    assert not any("/v2/" in url for url, _ in t.calls)
+    assert not any(url.startswith("ghcr.io/") for url in t.urls)
 
 
 def test_release_source_falls_back_to_git_tags_without_github_release() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
     tag_routes(t, "0.12.0", "b" * 40)
@@ -968,7 +947,7 @@ def test_release_source_falls_back_to_git_tags_without_github_release() -> None:
 
 
 def test_release_source_lines_from_git_tags_newest_first() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     git_tags_route(t, ["0.9.1", "0.10.0", "0.12.0", "0.12.1", "0.11.4", "0.13.0-rc.1"])
     for tag in ("0.12.1", "0.11.4", "0.10.0"):
@@ -981,21 +960,20 @@ def test_release_source_lines_from_git_tags_newest_first() -> None:
         "source-0.10.0",
     ]
     # several lines: the git tags decide, not the latest GitHub release
-    assert not any(url.endswith("/releases/latest") for url, _ in t.calls)
+    assert not any(url.endswith("/releases/latest") for url in t.urls)
 
 
 def test_release_source_git_tag_listing_is_paginated() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [f"0.1.{i}" for i in range(100)], page=1)
-    git_tags_route(t, ["0.2.0"], page=2)
+    git_tags_route(t, [f"0.1.{i}" for i in range(100)], ["0.2.0"])
     tag_routes(t, "0.2.0", "b" * 40)
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
     assert "source-0.2.0" in targets
 
 
 def test_release_source_no_stable_tag_is_not_applicable() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     git_tags_route(t, ["0.1.0-rc.1", "nightly"])
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
@@ -1004,37 +982,37 @@ def test_release_source_no_stable_tag_is_not_applicable() -> None:
 
 
 def test_release_source_git_tag_listing_failure_is_a_failed_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
-    t.add(f"{API}/repos/{REPOSITORY}/tags?per_page=100&page=1", rt.Response(403))
+    t.add(f"repos/{REPOSITORY}/tags?per_page=100", http_error(403))
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
     assert targets["source-release"]["status"] == "failed"
     assert "HTTP 403" in targets["source-release"]["reason"]
 
 
 def test_scan_source_false_disables_release_sources_too() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="0.12.0")
-    t.add(tags_url("example/x"), ok({"tags": ["development", "0.12.0"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "0.12.0"]))
     targets = by_id(
         run_resolve_targets(
             t, ["example/x"], scan_source=False, scan_release_source=True
         )
     )
     assert list(targets) == ["x-development", "x-0.12.0"]
-    assert not any("/git/" in url for url, _ in t.calls)
+    assert not any("/commits/refs/tags/" in url for url in t.urls)
 
 
 def test_release_source_off_makes_no_extra_requests() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="0.12.0")
-    t.add(tags_url("example/x"), ok({"tags": ["development", "0.12.0"]}))
+    t.add(tags_url("example/x"), tags_out(["development", "0.12.0"]))
     run_resolve_targets(t, ["example/x"], scan_release_source=False)
-    assert not any("/git/" in url or "/tags?" in url for url, _ in t.calls)
+    assert not any("/commits/refs/tags/" in url or "/tags?" in url for url in t.urls)
 
 
 def test_release_source_id_sanitized() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="rel/1.0")
     tag_routes(t, "rel/1.0", "b" * 40)
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
@@ -1042,7 +1020,7 @@ def test_release_source_id_sanitized() -> None:
 
 
 def test_run_scan_release_source_flag(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="0.12.0")
     tag_routes(t, "0.12.0", "b" * 40)
     base = [
@@ -1071,17 +1049,17 @@ def test_run_scan_release_source_flag(tmp_path: Path) -> None:
 
 
 def test_every_target_names_its_scanner_trivy_without_osv() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/app"), tags_out(["development", "1.1.14"]))
     targets_doc = run_resolve_targets(t, ["example/app"])
     assert {x["scanner"] for x in targets_doc["targets"]} == {"trivy"}
 
 
 def test_osv_target_is_the_twin_of_every_trivy_target() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/app"), tags_out(["development", "1.1.14"]))
     targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
     # Trivy targets as before, then the OSV twins in the same order
     assert [(x["scanner"], x["id"]) for x in targets_doc["targets"]] == [
@@ -1097,10 +1075,10 @@ def test_osv_target_is_the_twin_of_every_trivy_target() -> None:
 
 
 def test_osv_twins_cover_release_sources_in_resolve_order() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
     tag_routes(t, "1.1.14", "c" * 40)
-    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/app"), tags_out(["development", "1.1.14"]))
     targets_doc = run_resolve_targets(
         t, ["example/app"], scan_release_source=True, osv_enabled=True
     )
@@ -1119,9 +1097,9 @@ def test_osv_twins_cover_release_sources_in_resolve_order() -> None:
         "c" * 40,
     )
     # a release source that failed to resolve has a not_applicable twin
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(f"{API}/repos/{REPOSITORY}/git/ref/tags/1.1.14", rt.Response(404))
+    t.add(f"repos/{REPOSITORY}/commits/refs/tags/1.1.14", http_error(404))
     failed = {
         (x["scanner"], x["id"]): x
         for x in run_resolve_targets(t, [], scan_release_source=True, osv_enabled=True)[
@@ -1136,10 +1114,10 @@ def test_osv_twins_cover_release_sources_in_resolve_order() -> None:
 def test_osv_twin_of_a_trivy_target_that_will_not_be_scanned_is_not_applicable() -> (
     None
 ):
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
     # No release tag in the registry: the release target is not_applicable
-    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/app"), tags_out(["development"]))
     targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
     by_identity = {(x["scanner"], x["id"]): x for x in targets_doc["targets"]}
     trivy = by_identity[("trivy", "app-1.1.14")]
@@ -1151,9 +1129,9 @@ def test_osv_twin_of_a_trivy_target_that_will_not_be_scanned_is_not_applicable()
 
 
 def test_osv_twin_of_a_trivy_target_that_failed_to_resolve_is_not_applicable() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), rt.Response(404))
+    t.add(tags_url("example/app"), http_error(404))
     targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
     osv = [x for x in targets_doc["targets"] if x["scanner"] == "osv"]
     assert [(x["id"], x["status"]) for x in osv] == [
@@ -1165,9 +1143,9 @@ def test_osv_twin_of_a_trivy_target_that_failed_to_resolve_is_not_applicable() -
 
 
 def test_matrix_holds_only_pending_trivy_targets() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), ok({"tags": ["development", "1.1.14"]}))
+    t.add(tags_url("example/app"), tags_out(["development", "1.1.14"]))
     targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
     assert [m["id"] for m in rt.build_matrix(targets_doc)] == [
         "source-development",
@@ -1177,9 +1155,9 @@ def test_matrix_holds_only_pending_trivy_targets() -> None:
 
 
 def test_osv_twins_are_not_annotated_twice() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release="1.1.14")
-    t.add(tags_url("example/app"), ok({"tags": ["development"]}))
+    t.add(tags_url("example/app"), tags_out(["development"]))
     targets_doc = run_resolve_targets(t, ["example/app"], osv_enabled=True)
     lines = rt.annotations(targets_doc["targets"])
     assert len(lines) == 1
@@ -1194,7 +1172,7 @@ def test_target_identity_is_scanner_and_id() -> None:
 
 
 def test_render_table_names_the_scanner() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     table = rt.render_table(run_resolve_targets(t, [], osv_enabled=True)["targets"])
     assert [line.split()[:2] for line in table.splitlines()] == [
@@ -1205,7 +1183,7 @@ def test_render_table_names_the_scanner() -> None:
 
 
 def test_run_adds_osv_twins_by_default(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     tag_routes(t, "1.1.14", "b" * 40)
     output_file = tmp_path / "github_output"
@@ -1229,7 +1207,7 @@ def test_run_adds_osv_twins_by_default(tmp_path: Path) -> None:
 
 
 def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t)
     tag_routes(t, "1.1.14", "b" * 40)
     argv = [
@@ -1257,7 +1235,7 @@ def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
         str(tmp_path),
     ]
     with pytest.raises(rt.ResolveError):
-        rt.run(rt.parse_args(argv), FakeTransport(), ENV, NOW)
+        rt.run(rt.parse_args(argv), FakeRunner(), ENV, NOW)
 
 
 # --- repository configuration (.github/sca.yml) ------------------------------
@@ -1265,7 +1243,7 @@ def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
 CONFIG_FILE = "schema_version: 1\nnon_shipped_paths:\n  - examples/\n"
 
 
-def config_file_route(transport: FakeTransport, text: str) -> None:
+def config_file_route(transport: FakeRunner, text: str) -> None:
     """``.github/sca.yml`` of the pinned commit, as the contents API serves it."""
     body = base64.encodebytes(text.encode()).decode()  # wrapped at 60 characters
     transport.add(
@@ -1274,11 +1252,8 @@ def config_file_route(transport: FakeTransport, text: str) -> None:
     )
 
 
-def resolve_config_of(
-    transport: FakeTransport, config_input: str = ""
-) -> dict[str, Any]:
+def resolve_config_of(transport: FakeRunner, config_input: str = "") -> dict[str, Any]:
     github_routes(transport, release=None)
-    http = no_sleep_http(transport)
     return rt.resolve_targets(
         repository=REPOSITORY,
         registry_name="ghcr.io",
@@ -1288,8 +1263,8 @@ def resolve_config_of(
         scan_images=False,
         scan_release_source=False,
         osv_enabled=False,
-        github=rt.GitHubClient(http, "tkn", API),
-        registry=rt.RegistryClient(http, "ghcr.io", "tkn"),
+        github=rt.GitHubClient(transport),
+        registry=rt.RegistryClient(transport, "ghcr.io", "tkn"),
         environ=ENV,
         now=NOW,
         caller_repository=CALLER,
@@ -1299,7 +1274,7 @@ def resolve_config_of(
 
 
 def test_no_config_file_means_the_defaults() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     assert resolve_config_of(t) == {
         "source": None,
         "overrides": None,
@@ -1307,12 +1282,11 @@ def test_no_config_file_means_the_defaults() -> None:
         "trivy_skip_paths": "as_non_shipped",
     }
     # the file is looked up at the commit the run is pinned to, via the API
-    (headers,) = [h for url, h in t.calls if url == CONFIG_URL]
-    assert headers["Authorization"] == "Bearer tkn"
+    assert t.urls.count(CONFIG_URL) == 1
 
 
 def test_config_file_is_read_at_the_pinned_commit() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     config_file_route(t, CONFIG_FILE)
     config = resolve_config_of(t)
     assert config["source"] == f".github/sca.yml@{SHA}"
@@ -1321,7 +1295,7 @@ def test_config_file_is_read_at_the_pinned_commit() -> None:
 
 
 def test_targets_doc_carries_the_config() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     config_file_route(t, CONFIG_FILE)
     doc = run_resolve_targets(t, [])
@@ -1330,7 +1304,7 @@ def test_targets_doc_carries_the_config() -> None:
 
 
 def test_config_input_replaces_the_file_and_names_it() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     config_file_route(t, CONFIG_FILE)
     config = resolve_config_of(t, "schema_version: 1\nnon_shipped_paths: [docs/]\n")
     assert config["source"] == "input"
@@ -1339,13 +1313,13 @@ def test_config_input_replaces_the_file_and_names_it() -> None:
 
 
 def test_config_input_without_a_file() -> None:
-    config = resolve_config_of(FakeTransport(), "schema_version: 1\n")
+    config = resolve_config_of(FakeRunner(), "schema_version: 1\n")
     assert config["source"] == "input"
     assert config["overrides"] is None
 
 
 def test_invalid_config_file_fails_with_a_clear_error() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     config_file_route(t, "schema_version: 1\nnon_shiped_paths: [a/]\n")
     with pytest.raises(rt.sca_config.ConfigError, match="unknown key 'non_shiped"):
         resolve_config_of(t)
@@ -1353,8 +1327,8 @@ def test_invalid_config_file_fails_with_a_clear_error() -> None:
 
 @pytest.mark.parametrize("status", [401, 403, 500])
 def test_contents_api_failure_fails_the_resolution(status: int) -> None:
-    t = FakeTransport()
-    t.add(CONFIG_URL, rt.Response(status))
+    t = FakeRunner()
+    t.add(CONFIG_URL, http_error(status))
     with pytest.raises(rt.ResolveError, match=f"HTTP {status}"):
         resolve_config_of(t)
 
@@ -1374,14 +1348,14 @@ def test_contents_api_failure_fails_the_resolution(status: int) -> None:
     ],
 )
 def test_unusable_contents_response_fails_the_resolution(body: Any) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     t.add(CONFIG_URL, ok(body))
     with pytest.raises(rt.ResolveError, match="sca.yml"):
         resolve_config_of(t)
 
 
 def test_config_file_with_a_byte_order_mark_is_read() -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     config_file_route(t, "\ufeff" + CONFIG_FILE)
     assert resolve_config_of(t)["non_shipped_paths"] == ["examples/"]
 
@@ -1389,7 +1363,7 @@ def test_config_file_with_a_byte_order_mark_is_read() -> None:
 def test_run_passes_the_config_input_and_outputs_the_skip_mode(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     output_file = tmp_path / "github_output"
     argv = [
@@ -1418,7 +1392,7 @@ def test_run_passes_the_config_input_and_outputs_the_skip_mode(
 
 
 def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     output_file = tmp_path / "github_output"
     argv = ["--repository", REPOSITORY, "--output-dir", str(tmp_path / "out")]
@@ -1430,11 +1404,10 @@ def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> Non
 def test_main_reports_an_invalid_configuration_and_writes_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    t = FakeTransport()
+    t = FakeRunner()
     github_routes(t, release=None)
     config_file_route(t, "schema_version: 7\n")
-    monkeypatch.setattr(rt, "UrllibTransport", lambda: t)
-    monkeypatch.setenv("GITHUB_API_URL", API)
+    monkeypatch.setattr(rt, "make_runner", lambda token: t)
     monkeypatch.setenv("GITHUB_REPOSITORY", CALLER)
     monkeypatch.setenv("GITHUB_REF_NAME", "development")
     code = rt.main(["--repository", REPOSITORY, "--output-dir", str(tmp_path)])

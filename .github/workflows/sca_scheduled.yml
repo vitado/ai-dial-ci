@@ -46,7 +46,7 @@ on:
       cve-index:
         type: string
         description: The CVE index (an OCI artifact built daily by the sca_cve_index.yml workflow of ai-dial-ci) that the early warning reads. It is pulled anonymously, so the package must be public. Its window (180 days) is the window of the early warning
-        default: "ghcr.io/epam/ai-dial-sca-cve-index:1"
+        default: "ghcr.io/vitado/ai-dial-sca-cve-index:1"
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
@@ -90,7 +90,7 @@ jobs:
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
-      - uses: epam/ai-dial-ci/actions/sca_resolve_targets@4.12.0
+      - uses: vitado/ai-dial-ci/actions/sca_resolve_targets@pilot/sca-scheduled
         id: targets
         with:
           repository: ${{ inputs.repository || github.repository }}
@@ -223,7 +223,7 @@ jobs:
       - name: Prepare Trivy configuration
         id: trivy-config
         if: ${{ matrix.target.kind == 'fs' }}
-        uses: epam/ai-dial-ci/actions/sca_prepare_trivy_config@4.12.0
+        uses: vitado/ai-dial-ci/actions/sca_prepare_trivy_config@pilot/sca-scheduled
         with:
           mode: ${{ needs.targets.outputs.trivy-skip-paths }}
           target-id: ${{ matrix.target.id }}
@@ -247,7 +247,7 @@ jobs:
       - name: Generate Gradle lockfiles
         id: lockfiles
         if: ${{ steps.stack.outputs.java == 'true' }}
-        uses: epam/ai-dial-ci/actions/generate_gradle_lockfiles@4.12.0
+        uses: vitado/ai-dial-ci/actions/generate_gradle_lockfiles@pilot/sca-scheduled
         with:
           gpr-username: ${{ github.actor }}
           gpr-password: ${{ secrets.GITHUB_TOKEN }}
@@ -355,7 +355,7 @@ jobs:
           pattern: sca-part-trivy-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-ci/actions/sca_query_osv@4.12.0
+      - uses: vitado/ai-dial-ci/actions/sca_query_osv@pilot/sca-scheduled
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
@@ -394,7 +394,7 @@ jobs:
           pattern: sca-part-trivy-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-ci/actions/sca_early_warning@4.12.0
+      - uses: vitado/ai-dial-ci/actions/sca_early_warning@pilot/sca-scheduled
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
@@ -425,7 +425,7 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-ci/actions/sca_merge_results@4.12.0
+      - uses: vitado/ai-dial-ci/actions/sca_merge_results@pilot/sca-scheduled
         id: merge
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json

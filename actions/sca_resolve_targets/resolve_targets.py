@@ -1019,8 +1019,6 @@ def run(
     if output_path:
         outputs = {
             "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
-            "commit-sha": targets_doc["commit_sha"],
-            "default-branch": targets_doc["default_branch"],
             "targets-file": str(targets_file),
             "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
         }

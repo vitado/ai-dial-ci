@@ -3238,9 +3238,10 @@ def shortest_path_text(group: Iterable[Record]) -> str:
     return text
 
 
-def fixed_versions_text(
-    versions: Iterable[str], installed: str | None = None, limit: int = 3
-) -> str:
+FIXED_VERSIONS_SHOWN = 3
+
+
+def fixed_versions_text(versions: Iterable[str], installed: str | None = None) -> str:
     """``1.2, 1.3, 2.0 +4 more``: the fixed versions above the installed one (all of
     them if it is unknown or they cannot be compared), lowest first.
     """
@@ -3253,10 +3254,9 @@ def fixed_versions_text(
     if installed:
         above = [v for v in candidates if compare_versions(v, installed) != -1]
         candidates = above or candidates
-    text = ", ".join(candidates[:limit])
-    return (
-        f"{text} +{len(candidates) - limit} more" if len(candidates) > limit else text
-    )
+    text = ", ".join(candidates[:FIXED_VERSIONS_SHOWN])
+    hidden = len(candidates) - FIXED_VERSIONS_SHOWN
+    return f"{text} +{hidden} more" if hidden > 0 else text
 
 
 def upgrade_cell(fixable: Sequence[Record]) -> str:
@@ -4406,10 +4406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         append_text(step_summary, summary)
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
-        append_text(
-            github_output,
-            f"failed-count={failed_count}\nreport-dir={args.output_dir}\n",
-        )
+        append_text(github_output, f"failed-count={failed_count}\n")
     return 0
 
 

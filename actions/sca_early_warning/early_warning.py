@@ -82,9 +82,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import secrets
 import subprocess
 import sys
 import tempfile
@@ -1850,16 +1848,9 @@ def analyse(
     return status, candidates_doc
 
 
-def format_output(name: str, value: str) -> str:
-    """One $GITHUB_OUTPUT entry in the delimiter format, safe for multiline values."""
-    delimiter = f"ghadelimiter_{secrets.token_hex(16)}"
-    return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
-
-
 def run(
     args: argparse.Namespace,
     transport: Transport,
-    environ: Mapping[str, str],
     now: datetime,
     sleep: Callable[[float], None] = time.sleep,
     downloader: Any = None,
@@ -1899,10 +1890,6 @@ def run(
         )
     else:
         print(f"early warning skipped: {status['reason']}")
-    output_path = environ.get("GITHUB_OUTPUT")
-    if output_path:
-        with open(output_path, "a", encoding="utf-8", newline="\n") as out:
-            out.write(format_output("status", status["status"]))
     return status["status"]
 
 
@@ -1940,7 +1927,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        run(args, UrllibTransport(), os.environ, datetime.now(UTC))
+        run(args, UrllibTransport(), datetime.now(UTC))
     except InputError as err:
         print(f"::error title=Invalid early warning input::{err}", file=sys.stderr)
         return 1

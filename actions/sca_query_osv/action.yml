@@ -15,11 +15,6 @@ inputs:
     description: Base URL of the OSV API
     default: https://api.osv.dev
 
-outputs:
-  failed-count:
-    description: Number of OSV targets whose query failed (the workflow decides whether to fail the run)
-    value: ${{ steps.query.outputs.failed-count }}
-
 runs:
   using: "composite"
   steps:
@@ -28,7 +23,6 @@ runs:
       with:
         python-version: "3.12"
     - name: Query OSV
-      id: query
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}

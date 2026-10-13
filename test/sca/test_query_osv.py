@@ -209,11 +209,9 @@ class Workspace:
             *extra,
         ]
 
-    def run(
-        self, fake: FakeOsv, *extra: str, env: Mapping[str, str] | None = None
-    ) -> int:
+    def run(self, fake: FakeOsv, *extra: str) -> int:
         args = qo.parse_args(self.argv(*extra))
-        return qo.run(args, fake, env or {}, NOW, fake.sleep)
+        return qo.run(args, fake, NOW, fake.sleep)
 
     def status(self, tid: str) -> dict[str, Any]:
         return json.loads((self.out / "osv" / f"{tid}.status.json").read_text("utf-8"))
@@ -269,7 +267,7 @@ def test_requests_carry_headers_and_the_purl_with_its_version(ws: Workspace) -> 
         return fake(method, url, headers, body)
 
     args = qo.parse_args(ws.argv())
-    qo.run(args, spy, {}, NOW, fake.sleep)
+    qo.run(args, spy, NOW, fake.sleep)
     assert fake.batches() == [[{"package": {"purl": "pkg:npm/a@3.1.4"}}]]
     assert all(h["Content-Type"] == "application/json" for h in seen)
     assert all("User-Agent" in h for h in seen)
@@ -488,7 +486,7 @@ def test_the_vulnerability_request_is_retried_too(ws: Workspace) -> None:
         return plain(method, url, headers, body)
 
     args = qo.parse_args(ws.argv())
-    assert qo.run(args, flaky, {}, NOW, fake.sleep) == 0
+    assert qo.run(args, flaky, NOW, fake.sleep) == 0
     assert calls["gets"] == 2
     assert ws.status("t")["status"] == "ok"
 
@@ -570,7 +568,7 @@ def test_a_failed_chunk_fails_only_the_targets_with_its_packages(
         return plain(method, url, headers, body)
 
     args = qo.parse_args(ws.argv())
-    assert qo.run(args, fail_second_chunk, {}, NOW, fake.sleep) == 2
+    assert qo.run(args, fail_second_chunk, NOW, fake.sleep) == 2
     # chunks: [a, b] ok, [c, d] failed
     assert ws.status("first")["status"] == "ok"
     assert ws.status("second")["status"] == "failed"
@@ -692,20 +690,6 @@ def test_without_osv_targets_nothing_is_written_or_asked(ws: Workspace) -> None:
 # --- outputs and inputs ------------------------------------------------------------
 
 
-def test_failed_count_is_a_github_output(ws: Workspace, tmp_path: Path) -> None:
-    ws.add("t1", trivy_native(npm("a")))
-    ws.add("t2", trivy_native(npm("b")), trivy_status="failed")
-    output_file = tmp_path / "github_output"
-    fake = FakeOsv()
-    fake.script = [qo.Response(404, {}, b"")]
-    assert ws.run(fake, env={"GITHUB_OUTPUT": str(output_file)}) == 1
-    text = output_file.read_text(encoding="utf-8")
-    name, _, rest = text.partition("<<")
-    delimiter, _, body = rest.partition("\n")
-    assert name == "failed-count"
-    assert body.split("\n")[:2] == ["1", delimiter]
-
-
 def test_a_custom_api_url_is_used_and_recorded(ws: Workspace) -> None:
     ws.add("t", trivy_native(npm("a")))
     urls: list[str] = []
@@ -715,7 +699,7 @@ def test_a_custom_api_url_is_used_and_recorded(ws: Workspace) -> None:
         return ok({"results": [{}]})
 
     args = qo.parse_args(ws.argv("--api-url", "https://osv.example.invalid/api/"))
-    assert qo.run(args, spy, {}, NOW) == 0
+    assert qo.run(args, spy, NOW) == 0
     assert urls == ["https://osv.example.invalid/api/v1/querybatch"]
     assert ws.native("t")["api_url"] == "https://osv.example.invalid/api"
 
@@ -724,7 +708,7 @@ def test_api_url_must_be_https(ws: Workspace) -> None:
     ws.add("t", trivy_native(npm("a")))
     args = qo.parse_args(ws.argv("--api-url", "http://api.osv.dev"))
     with pytest.raises(qo.InputError, match="https"):
-        qo.run(args, FakeOsv(), {}, NOW)
+        qo.run(args, FakeOsv(), NOW)
 
 
 def test_transport_refuses_plain_http() -> None:

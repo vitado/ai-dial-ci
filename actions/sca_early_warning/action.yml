@@ -15,11 +15,6 @@ inputs:
     description: The CVE index artifact (built by the sca_cve_index.yml workflow) to pull anonymously with ORAS, for example ghcr.io/epam/ai-dial-sca-cve-index:1. Its window of days is the window of the early warning
     required: true
 
-outputs:
-  status:
-    description: ok, failed or skipped. A failure is reported, but is not a failure of the scan
-    value: ${{ steps.match.outputs.status }}
-
 runs:
   using: "composite"
   steps:
@@ -32,7 +27,6 @@ runs:
       with:
         version: "1.3.3"
     - name: Match CVE records with packages
-      id: match
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}

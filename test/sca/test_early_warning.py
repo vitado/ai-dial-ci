@@ -1777,14 +1777,12 @@ def run_early_warning(
     ws: Workspace,
     network: FakeNetwork,
     net: FakeDownloader | None = None,
-    environ: Mapping[str, str] | None = None,
     runner: Any = None,
     **overrides: Any,
 ) -> str:
     return ew.run(
         ws.args(**overrides),
         network,
-        environ or {},
         NOW,
         network.sleep,
         net or todays_deltas(),
@@ -1995,15 +1993,6 @@ def test_run_reports_deps_dev_being_down_and_does_not_fail(
     assert network_requests
 
 
-def test_run_writes_the_github_output(ws: Workspace, tmp_path: Path) -> None:
-    ws.add_target("source-development", None, status="failed")
-    output = tmp_path / "github_output"
-    run_early_warning(ws, FakeNetwork(), environ={"GITHUB_OUTPUT": str(output)})
-    text = output.read_text(encoding="utf-8")
-    assert text.startswith("status<<ghadelimiter_")
-    assert "\nskipped\n" in text
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -2023,7 +2012,7 @@ def test_run_fails_on_a_broken_targets_file(ws: Workspace) -> None:
     args = ws.args()
     ws.targets_file.write_text("{}", encoding="utf-8")
     with pytest.raises(ew.InputError):
-        ew.run(args, FakeNetwork(), {}, NOW)
+        ew.run(args, FakeNetwork(), NOW)
 
 
 def test_main_exits_one_on_unusable_input(tmp_path: Path) -> None:

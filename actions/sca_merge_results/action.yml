@@ -25,9 +25,6 @@ outputs:
   failed-count:
     description: Number of targets whose scan failed (the workflow decides whether to fail the run)
     value: ${{ steps.merge.outputs.failed-count }}
-  report-dir:
-    description: Directory with the generated report
-    value: ${{ steps.merge.outputs.report-dir }}
 
 runs:
   using: "composite"

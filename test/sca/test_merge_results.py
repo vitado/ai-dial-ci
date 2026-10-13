@@ -255,23 +255,6 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
     assert records_by_cve(full)["CVE-2000-0001"]["pkg_type"] == "library"
 
 
-def test_removed_fields_are_absent(full: Workspace) -> None:
-    full.run()
-    vulns = full.json("_report/vulnerabilities.json")
-    assert "counts" not in vulns
-    assert "per_target" not in vulns
-    assert all("fixed_version" not in r for r in vulns["records"])
-    for entry in full.json("_report/scan_report.json")["targets"]:
-        for field in (
-            "findings_raw",
-            "findings_unique",
-            "vulnerable_package_versions",
-            "lockfiles",
-        ):
-            assert field not in entry
-    assert not (full.out / "summary.csv").exists()
-
-
 def test_record_sort_key_orders_exposure_severity_cvss_then_identity() -> None:
     def record(cve: str, exposure: str, severity: str, score: float | None) -> Record:
         return {
@@ -933,10 +916,7 @@ def test_main_writes_github_output_and_step_summary(
     monkeypatch.setenv("GITHUB_OUTPUT", str(gh_output))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(gh_summary))
     assert mr.main(cli_args(full, "--step-summary", "true")) == 0
-    assert gh_output.read_text(encoding="utf-8").splitlines() == [
-        "failed-count=1",
-        f"report-dir={full.out}",
-    ]
+    assert gh_output.read_text(encoding="utf-8").splitlines() == ["failed-count=1"]
     assert gh_summary.read_text(encoding="utf-8") == (
         full.out / "summary.md"
     ).read_text(encoding="utf-8")
@@ -1143,7 +1123,6 @@ def test_source_findings_of_a_run_without_images_are_development_only(
     )
     assert "> | development | 1 | 1 | 1 | 0 | 2 | 0 |" in md
     assert "Source only" not in md
-    assert "not in any image" not in md
 
 
 def rec(exposure: str, severity: str = "HIGH", **extra: Any) -> Record:
@@ -1752,7 +1731,6 @@ def test_python_package_names_are_one_package_across_ecosystems(
     totals = ws.json("_report/scan_report.json")["totals"]["findings"]
     assert totals["by_exposure"]["source_only"] == 0
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert "not in any image" not in md
     assert (
         "| 1 | Mako · python | 1.3.12 → 1.4.2 | 1 HIGH "
         "| Released 1.0.0 + development "
@@ -3257,7 +3235,7 @@ def test_targets_file_identity_is_scanner_and_id(tmp_path: Path) -> None:
         mr.load_targets_file(ws.targets_file)
 
 
-@pytest.mark.parametrize("scanner", [None, "", "snyk", "ort"])
+@pytest.mark.parametrize("scanner", [None, "", "grype", "dependabot"])
 def test_targets_file_needs_a_known_scanner(
     tmp_path: Path, scanner: str | None
 ) -> None:
@@ -3410,18 +3388,11 @@ def test_purl_identity_is_the_osv_package(
     assert mr.purl_identity(purl) == identity
 
 
-def _affected(ecosystem: str, name: str, *events: dict, kind: str = "ECOSYSTEM"):
-    return {
-        "package": {"ecosystem": ecosystem, "name": name},
-        "ranges": [{"type": kind, "events": [{"introduced": "0"}, *events]}],
-    }
-
-
 def test_osv_has_fix_needs_a_fixed_event_of_this_package() -> None:
     record = {
         "affected": [
-            _affected("PyPI", "requests", {"fixed": "2.31.0"}),
-            _affected("PyPI", "other", {"last_affected": "1.0"}),
+            affected_range("PyPI", "requests", {"fixed": "2.31.0"}),
+            affected_range("PyPI", "other", {"last_affected": "1.0"}),
         ]
     }
     assert mr.osv_has_fix(record, "pkg:pypi/Requests@2.0.0")
@@ -3430,9 +3401,11 @@ def test_osv_has_fix_needs_a_fixed_event_of_this_package() -> None:
 
 
 def test_osv_has_fix_ignores_git_ranges_and_unknown_purls() -> None:
-    record = {"affected": [_affected("npm", "a", {"fixed": "abc123"}, kind="GIT")]}
+    record = {"affected": [affected_range("npm", "a", {"fixed": "abc123"}, kind="GIT")]}
     assert not mr.osv_has_fix(record, "pkg:npm/a@1")
-    record = {"affected": [_affected("npm", "a", {"fixed": "1.2.3"}, kind="SEMVER")]}
+    record = {
+        "affected": [affected_range("npm", "a", {"fixed": "1.2.3"}, kind="SEMVER")]
+    }
     assert mr.osv_has_fix(record, "pkg:npm/a@1")
     assert not mr.osv_has_fix(record, "pkg:apk/alpine/a@1")
     assert not mr.osv_has_fix({}, "pkg:npm/a@1")
@@ -3449,7 +3422,9 @@ def test_osv_has_fix_matches_by_purl_or_by_ecosystem_with_a_suffix() -> None:
     }
     assert mr.osv_has_fix(by_purl, "pkg:maven/org.example/lib@1.0")
     suffixed = {
-        "affected": [_affected("Maven:https://repo", "org.example:lib", {"fixed": "2"})]
+        "affected": [
+            affected_range("Maven:https://repo", "org.example:lib", {"fixed": "2"})
+        ]
     }
     assert mr.osv_has_fix(suffixed, "pkg:maven/org.example/lib@1.0")
     broken = {"affected": [{"package": {"ecosystem": "npm"}}, {"ranges": []}]}

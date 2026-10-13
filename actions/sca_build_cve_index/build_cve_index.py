@@ -413,8 +413,6 @@ def reconcile(
     now: datetime,
     cutoff: datetime,
     feed: Feed,
-    log_url: str = DELTA_LOG_URL,
-    records_url: str = RECORDS_URL,
 ) -> int:
     """Fetch the records that ``deltaLog.json`` lists since ``since`` and that
     ``records`` does not have in that version (or at all); return how many.
@@ -428,8 +426,8 @@ def reconcile(
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
         log_path = work_dir / "deltaLog.json"
-        if downloader.fetch(log_url, log_path) is None:
-            raise DownloadError(f"{log_url}: not found")
+        if downloader.fetch(DELTA_LOG_URL, log_path) is None:
+            raise DownloadError(f"{DELTA_LOG_URL}: not found")
         try:
             log = json.loads(log_path.read_text(encoding="utf-8"))
         finally:
@@ -465,7 +463,7 @@ def reconcile(
             continue
         dest = work_dir / f"{cve}.json"
         try:
-            if downloader.fetch(record_url(records_url, cve), dest) is None:
+            if downloader.fetch(record_url(RECORDS_URL, cve), dest) is None:
                 raise DownloadError(f"{cve}: not found")
             try:
                 document = json.loads(dest.read_text(encoding="utf-8"))
@@ -850,12 +848,10 @@ def build(
     now: datetime,
     window_days: int = DEFAULT_WINDOW_DAYS,
     previous: Previous | None = None,
-    feed_url: str = FEED_URL,
-    osv_url: str = OSV_URL,
 ) -> Built:
     now = now.astimezone(UTC).replace(microsecond=0)
     cutoff = now - timedelta(days=window_days)
-    client = FeedClient(downloader, feed_url, work_dir / "feed")
+    client = FeedClient(downloader, FEED_URL, work_dir / "feed")
     feed = Feed()
     records: dict[str, dict[str, Any]] = {}
     baseline: str | None = None
@@ -903,7 +899,7 @@ def build(
     osv_info: dict[str, dict[str, Any]] = {}
     for export in OSV_EXPORTS:
         dest = osv_dir / f"{export}.zip"
-        headers = downloader.fetch(f"{osv_url.rstrip('/')}/{export}/all.zip", dest)
+        headers = downloader.fetch(f"{OSV_URL}/{export}/all.zip", dest)
         if headers is None:
             raise DownloadError(f"OSV export {export}: not found")
         exports[export] = dest

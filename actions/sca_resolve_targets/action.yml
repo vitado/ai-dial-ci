@@ -46,12 +46,6 @@ outputs:
   matrix:
     description: Compact JSON array of the pending Trivy targets (may be "[]")
     value: ${{ steps.targets.outputs.matrix }}
-  commit-sha:
-    description: Commit SHA of the default branch the scan is pinned to
-    value: ${{ steps.targets.outputs.commit-sha }}
-  default-branch:
-    description: Default branch of the scanned repository
-    value: ${{ steps.targets.outputs.default-branch }}
   targets-file:
     description: Path to targets.json with all targets and their statuses
     value: ${{ steps.targets.outputs.targets-file }}

@@ -768,8 +768,6 @@ def test_run_writes_resolve_json_and_outputs(
         "x-1.1.14",
     ]
     outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
-    assert outputs["commit-sha"] == "a" * 40
-    assert outputs["default-branch"] == "development"
     assert outputs["targets-file"] == str(tmp_path / "out" / "targets.json")
     assert " " not in outputs["matrix"]
     assert [m["id"] for m in json.loads(outputs["matrix"])] == [

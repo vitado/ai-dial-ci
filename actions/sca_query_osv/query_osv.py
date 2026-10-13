@@ -37,7 +37,7 @@ packages cannot be completed (retries exhausted, a rejected purl, an unreadable
 answer), the target is ``failed`` with a reason. A target whose Trivy target was
 not scanned successfully is ``not_applicable`` and is not queried. The script
 exits 0 once the outputs are written (the merge step reports and the workflow
-decides about failing the run); the number of failed targets is a GitHub output.
+decides about failing the run).
 
 The HTTP layer is injectable: every request goes through a ``Transport`` (a
 callable ``(method, url, headers, body) -> Response``), so the logic can be
@@ -48,8 +48,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import secrets
 import sys
 import time
 import urllib.error
@@ -480,16 +478,9 @@ def write_json(path: Path, data: Any) -> None:
     )
 
 
-def format_output(name: str, value: str) -> str:
-    """One $GITHUB_OUTPUT entry in the delimiter format, safe for multiline values."""
-    delimiter = f"ghadelimiter_{secrets.token_hex(16)}"
-    return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
-
-
 def run(
     args: argparse.Namespace,
     transport: Transport,
-    environ: Mapping[str, str],
     now: datetime,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
@@ -530,11 +521,6 @@ def run(
                 f"::notice title=OSV skipped packages::{plan.target_id}: "
                 f"{status['packages_skipped']} package(s) without a versioned purl"
             )
-
-    output_path = environ.get("GITHUB_OUTPUT")
-    if output_path:
-        with open(output_path, "a", encoding="utf-8", newline="\n") as out:
-            out.write(format_output("failed-count", str(failed)))
     return failed
 
 
@@ -566,7 +552,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        run(args, UrllibTransport(), os.environ, datetime.now(UTC))
+        run(args, UrllibTransport(), datetime.now(UTC))
     except InputError as err:
         print(f"::error title=Invalid OSV query input::{err}", file=sys.stderr)
         return 1

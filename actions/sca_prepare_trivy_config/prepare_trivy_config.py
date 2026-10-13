@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from _sca_lib.gha import append_text, escape_command_data
 
 SCHEMA_VERSION = 1
 MODE_APPLY = "apply"
@@ -42,16 +43,6 @@ MAX_CONFIG_BYTES = 1024 * 1024
 
 class ConfigError(Exception):
     """The Trivy configuration of the repository cannot be understood."""
-
-
-def escape_command_data(text: object) -> str:
-    """Escape a text for the message of a workflow command (``::warning::``).
-
-    The text may come from outside (scanner output, a repository, a feed), and
-    ``%``, CR and LF would end or forge the command. The same function is in every
-    module that prints commands (a shared package comes later).
-    """
-    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def load_config(path: Path) -> dict[str, Any] | None:
@@ -164,8 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     output_path = os.environ.get("GITHUB_OUTPUT")
     if output_path:
-        with open(output_path, "a", encoding="utf-8", newline="\n") as out:
-            out.write(f"config-file={replacement or ''}\n")
+        append_text(output_path, f"config-file={replacement or ''}\n")
     print(
         f"Trivy configuration of {args.target_id}: "
         + (f"{replacement} (without the skip paths)" if replacement else "unchanged")

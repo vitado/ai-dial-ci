@@ -1397,29 +1397,6 @@ def test_totals_line_is_the_coverage_of_the_run() -> None:
 
 
 @pytest.mark.parametrize(
-    ("a", "b", "expected"),
-    [
-        ("1.0.0", "1.0.0", 0),
-        ("1.0", "1.0.0", 0),
-        ("1.2.9", "1.10.0", -1),
-        ("15.5.27", "15.5.24", 1),
-        ("1.3.2-r1", "1.3.2-r0", 1),
-        ("1.3.2-r0", "1.3.2", 1),
-        ("1.0rc1", "1.0", -1),
-        ("2.0.0", "2.0.0-RC1", 1),
-        ("v1.2.3", "v1.2.4", -1),
-        ("1.0", "abc", None),
-        ("1.0", "v", None),
-        ("1.a", "1.2", None),
-    ],
-)
-def test_compare_versions(a: str, b: str, expected: int | None) -> None:
-    assert mr.compare_versions(a, b) == expected
-    if expected is not None:
-        assert mr.compare_versions(b, a) == -expected
-
-
-@pytest.mark.parametrize(
     ("installed", "fixed", "expected"),
     [
         ("15.5.24", ["15.5.27", "16.3.8"], "15.5.27"),
@@ -3249,27 +3226,6 @@ def test_osv_score_reads_max_severity(value: Any, score: float | None) -> None:
 
 
 @pytest.mark.parametrize(
-    ("purl", "expected"),
-    [
-        ("pkg:npm/lodash@4.17.0", ("npm", "", "lodash")),
-        ("pkg:npm/%40babel/traverse@7.20.0", ("npm", "@babel", "traverse")),
-        ("pkg:pypi/Requests@2.0.0", ("pypi", "", "Requests")),
-        (
-            "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1?type=jar",
-            ("maven", "org.apache.logging.log4j", "log4j-core"),
-        ),
-        ("pkg:golang/github.com/a/b@v1#sub/path", ("golang", "github.com/a", "b")),
-        ("pkg:NPM/x", ("npm", "", "x")),
-        ("lodash@1", None),
-        ("pkg:npm", None),
-        ("pkg:npm//x", None),
-    ],
-)
-def test_parse_purl(purl: str, expected: tuple[str, str, str] | None) -> None:
-    assert mr.parse_purl(purl) == expected
-
-
-@pytest.mark.parametrize(
     ("purl", "identity"),
     [
         ("pkg:npm/%40babel/traverse@7.20.0", ("npm", "@babel/traverse")),
@@ -5087,10 +5043,6 @@ def test_md_link_is_a_link_that_md_cell_keeps() -> None:
     assert mr.md_cell(link) == link
     joined = mr.md_join(", ", [link, "[plain](u)"])
     assert mr.md_cell(joined).endswith(", \\[plain\\]\\(u\\)")
-
-
-def test_command_data_is_escaped() -> None:
-    assert mr.escape_command_data("a%b\r\nc") == "a%25b%0D%0Ac"
 
 
 def test_a_target_reason_cannot_forge_a_command(

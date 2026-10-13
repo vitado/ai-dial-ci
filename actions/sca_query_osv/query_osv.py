@@ -36,7 +36,6 @@ written (the merge step reports and the workflow decides about failing the run).
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -46,6 +45,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from _sca_lib.gha import escape_command_data
+from _sca_lib.jsonio import InputError, dump_json, load_targets_list, read_json
+from _sca_lib.times import format_time
 
 SCANNER_TRIVY = "trivy"
 SCANNER_OSV = "osv"
@@ -67,10 +70,6 @@ UNREAD_LISTED = 5
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 
-class InputError(Exception):
-    """The inputs are unusable, so no meaningful result can be produced."""
-
-
 def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run a command; a program that cannot start is exit code 127 (as in a shell)."""
     try:
@@ -81,40 +80,9 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(command, EXIT_NOT_FOUND, "", str(err))
 
 
-def escape_command_data(text: str) -> str:
-    """Escape a text for the message of a workflow command (``::warning::``).
-
-    The text may come from outside (a package name of a scanned repository), and
-    ``%``, CR and LF would end or forge the command.
-    """
-    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
 def tail(text: str) -> str:
     text = " ".join(text.split())
     return text if len(text) <= REASON_LIMIT else "..." + text[-REASON_LIMIT:]
-
-
-def read_json(path: Path) -> Any:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path: Path, data: Any) -> None:
-    path.write_text(
-        json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-
-
-def load_targets_file(path: Path) -> list[dict[str, Any]]:
-    try:
-        data = read_json(path)
-    except (OSError, ValueError) as err:
-        raise InputError(f"cannot read targets file {path}: {err}") from err
-    targets = data.get("targets") if isinstance(data, dict) else None
-    if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets):
-        raise InputError(f"targets file {path} has no 'targets' list")
-    return targets
 
 
 def trivy_status(trivy_dir: Path, target_id: str) -> str:
@@ -221,7 +189,7 @@ def scan_target(
         bom, skipped = filter_bom(read_json(bom_path))
     except (OSError, ValueError, AttributeError) as err:
         return Outcome(STATUS_FAILED, f"trivy convert wrote no valid BOM: {err}")
-    write_json(bom_path, bom)
+    dump_json(bom_path, bom)
     queried = len(bom["components"])
     output.unlink(missing_ok=True)  # no stale result can pass for this run's
     if queried:
@@ -233,7 +201,7 @@ def scan_target(
             reason = f"osv-scanner failed (exit {code}): {tail(scanned.stderr)}"
             return Outcome(STATUS_FAILED, reason, queried, skipped)
     else:
-        write_json(output, {"results": []})
+        dump_json(output, {"results": []})
     try:
         result = read_json(output)
         packages = {
@@ -250,7 +218,7 @@ def scan_target(
 
 def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
     """Write all outputs; return the number of failed OSV targets."""
-    queried_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    queried_at = format_time(now)
     # "osv-scanner version: 2.6.0"
     first = (run([args.osv_scanner, "--version"]).stdout.strip().splitlines() or [""])[
         0
@@ -260,7 +228,7 @@ def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     failed = 0
     with tempfile.TemporaryDirectory() as work:
-        for target in load_targets_file(args.targets_file):
+        for target in load_targets_list(args.targets_file):
             if target.get("scanner") != SCANNER_OSV:
                 continue
             if target.get("status") != STATUS_PENDING:
@@ -280,7 +248,7 @@ def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
             if outcome.status != STATUS_OK:
                 output.unlink(missing_ok=True)
             applicable = outcome.status != STATUS_NOT_APPLICABLE
-            write_json(
+            dump_json(
                 out_dir / f"{tid}.status.json",
                 {
                     "id": tid,

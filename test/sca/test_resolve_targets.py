@@ -707,20 +707,6 @@ def test_runner_reports_a_missing_tool(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- output formatting and CLI ---------------------------------------------------
 
 
-def test_format_output_is_multiline_safe() -> None:
-    out = rt.format_output("matrix", "first\nsecond")
-    first, *middle, delimiter, trailing = out.split("\n")
-    name, _, marker = first.partition("<<")
-    assert name == "matrix"
-    assert marker == delimiter
-    assert middle == ["first", "second"]
-    assert trailing == ""
-
-
-def test_format_output_delimiter_is_unique() -> None:
-    assert rt.format_output("a", "x") != rt.format_output("a", "x")
-
-
 def parse_github_output(text: str) -> dict[str, str]:
     values: dict[str, str] = {}
     lines = iter(text.split("\n"))

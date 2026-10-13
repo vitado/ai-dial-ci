@@ -83,7 +83,6 @@ import posixpath
 import re
 import shutil
 import sys
-import urllib.parse
 from collections.abc import (
     Callable,
     Collection,
@@ -97,6 +96,12 @@ from datetime import UTC, datetime
 from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from _sca_lib.gha import append_text, escape_command_data
+from _sca_lib.jsonio import InputError, dump_json, read_json
+from _sca_lib.purl import parse_purl
+from _sca_lib.times import format_time
+from _sca_lib.versions import compare_tokens
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
@@ -232,29 +237,9 @@ FindingKey = tuple[str | None, str | None, str | None]
 Sightings = dict[FindingKey, dict[str, list[str]]]
 
 
-class InputError(Exception):
-    """The inputs are unusable, so no meaningful report can be produced."""
-
-
 # --------------------------------------------------------------------------
 # Reading inputs
 # --------------------------------------------------------------------------
-
-
-def escape_command_data(text: object) -> str:
-    """Escape a text for the message of a workflow command (``::warning::``).
-
-    The text may come from outside (scanner output, a repository, a feed), and
-    ``%``, CR and LF would end or forge the command. The same function is in every
-    module that prints commands (a shared package comes later).
-    """
-    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
-def read_json(path: Path) -> Any:
-    """Read a JSON file; raises OSError/ValueError with a readable cause."""
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
 
 
 def load_targets_file(path: Path) -> dict[str, Any]:
@@ -917,57 +902,7 @@ def select_cvss(vuln: Mapping[str, Any]) -> Record | None:
     return entries[source]
 
 
-# ---- Version comparison
-
-PRERELEASE_TOKENS = frozenset(
-    {"a", "alpha", "b", "beta", "c", "rc", "pre", "preview", "dev", "snapshot", "m"}
-)
-_VERSION_TOKEN_RE = re.compile(r"\d+|[A-Za-z]+")
-
-
-def version_tokens(version: str) -> list[int | str]:
-    """Split a version into numeric (int) and alphabetic (lowercase str) tokens."""
-    return [
-        int(token) if token.isdigit() else token.lower()
-        for token in _VERSION_TOKEN_RE.findall(version)
-    ]
-
-
-def _tail_order(tail: Sequence[int | str]) -> int:
-    """Order of a version that has ``tail`` more tokens than the one it is compared to.
-
-    Trailing zeros change nothing (1.0 == 1.0.0), a pre-release word makes the
-    longer version older (1.0rc1 < 1.0), anything else makes it newer (1.0.1, 1.0-r1).
-    """
-    if all(token == 0 for token in tail):
-        return 0
-    return -1 if tail[0] in PRERELEASE_TOKENS else 1
-
-
-def compare_versions(a: str, b: str) -> int | None:
-    """Tolerant version comparison: -1, 0 or 1; None if the versions are not comparable.
-
-    Works for semver-like, Alpine (``1.3.2-r1``) and similar schemes by comparing
-    numeric tokens as integers and alphabetic ones as text. Versions without any
-    number, or whose first difference is a number against a word, are not comparable.
-    """
-    tokens_a, tokens_b = version_tokens(a), version_tokens(b)
-    if not any(isinstance(t, int) for t in tokens_a) or not any(
-        isinstance(t, int) for t in tokens_b
-    ):
-        return None
-    for x, y in zip(tokens_a, tokens_b, strict=False):
-        if x == y:
-            continue
-        if isinstance(x, int) != isinstance(y, int):
-            return None
-        return -1 if x < y else 1  # type: ignore[operator]
-    common = min(len(tokens_a), len(tokens_b))
-    if len(tokens_a) > common:
-        return _tail_order(tokens_a[common:])
-    if len(tokens_b) > common:
-        return -_tail_order(tokens_b[common:])
-    return 0
+# ---- Fixed versions
 
 
 def minimal_fix(installed: str, fixed_versions: Iterable[str]) -> str | None:
@@ -977,7 +912,7 @@ def minimal_fix(installed: str, fixed_versions: Iterable[str]) -> str | None:
     """
     best: str | None = None
     for candidate in fixed_versions:
-        against_installed = compare_versions(candidate, installed)
+        against_installed = compare_tokens(candidate, installed)
         if against_installed is None:
             return None
         if against_installed <= 0:
@@ -985,7 +920,7 @@ def minimal_fix(installed: str, fixed_versions: Iterable[str]) -> str | None:
         if best is None:
             best = candidate
             continue
-        against_best = compare_versions(candidate, best)
+        against_best = compare_tokens(candidate, best)
         if against_best is None:
             return None
         if against_best < 0:
@@ -1009,7 +944,7 @@ def upgrade_target(
         if target is None:
             target = minimal
             continue
-        against_target = compare_versions(minimal, target)
+        against_target = compare_tokens(minimal, target)
         if against_target is None:
             return None
         if against_target > 0:
@@ -1040,7 +975,7 @@ def fixed_in_place(
             else None
         )
         if minimal is None or not any(
-            compare_versions(other, minimal) in (0, 1)
+            compare_tokens(other, minimal) in (0, 1)
             for other in index.other_versions_in_file(package)
         ):
             return False
@@ -1427,18 +1362,6 @@ def osv_result_problem(native: Mapping[str, Any]) -> str | None:
     return None
 
 
-def parse_purl(purl: str) -> tuple[str, str, str] | None:
-    """``(type, namespace, name)`` of a purl, percent-decoded; None if malformed."""
-    if not purl.startswith("pkg:"):
-        return None
-    body = purl[len("pkg:") :].split("#", 1)[0].split("?", 1)[0].split("@", 1)[0]
-    parts = body.split("/")
-    if len(parts) < 2 or not all(parts):
-        return None
-    namespace = "/".join(urllib.parse.unquote(part) for part in parts[1:-1])
-    return parts[0].lower(), namespace, urllib.parse.unquote(parts[-1])
-
-
 def osv_identity(ecosystem: str, name: str) -> tuple[str, str]:
     """``(ecosystem, name)`` in the form OSV package references are compared in."""
     if ecosystem in CASE_INSENSITIVE_ECOSYSTEMS:
@@ -1449,12 +1372,13 @@ def osv_identity(ecosystem: str, name: str) -> tuple[str, str]:
 def purl_identity(purl: str) -> tuple[str, str] | None:
     """The OSV package of a purl; None for a malformed purl or an unknown purl type."""
     parsed = parse_purl(purl)
-    known = PURL_ECOSYSTEMS.get(parsed[0]) if parsed else None
+    known = PURL_ECOSYSTEMS.get(parsed.type) if parsed else None
     if parsed is None or known is None:
         return None
     ecosystem, separator = known
-    _, namespace, name = parsed
-    return osv_identity(ecosystem, separator.join(p for p in (namespace, name) if p))
+    return osv_identity(
+        ecosystem, separator.join(p for p in (parsed.namespace, parsed.name) if p)
+    )
 
 
 def affected_identity(affected: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -1495,7 +1419,7 @@ def osv_fixed_versions(
                 version = event.get("fixed")
                 if not isinstance(version, str) or not version:
                     continue
-                if installed is None or compare_versions(version, installed) not in (
+                if installed is None or compare_tokens(version, installed) not in (
                     -1,
                     0,
                 ):
@@ -3272,12 +3196,12 @@ def fixed_versions_text(versions: Iterable[str], installed: str | None = None) -
     """
 
     def order(a: str, b: str) -> int:
-        return compare_versions(a, b) or 0
+        return compare_tokens(a, b) or 0
 
     # versions that cannot be compared keep their alphabetical order
     candidates = sorted(sorted(set(versions)), key=cmp_to_key(order))
     if installed:
-        above = [v for v in candidates if compare_versions(v, installed) != -1]
+        above = [v for v in candidates if compare_tokens(v, installed) != -1]
         candidates = above or candidates
     text = ", ".join(candidates[:FIXED_VERSIONS_SHOWN])
     hidden = len(candidates) - FIXED_VERSIONS_SHOWN
@@ -4029,10 +3953,6 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
-def dump_json(path: Path, data: Any) -> None:
-    write_text(path, json.dumps(data, indent=1, ensure_ascii=False) + "\n")
-
-
 def copy_native(scanner_parts_dir: Path, target_id: str, native_dir: Path) -> None:
     """Keep the unmodified per-target results of one scanner for audit."""
     for suffix in (".json", ".txt"):
@@ -4218,11 +4138,6 @@ def truncate_summary(text: str, run_url: str | None) -> str:
     return kept + close * max(open_blocks, 0) + note
 
 
-def append_text(path: str, text: str) -> None:
-    with open(path, "a", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-
-
 def parse_bool(value: str) -> bool:
     lowered = value.strip().lower()
     if lowered in ("true", "1", "yes"):
@@ -4282,7 +4197,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    generated_utc = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated_utc = format_time(datetime.now(UTC))
     try:
         failed_count = run_merge(
             args.targets_file,

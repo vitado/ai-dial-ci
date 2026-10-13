@@ -70,7 +70,7 @@ the status is ``failed`` with a reason and the script exits 0 (the report says
 
 The HTTP layer of deps.dev is injectable: every request goes through a ``Transport``
 (a callable ``(method, url, headers, body) -> Response``), the downloads of the
-deltas through the ``Downloader`` of the builder and the ORAS call through a
+deltas through the ``Downloader`` of ``_sca_lib.cve_index`` and the ORAS call through a
 ``subprocess.run``-like runner, so the logic can be tested with fakes and no
 network. Python standard library only (and the ``oras`` command).
 """
@@ -92,12 +92,34 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import cmp_to_key
 from pathlib import Path
 from typing import Any
 
-FEED_URL = "https://github.com/CVEProject/cvelistV5/releases/download"
+from _sca_lib.cve_index import (
+    FEED_URL,
+    SEVERITIES,
+    SEVERITY_ORDER,
+    STATE_PUBLISHED,
+    Feed,
+    FeedClient,
+    IndexBuildError,
+    UrllibDownloader,
+    apply_deltas,
+    gap_ranges,
+    gaps_of,
+    read_previous,
+    reconcile,
+    select_severity,
+)
+from _sca_lib.gha import escape_command_data
+from _sca_lib.http import HttpClient, Transport, TransportError, UrllibTransport
+from _sca_lib.jsonio import InputError, dump_json, load_targets_list, read_json
+from _sca_lib.purl import parse_purl as purl_parts
+from _sca_lib.times import format_time, parse_time
+from _sca_lib.versions import compare_versions
+
 ORAS_TIMEOUT_SECONDS = 300
 DEPSDEV_URL = "https://api.deps.dev"
 USER_AGENT = "ai-dial-ci-sca-early-warning"
@@ -111,15 +133,8 @@ CLASS_LANGUAGE_PACKAGES = "lang-pkgs"
 SCHEMA_VERSION = 1
 PART_DIR = "early-warning"
 
-REQUEST_TIMEOUT_SECONDS = 60.0
-MAX_ATTEMPTS = 4
-BACKOFF_BASE_SECONDS = 1.0
-MAX_RETRY_AFTER_SECONDS = 60.0
-RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
-# deps.dev answers are small; this only stops an answer that is not one
-MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 DEPSDEV_WORKERS = 4
 # deps.dev is considered unavailable after this many failed requests in a row
 DEPSDEV_BREAKER = 10
@@ -127,8 +142,6 @@ DEPSDEV_BREAKER = 10
 DEPSDEV_VERSION_TRIES = 3
 
 ECOSYSTEMS = ("npm", "pypi", "maven", "cargo")
-MAX_DESCRIPTION_CHARS = 3000
-MAX_REFERENCES = 100
 MAX_LOCATIONS = 50
 
 MATCH_PACKAGE_NAME = "package_name"
@@ -142,25 +155,7 @@ MATCH_PRIORITY = {
     MATCH_REPO_MODULE: 3,
 }
 
-SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
-UNKNOWN_SEVERITY = "UNKNOWN"
-SEVERITY_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
-# CVSS metric keys of a CVE record, the version they carry, in the order of
-# preference when a source has several (3.1 over 3.0, v3 over v4 for ranking)
-CVSS_METRICS = (("cvssV3_1", "3.1"), ("cvssV3_0", "3.0"), ("cvssV4_0", "4.0"))
-SOURCE_CNA = "cna"
-SOURCE_ADP_PREFIX = "adp:"
-
 _GHSA_RE = re.compile(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}", re.IGNORECASE)
-_PURL_RE = re.compile(r"^pkg:([^/]+)/(.+?)@([^?#@]+)(?:[?#].*)?$")
-
-
-class InputError(Exception):
-    """The inputs are unusable, so no meaningful result can be produced."""
-
-
-class TransportError(Exception):
-    """A network-level failure (DNS, connection, timeout)."""
 
 
 class IndexUnavailable(Exception):
@@ -173,354 +168,6 @@ class DepsDevError(Exception):
 
 class DepsDevUnavailable(Exception):
     """deps.dev fails persistently: the repositories of the packages are unknown."""
-
-
-# --------------------------------------------------------------------------
-# HTTP
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Response:
-    status: int
-    headers: Mapping[str, str] = field(default_factory=dict)
-    body: bytes = b""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "headers", {k.lower(): v for k, v in self.headers.items()}
-        )
-
-    def header(self, name: str) -> str | None:
-        return self.headers.get(name.lower())
-
-
-Transport = Callable[[str, str, Mapping[str, str], bytes | None], Response]
-
-
-class UrllibTransport:
-    """Production transport: an HTTPS request through urllib with a timeout."""
-
-    def __init__(self, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
-        self._timeout = timeout
-
-    def __call__(
-        self, method: str, url: str, headers: Mapping[str, str], body: bytes | None
-    ) -> Response:
-        if urllib.parse.urlsplit(url).scheme != "https":
-            raise TransportError(f"refusing non-HTTPS URL: {url}")
-        request = urllib.request.Request(
-            url, data=body, headers=dict(headers), method=method
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                data = resp.read(MAX_DOWNLOAD_BYTES + 1)
-                if len(data) > MAX_DOWNLOAD_BYTES:
-                    raise TransportError(f"{url}: answer is larger than the limit")
-                return Response(resp.status, dict(resp.headers), data)
-        except urllib.error.HTTPError as err:
-            return Response(err.code, dict(err.headers), err.read(4096))
-        except (urllib.error.URLError, TimeoutError, OSError) as err:
-            raise TransportError(f"{url}: {err}") from err
-
-
-class HttpClient:
-    """Adds bounded retries with backoff (429/5xx, network errors) to a Transport."""
-
-    def __init__(
-        self,
-        transport: Transport,
-        sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = MAX_ATTEMPTS,
-    ) -> None:
-        self._transport = transport
-        self._sleep = sleep
-        self._max_attempts = max_attempts
-
-    def request(
-        self, method: str, url: str, headers: Mapping[str, str], body: bytes | None
-    ) -> Response:
-        for attempt in range(1, self._max_attempts + 1):
-            delay = BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
-            try:
-                response = self._transport(method, url, headers, body)
-            except TransportError:
-                if attempt == self._max_attempts:
-                    raise
-            else:
-                if (
-                    response.status not in RETRY_STATUSES
-                    or attempt == self._max_attempts
-                ):
-                    return response
-                delay = _retry_after(response) or delay
-            self._sleep(delay)
-        raise AssertionError("unreachable")  # pragma: no cover
-
-
-def escape_command_data(text: object) -> str:
-    """Escape a text for the message of a workflow command (``::warning::``).
-
-    The text may come from outside (scanner output, a repository, a feed), and
-    ``%``, CR and LF would end or forge the command. The same function is in every
-    module that prints commands (a shared package comes later).
-    """
-    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
-def _retry_after(response: Response) -> float | None:
-    value = response.header("Retry-After")
-    if value is None or not value.strip().isdigit():
-        return None
-    return min(float(value), MAX_RETRY_AFTER_SECONDS)
-
-
-# --------------------------------------------------------------------------
-# Versions: one comparator per ecosystem, None when a version cannot be compared
-# --------------------------------------------------------------------------
-
-_SEMVER_RE = re.compile(
-    r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?"
-    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$"
-)
-
-
-def _semver_key(version: str) -> tuple[tuple[int, int, int], list[str] | None] | None:
-    match = _SEMVER_RE.match(version.strip().lstrip("="))
-    if not match:
-        return None
-    numbers = tuple(int(part) if part else 0 for part in match.groups()[:3])
-    pre = match.group(4)
-    return numbers, (pre.split(".") if pre else None)  # type: ignore[return-value]
-
-
-def _cmp_prerelease(a: list[str] | None, b: list[str] | None) -> int:
-    """SemVer 2.0 precedence of pre-release parts (no pre-release is the highest)."""
-    if a is None or b is None:
-        return (a is None) - (b is None)
-    for x, y in zip(a, b, strict=False):
-        if x == y:
-            continue
-        if x.isdigit() and y.isdigit():
-            return -1 if int(x) < int(y) else 1
-        if x.isdigit() != y.isdigit():
-            return -1 if x.isdigit() else 1
-        return -1 if x < y else 1
-    return (len(a) > len(b)) - (len(a) < len(b))
-
-
-def compare_semver(a: str, b: str) -> int | None:
-    ka, kb = _semver_key(a), _semver_key(b)
-    if ka is None or kb is None:
-        return None
-    if ka[0] != kb[0]:
-        return -1 if ka[0] < kb[0] else 1
-    return _cmp_prerelease(ka[1], kb[1])
-
-
-# PEP 440, Appendix B
-_PEP440_RE = re.compile(
-    r"""^\s*v?
-    (?:(?P<epoch>[0-9]+)!)?
-    (?P<release>[0-9]+(?:\.[0-9]+)*)
-    (?P<pre>[-_.]?(?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)[-_.]?(?P<pre_n>[0-9]+)?)?
-    (?P<post>(?:-(?P<post_n1>[0-9]+))|(?:[-_.]?(?P<post_l>post|rev|r)[-_.]?(?P<post_n2>[0-9]+)?))?
-    (?P<dev>[-_.]?(?P<dev_l>dev)[-_.]?(?P<dev_n>[0-9]+)?)?
-    (?:\+(?P<local>[a-z0-9]+(?:[-_.][a-z0-9]+)*))?
-    \s*$""",
-    re.IGNORECASE | re.VERBOSE,
-)
-_PEP440_PRE = {
-    "alpha": 0,
-    "a": 0,
-    "beta": 1,
-    "b": 1,
-    "c": 2,
-    "rc": 2,
-    "pre": 2,
-    "preview": 2,
-}
-_NEG_INF = (-1,)
-_POS_INF = (1 << 62,)
-
-
-def _pep440_key(version: str) -> tuple[Any, ...] | None:
-    """Ordering key as of ``packaging``; the local version label is ignored (the
-    affected ranges of a CVE are about public versions).
-    """
-    match = _PEP440_RE.match(version)
-    if not match:
-        return None
-    release = [int(part) for part in match.group("release").split(".")]
-    while len(release) > 1 and release[-1] == 0:
-        release.pop()
-    pre = post = dev = None
-    if match.group("pre_l"):
-        pre = (
-            _PEP440_PRE[match.group("pre_l").lower()],
-            int(match.group("pre_n") or 0),
-        )
-    if match.group("post"):
-        post = int(match.group("post_n1") or match.group("post_n2") or 0)
-    if match.group("dev_l"):
-        dev = int(match.group("dev_n") or 0)
-    if pre is None and post is None and dev is not None:
-        pre_key: tuple[Any, ...] = _NEG_INF
-    elif pre is None:
-        pre_key = _POS_INF
-    else:
-        pre_key = pre
-    return (
-        int(match.group("epoch") or 0),
-        tuple(release),
-        pre_key,
-        _NEG_INF if post is None else (post,),
-        _POS_INF if dev is None else (dev,),
-    )
-
-
-def compare_pep440(a: str, b: str) -> int | None:
-    ka, kb = _pep440_key(a), _pep440_key(b)
-    if ka is None or kb is None:
-        return None
-    return (ka > kb) - (ka < kb)
-
-
-# Maven ComparableVersion (Maven 3.x): items are int, str (a qualifier) or list.
-_MAVEN_QUALIFIERS = ("alpha", "beta", "milestone", "rc", "snapshot", "", "sp")
-_MAVEN_ALIASES = {"ga": "", "final": "", "release": "", "cr": "rc"}
-_MAVEN_SHORT = {"a": "alpha", "b": "beta", "m": "milestone"}
-_MAVEN_RELEASE_KEY = str(_MAVEN_QUALIFIERS.index(""))
-_MavenItem = int | str | list
-
-
-def _maven_qualifier_key(qualifier: str) -> str:
-    if qualifier in _MAVEN_QUALIFIERS:
-        return str(_MAVEN_QUALIFIERS.index(qualifier))
-    return f"{len(_MAVEN_QUALIFIERS)}-{qualifier}"
-
-
-def _maven_string_item(text: str, followed_by_digit: bool) -> str:
-    if followed_by_digit and len(text) == 1:
-        text = _MAVEN_SHORT.get(text, text)
-    return _MAVEN_ALIASES.get(text, text)
-
-
-def _maven_is_null(item: _MavenItem) -> bool:
-    if isinstance(item, int):
-        return item == 0
-    if isinstance(item, str):
-        return _maven_qualifier_key(item) == _MAVEN_RELEASE_KEY
-    return not item
-
-
-def _maven_normalize(items: list[_MavenItem]) -> None:
-    for index in range(len(items) - 1, -1, -1):
-        item = items[index]
-        if _maven_is_null(item):
-            del items[index]
-        elif not isinstance(item, list):
-            break
-
-
-def _maven_parse(version: str) -> list[_MavenItem]:
-    version = version.strip().lower()
-    root: list[_MavenItem] = []
-    current = root
-    stack = [root]
-    is_digit = False
-    start = 0
-
-    def item(digit: bool, text: str) -> _MavenItem:
-        return int(text) if digit else _maven_string_item(text, False)
-
-    def descend() -> list[_MavenItem]:
-        child: list[_MavenItem] = []
-        current.append(child)
-        stack.append(child)
-        return child
-
-    for index, char in enumerate(version):
-        if char == ".":
-            current.append(
-                0 if index == start else item(is_digit, version[start:index])
-            )
-            start = index + 1
-        elif char == "-":
-            current.append(
-                0 if index == start else item(is_digit, version[start:index])
-            )
-            start = index + 1
-            current = descend()
-        elif char.isdigit():
-            if not is_digit and index > start:
-                current.append(_maven_string_item(version[start:index], True))
-                start = index
-                current = descend()
-            is_digit = True
-        else:
-            if is_digit and index > start:
-                current.append(int(version[start:index]))
-                start = index
-                current = descend()
-            is_digit = False
-    if len(version) > start:
-        current.append(item(is_digit, version[start:]))
-    while stack:
-        _maven_normalize(stack.pop())
-    return root
-
-
-def _maven_cmp_item(a: _MavenItem | None, b: _MavenItem | None) -> int:
-    """``ComparableVersion.*Item.compareTo``; None is the missing item."""
-    if a is None:
-        return 0 if b is None else -_maven_cmp_item(b, None)
-    if isinstance(a, int):
-        if b is None:
-            return 0 if a == 0 else 1
-        if isinstance(b, int):
-            return (a > b) - (a < b)
-        return 1
-    if isinstance(a, str):
-        if b is None:
-            ka, kb = _maven_qualifier_key(a), _MAVEN_RELEASE_KEY
-        elif isinstance(b, str):
-            ka, kb = _maven_qualifier_key(a), _maven_qualifier_key(b)
-        else:
-            return -1
-        return (ka > kb) - (ka < kb)
-    if b is None:
-        return 0 if not a else _maven_cmp_item(a[0], None)
-    if isinstance(b, int):
-        return -1
-    if isinstance(b, str):
-        return 1
-    for index in range(max(len(a), len(b))):
-        left = a[index] if index < len(a) else None
-        right = b[index] if index < len(b) else None
-        result = _maven_cmp_item(left, right)
-        if result:
-            return result
-    return 0
-
-
-def compare_maven(a: str, b: str) -> int | None:
-    if not (re.search(r"\d", a) and re.search(r"\d", b)):
-        return None
-    return _maven_cmp_item(_maven_parse(a), _maven_parse(b))
-
-
-def compare_versions(ecosystem: str, a: str, b: str) -> int | None:
-    """-1, 0 or 1 by the version scheme of the ecosystem; None if either version is
-    not valid in it.
-    """
-    if ecosystem in ("npm", "cargo"):
-        return compare_semver(a, b)
-    if ecosystem == "pypi":
-        return compare_pep440(a, b)
-    if ecosystem == "maven":
-        return compare_maven(a, b)
-    return None
 
 
 # --------------------------------------------------------------------------
@@ -849,30 +496,13 @@ class Inventory:
 
 def parse_purl(purl: str) -> Package | None:
     """The package of a supported ecosystem a purl names, else None."""
-    match = _PURL_RE.match(purl)
-    if not match or match.group(1) not in ECOSYSTEMS:
+    parts = purl_parts(purl)
+    if parts is None or parts.type not in ECOSYSTEMS or not parts.version:
         return None
-    ecosystem = match.group(1)
-    name = urllib.parse.unquote(match.group(2))
-    if ecosystem == "maven":
+    name = "/".join(p for p in (parts.namespace, parts.name) if p)
+    if parts.type == "maven":
         name = name.replace("/", ":")
-    return Package(ecosystem, name, urllib.parse.unquote(match.group(3)))
-
-
-def read_json(path: Path) -> Any:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_targets_file(path: Path) -> list[dict[str, Any]]:
-    try:
-        data = read_json(path)
-    except (OSError, ValueError) as err:
-        raise InputError(f"cannot read targets file {path}: {err}") from err
-    targets = data.get("targets") if isinstance(data, dict) else None
-    if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets):
-        raise InputError(f"targets file {path} has no 'targets' list")
-    return targets
+    return Package(parts.type, name, parts.version)
 
 
 def trivy_native(trivy_dir: Path, target_id: str) -> dict[str, Any] | None:
@@ -1042,223 +672,11 @@ def resolve_repos(
 # --------------------------------------------------------------------------
 
 
-def parse_time(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
-def severity_of_score(score: float) -> str:
-    """The CVSS rating of a base score (the same bands in v3 and v4)."""
-    if score >= 9.0:
-        return "CRITICAL"
-    if score >= 7.0:
-        return "HIGH"
-    if score >= 4.0:
-        return "MEDIUM"
-    if score > 0:
-        return "LOW"
-    return UNKNOWN_SEVERITY
-
-
-def _cvss_of(source: str, metric: Mapping[str, Any]) -> list[dict[str, Any]]:
-    found = []
-    for key, version in CVSS_METRICS:
-        data = metric.get(key)
-        if not isinstance(data, dict):
-            continue
-        score = data.get("baseScore")
-        if isinstance(score, bool) or not isinstance(score, int | float):
-            continue
-        rating = str(data.get("baseSeverity") or "").upper()
-        found.append(
-            {
-                "score": float(score),
-                "vector": data.get("vectorString") or None,
-                "version": version,
-                "source": source,
-                "severity": rating
-                if rating in SEVERITY_ORDER and rating != UNKNOWN_SEVERITY
-                else severity_of_score(float(score)),
-            }
-        )
-    return found
-
-
-def _exploitation_of(source: str, metric: Mapping[str, Any]) -> dict[str, Any] | None:
-    other = metric.get("other")
-    if not isinstance(other, dict):
-        return None
-    kind = str(other.get("type") or "").lower()
-    content = other.get("content")
-    if not isinstance(content, dict):
-        return None
-    if kind == "kev":
-        return {
-            "kev": True,
-            "kev_date_added": content.get("dateAdded"),
-            "source": source,
-        }
-    if kind == "ssvc":
-        for option in content.get("options") or []:
-            if isinstance(option, dict) and "Exploitation" in option:
-                return {"ssvc": str(option["Exploitation"]).lower(), "source": source}
-    return None
-
-
-def extract_metrics(containers: Mapping[str, Any]) -> dict[str, Any]:
-    """The CVSS scores and the exploitation signals of a record.
-
-    ``cvss`` is the list of CVSS 3.x / 4.0 scores of the first source that has any
-    (the CNA, else an ADP container, by short name); ``exploitation`` is
-    ``{"kev": bool, "kev_date_added", "ssvc": "active|poc|none"|None, "source"}``
-    or None. CVSS 2 and free-text ratings are not used.
-    """
-    sources: list[tuple[str, Mapping[str, Any]]] = [
-        (SOURCE_CNA, containers.get("cna") or {})
-    ]
-    adp = [c for c in containers.get("adp") or [] if isinstance(c, dict)]
-    adp.sort(key=lambda c: str((c.get("providerMetadata") or {}).get("shortName")))
-    for container in adp:
-        name = (container.get("providerMetadata") or {}).get("shortName") or "?"
-        sources.append((f"{SOURCE_ADP_PREFIX}{name}", container))
-    cvss: list[dict[str, Any]] = []
-    kev: dict[str, Any] | None = None
-    ssvc: dict[str, Any] | None = None
-    for source, container in sources:
-        found: list[dict[str, Any]] = []
-        for metric in container.get("metrics") or []:
-            if not isinstance(metric, dict):
-                continue
-            found += _cvss_of(source, metric)
-            signal = _exploitation_of(source, metric)
-            if signal and "kev" in signal:
-                kev = kev or signal
-            elif signal:
-                ssvc = ssvc or signal
-        cvss = cvss or found
-    exploitation = None
-    if kev or ssvc:
-        exploitation = {
-            "kev": bool(kev),
-            "kev_date_added": (kev or {}).get("kev_date_added"),
-            "ssvc": (ssvc or {}).get("ssvc"),
-            "source": (kev or ssvc or {}).get("source"),
-        }
-    return {"cvss": cvss, "exploitation": exploitation}
-
-
-def select_severity(metrics: Mapping[str, Any]) -> dict[str, Any]:
-    """``severity``, ``severity_source``, ``cvss`` (the score used for ranking:
-    3.1 over 3.0 over 4.0 of the chosen source) and ``cvss_v4`` (the 4.0 score, if
-    it is not the ranking one) of a record's metrics.
-    """
-    scores = list(metrics.get("cvss") or [])
-    if not scores:
-        return {
-            "severity": UNKNOWN_SEVERITY,
-            "severity_source": None,
-            "cvss": None,
-            "cvss_v4": None,
-        }
-    order = {version: index for index, (_, version) in enumerate(CVSS_METRICS)}
-    scores.sort(key=lambda s: order[s["version"]])
-    main = scores[0]
-    v4 = next((s for s in scores if s["version"] == "4.0" and s is not main), None)
-
-    def public(score: Mapping[str, Any] | None) -> dict[str, Any] | None:
-        if score is None:
-            return None
-        return {k: score[k] for k in ("score", "vector", "version", "source")}
-
-    return {
-        "severity": main["severity"],
-        "severity_source": main["source"],
-        "cvss": public(main),
-        "cvss_v4": public(v4),
-    }
-
-
-def slim_record(document: Mapping[str, Any]) -> dict[str, Any] | None:
-    """What the matcher needs of a CVE record 5 (None: not a usable record)."""
-    meta = document.get("cveMetadata")
-    containers = document.get("containers")
-    if not isinstance(meta, dict) or not isinstance(containers, dict):
-        return None
-    cna = containers.get("cna") or {}
-    descriptions = cna.get("descriptions") or [{}]
-    english = [d for d in descriptions if str(d.get("lang", "en")).startswith("en")]
-    text = str((english or descriptions)[0].get("value") or "")
-    entries = []
-    for entry in cna.get("affected") or []:
-        if isinstance(entry, dict):
-            entries.append(
-                {
-                    k: entry[k]
-                    for k in (
-                        "vendor",
-                        "product",
-                        "packageName",
-                        "collectionURL",
-                        "repo",
-                        "versions",
-                        "defaultStatus",
-                    )
-                    if entry.get(k) is not None
-                }
-            )
-    refs = [
-        str(r["url"])
-        for r in (cna.get("references") or [])[:MAX_REFERENCES]
-        if isinstance(r, dict) and r.get("url")
-    ]
-    return {
-        "cve": meta.get("cveId"),
-        "state": meta.get("state"),
-        "published": meta.get("datePublished"),
-        "updated": meta.get("dateUpdated") or meta.get("datePublished"),
-        "assigner": meta.get("assignerShortName"),
-        "title": cna.get("title"),
-        "description": text[:MAX_DESCRIPTION_CHARS],
-        "affected": entries,
-        "references": refs,
-        "metrics": extract_metrics(containers),
-    }
-
-
-def end_of_day_asset(day: date) -> str:
-    return f"cve_{day}_at_end_of_day/{day}_delta_CVEs_at_end_of_day.zip"
-
-
-def hourly_asset(day: date, hour: int) -> str:
-    return f"cve_{day}_{hour:02d}00Z/{day}_delta_CVEs_at_{hour:02d}00Z.zip"
-
-
 # --------------------------------------------------------------------------
 # The CVE index
 # --------------------------------------------------------------------------
 
-STATE_PUBLISHED = "PUBLISHED"
-_BUILDER_DIR = Path(__file__).resolve().parents[1] / "sca_build_cve_index"
-
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
-
-
-def builder() -> Any:
-    """The module of the index builder, a sibling action: its code reads the index and
-    applies the deltas to it. Imported when needed, not at the top: the builder
-    imports this module for its helpers (names, versions, the form of a record), and a
-    cycle of imports at load time would depend on which of the two runs as a script.
-    """
-    if str(_BUILDER_DIR) not in sys.path:
-        sys.path.insert(0, str(_BUILDER_DIR))
-    import build_cve_index
-
-    return build_cve_index
 
 
 # An index older than this is reported: the builder has not run for a while
@@ -1319,12 +737,11 @@ def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
     """The index in a directory. An index that cannot be read, or that has another
     schema, is IndexUnavailable: the early warning is not made from a guess.
     """
-    bci = builder()
     try:
-        previous = bci.read_previous(directory)
+        previous = read_previous(directory)
         gaps = list(previous.metadata.get("gaps") or [])
-        bci.gaps_of(gaps)  # the shape of the gaps is checked here and not later
-    except (bci.IndexBuildError, OSError, ValueError) as err:
+        gaps_of(gaps)  # the shape of the gaps is checked here and not later
+    except (IndexBuildError, OSError, ValueError) as err:
         raise IndexUnavailable(f"the index {ref} cannot be read: {err}") from err
     return IndexData(previous.records, previous.metadata, ref, digest, gaps)
 
@@ -1343,7 +760,6 @@ def catch_up(
     window: those of the index before the day it was built, and those of the deltas
     applied now. A delta that cannot be downloaded or read is IndexUnavailable.
     """
-    bci = builder()
     now = now.astimezone(UTC).replace(microsecond=0)
     built = parse_time(index.metadata.get("built_at"))
     window_days = index.metadata.get("window_days")
@@ -1356,19 +772,19 @@ def catch_up(
             f"{window_days} days: no delta connects it to today"
         )
     since = datetime(built.year, built.month, built.day, tzinfo=UTC)
-    feed = bci.Feed()
+    feed = Feed()
     try:
-        client = bci.FeedClient(downloader, feed_url, work_dir / "feed")
-        bci.apply_deltas(index.records, client, since.date(), now, cutoff, feed)
-        bci.reconcile(
+        client = FeedClient(downloader, feed_url, work_dir / "feed")
+        apply_deltas(index.records, client, since.date(), now, cutoff, feed)
+        reconcile(
             index.records, downloader, work_dir / "reconcile", since, now, cutoff, feed
         )
-        gaps = feed.gaps | {h for h in bci.gaps_of(index.gaps) if h < since}
+        gaps = feed.gaps | {h for h in gaps_of(index.gaps) if h < since}
         index.skipped = len(feed.skipped)
-    except bci.IndexBuildError as err:
+    except IndexBuildError as err:
         raise IndexUnavailable(str(err)) from err
     first_hour = cutoff.replace(minute=0, second=0)
-    index.gaps = bci.gap_ranges({h for h in gaps if h >= first_hour})
+    index.gaps = gap_ranges({h for h in gaps if h >= first_hour})
     index.records = {
         cve: record
         for cve, record in index.records.items()
@@ -1706,16 +1122,6 @@ def candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
 # --------------------------------------------------------------------------
 
 
-def write_json(path: Path, data: Any) -> None:
-    path.write_text(
-        json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-
-
-def utc_text(moment: datetime) -> str:
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def status_document(
     status: str,
     reason: str | None,
@@ -1757,10 +1163,10 @@ def analyse(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """``(status document, candidates document)``; the latter only if ``ok``.
 
-    ``downloader`` fetches the deltas (the builder's ``Downloader``), ``run`` calls
+    ``downloader`` fetches the deltas (a ``cve_index.Downloader``), ``run`` calls
     ORAS; both default to the real ones.
     """
-    targets = load_targets_file(args.targets_file)
+    targets = load_targets_list(args.targets_file)
     inventory = load_inventory(targets, args.parts_dir / SCANNER_TRIVY)
     if not inventory.targets_read:
         return status_document(STATUS_SKIPPED, "no Trivy target was scanned"), None
@@ -1775,7 +1181,7 @@ def analyse(
             index = load_index(args, Path(work), run)
             catch_up(
                 index,
-                downloader or builder().UrllibDownloader(),
+                downloader or UrllibDownloader(),
                 args.feed_url,
                 Path(work),
                 now,
@@ -1802,11 +1208,11 @@ def analyse(
     )
     candidates_doc = {
         "schema_version": SCHEMA_VERSION,
-        "generated_utc": utc_text(now),
+        "generated_utc": format_time(now),
         "generated_from": {
             "days": window_days,
-            "from": utc_text(now - timedelta(days=window_days)),
-            "to": utc_text(now),
+            "from": format_time(now - timedelta(days=window_days)),
+            "to": format_time(now),
         },
         "candidates": matched.candidates,
     }
@@ -1840,9 +1246,9 @@ def run(
     status, candidates = analyse(args, transport, now, sleep, downloader, runner)
     out_dir = args.output_dir / PART_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_json(out_dir / "status.json", status)
+    dump_json(out_dir / "status.json", status)
     if candidates is not None:
-        write_json(out_dir / "candidates.json", candidates)
+        dump_json(out_dir / "candidates.json", candidates)
     if status["status"] == STATUS_OK:
         print(
             f"early warning: {status['records_scanned']} CVE record(s) of the last "

@@ -23,6 +23,8 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        # the shared code of the SCA actions: actions/_sca_lib, a sibling of this directory
+        PYTHONPATH: ${{ github.action_path }}/..
         OUTPUT_DIR: ${{ inputs.output-dir }}
         PREVIOUS_DIR: ${{ inputs.previous-dir }}
         WINDOW_DAYS: ${{ inputs.window-days }}

@@ -20,7 +20,6 @@ import fnmatch
 import json
 import os
 import re
-import secrets
 import subprocess
 import sys
 import time
@@ -31,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 import sca_config
+from _sca_lib.gha import append_text, escape_command_data, format_output
+from _sca_lib.times import format_time
 
 GITHUB_API_VERSION = "2022-11-28"
 DOCKER_HUB_REGISTRY_HOST = "registry-1.docker.io"
@@ -81,16 +82,6 @@ class ToolError(Exception):
 
 
 Runner = Callable[[Sequence[str], str | None], str]
-
-
-def escape_command_data(text: object) -> str:
-    """Escape a text for the message of a workflow command (``::warning::``).
-
-    The text may come from outside (scanner output, a repository, a feed), and
-    ``%``, CR and LF would end or forge the command. The same function is in every
-    module that prints commands (a shared package comes later).
-    """
-    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def make_runner(
@@ -654,7 +645,7 @@ def resolve_targets(
         "run_url": f"{server}/{run_repository}/actions/runs/{run_id}"
         if run_id and run_repository
         else "",
-        "run_started_at": now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_started_at": format_time(now),
         "targets": targets,
     }
 
@@ -667,12 +658,6 @@ def build_matrix(targets_doc: Mapping[str, Any]) -> list[dict[str, Any]]:
         for t in targets_doc["targets"]
         if t["status"] == STATUS_PENDING and t["scanner"] == SCANNER_TRIVY
     ]
-
-
-def format_output(name: str, value: str) -> str:
-    """One $GITHUB_OUTPUT entry in the delimiter format, safe for multiline values."""
-    delimiter = f"ghadelimiter_{secrets.token_hex(16)}"
-    return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
 
 
 def render_table(targets: Sequence[Mapping[str, Any]]) -> str:
@@ -873,8 +858,9 @@ def run(
             # Decided here, once; the early warning job and the merge follow it
             "early-warning-enabled": "true" if early_warning_enabled else "false",
         }
-        with open(output_path, "a", encoding="utf-8", newline="\n") as out:
-            out.writelines(format_output(k, v) for k, v in outputs.items())
+        append_text(
+            output_path, "".join(format_output(k, v) for k, v in outputs.items())
+        )
     return 0
 
 

@@ -95,6 +95,8 @@ runs:
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}
+        # the shared code of the SCA actions: actions/_sca_lib, a sibling of this directory
+        PYTHONPATH: ${{ github.action_path }}/..
       run: >-
         python "$ACTION_PATH/resolve_targets.py"
         --repository "$REPOSITORY"

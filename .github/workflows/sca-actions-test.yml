@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - "actions/sca_*/**"
+      - "actions/_sca_lib/**"
       - "test/sca/**"
       - ".github/workflows/sca-actions-test.yml"
   push:
     branches: [main]
     paths:
       - "actions/sca_*/**"
+      - "actions/_sca_lib/**"
       - "test/sca/**"
       - ".github/workflows/sca-actions-test.yml"
 

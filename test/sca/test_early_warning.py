@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _sca_lib import cve_index as ci
+from _sca_lib import http
+from _sca_lib.jsonio import dump_json, load_targets_list
 
 ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2030, 1, 10, 12, 30, 0, tzinfo=UTC)
@@ -111,88 +114,6 @@ def found(result: Any) -> set[tuple[str, str, str, str]]:
         (c["cve"], c["package"]["name"], c["package"]["version"], c["match"])
         for c in result.candidates
     }
-
-
-# --- versions -------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("a", "b", "expected"),
-    [
-        ("1.2.3", "1.2.3", 0),
-        ("1.2.3", "1.10.0", -1),
-        ("v2.0.0", "2.0", 0),
-        ("1.0.0-alpha", "1.0.0", -1),
-        ("1.0.0-alpha.2", "1.0.0-alpha.10", -1),
-        ("1.0.0-alpha.1", "1.0.0-alpha", 1),
-        ("1.0.0-alpha", "1.0.0-beta", -1),
-        ("1.0.0-1", "1.0.0-alpha", -1),
-        ("1.0.0+build.5", "1.0.0", 0),
-        ("1.2.3.4", "1.2.3", None),
-        ("latest", "1.0.0", None),
-    ],
-)
-def test_semver_comparison(a: str, b: str, expected: int | None) -> None:
-    assert ew.compare_versions("npm", a, b) == expected
-    assert ew.compare_versions("cargo", a, b) == expected
-
-
-@pytest.mark.parametrize(
-    ("a", "b", "expected"),
-    [
-        ("1.0", "1.0.0", 0),
-        ("1.0rc1", "1.0", -1),
-        ("1.0a1", "1.0b1", -1),
-        ("1.0b2", "1.0rc1", -1),
-        ("1.0.dev1", "1.0a1", -1),
-        ("1.0", "1.0.post1", -1),
-        ("1.0.post1", "1.1", -1),
-        ("1.0-1", "1.0.post1", 0),
-        ("1!0.5", "2.0", 1),
-        ("1.0+local.1", "1.0", 0),
-        ("1.0.rc.1", "1.0c1", 0),
-        ("2.10", "2.9", 1),
-        ("1.0.post1.dev1", "1.0.post1", -1),
-        ("not a version", "1.0", None),
-    ],
-)
-def test_pep440_comparison(a: str, b: str, expected: int | None) -> None:
-    assert ew.compare_versions("pypi", a, b) == expected
-
-
-@pytest.mark.parametrize(
-    ("a", "b", "expected"),
-    [
-        ("1.0", "1.0.0", 0),
-        ("1", "1.0.0.0", 0),
-        ("33.4.8-jre", "33.7.2", -1),
-        ("33.7.2-jre", "33.7.2", 1),
-        ("33.7.2-android", "33.7.2-jre", -1),
-        ("1.0-alpha-1", "1.0-beta-1", -1),
-        ("1.0-beta-1", "1.0-rc-1", -1),
-        ("1.0-rc1", "1.0-SNAPSHOT", -1),
-        ("1.0-SNAPSHOT", "1.0", -1),
-        ("1.0", "1.0-sp1", -1),
-        ("1.0-ga", "1.0", 0),
-        ("1.0.Final", "1.0", 0),
-        ("1.0-cr1", "1.0-rc1", 0),
-        ("1.0a1", "1.0-alpha-1", 0),
-        ("1.10", "1.9", 1),
-        ("1.0.1", "1.0-1", 1),
-        ("2.9.10.8", "2.9.10", 1),
-        ("1.85", "1.86", -1),
-        ("1.0-milestone-2", "1.0-m2", 0),
-        ("no-digits", "1.0", None),
-    ],
-)
-def test_maven_comparison(a: str, b: str, expected: int | None) -> None:
-    assert ew.compare_versions("maven", a, b) == expected
-    if expected is not None:
-        assert ew.compare_versions("maven", b, a) == -expected
-
-
-def test_other_ecosystems_are_not_compared() -> None:
-    assert ew.compare_versions("golang", "1.0.0", "1.0.1") is None
 
 
 # --- affected versions ----------------------------------------------------------
@@ -853,7 +774,7 @@ def containers(
 
 
 def severity_of(**kwargs: Any) -> dict[str, Any]:
-    return ew.select_severity(ew.extract_metrics(containers(**kwargs)))
+    return ew.select_severity(ci.extract_metrics(containers(**kwargs)))
 
 
 def test_severity_from_the_cna_cvss_31() -> None:
@@ -982,17 +903,17 @@ def test_exploitation_from_adp_kev_and_ssvc() -> None:
             "content": {"options": [{"Exploitation": "active"}, {"Automatable": "no"}]},
         }
     }
-    metrics = ew.extract_metrics(containers(**{"CISA-ADP": [ssvc, kev]}))
+    metrics = ci.extract_metrics(containers(**{"CISA-ADP": [ssvc, kev]}))
     assert metrics["exploitation"] == {
         "kev": True,
         "kev_date_added": "2022-05-25",
         "ssvc": "active",
         "source": "adp:CISA-ADP",
     }
-    only_ssvc = ew.extract_metrics(containers(**{"CISA-ADP": [ssvc]}))
+    only_ssvc = ci.extract_metrics(containers(**{"CISA-ADP": [ssvc]}))
     assert only_ssvc["exploitation"]["kev"] is False
     assert only_ssvc["exploitation"]["ssvc"] == "active"
-    assert ew.extract_metrics(containers())["exploitation"] is None
+    assert ci.extract_metrics(containers())["exploitation"] is None
 
 
 def test_candidates_are_ordered_by_severity_score_and_date() -> None:
@@ -1002,7 +923,7 @@ def test_candidates_are_ordered_by_severity_score_and_date() -> None:
         metrics = {"cvss": [], "exploitation": None}
         if score is not None:
             key = "cvssV3_1"
-            metrics = ew.extract_metrics(
+            metrics = ci.extract_metrics(
                 containers(cna_metrics=[cvss(key, score, None)])
             )
         return record(
@@ -1098,10 +1019,10 @@ def hour_asset(day: str, hour: int) -> str:
 def test_asset_names_follow_the_release_naming() -> None:
     from datetime import date
 
-    assert ew.end_of_day_asset(date(2026, 10, 11)) == (
+    assert ci.end_of_day_asset(date(2026, 10, 11)) == (
         "cve_2026-10-11_at_end_of_day/2026-10-11_delta_CVEs_at_end_of_day.zip"
     )
-    assert ew.hourly_asset(date(2026, 10, 12), 5) == (
+    assert ci.hourly_asset(date(2026, 10, 12), 5) == (
         "cve_2026-10-12_0500Z/2026-10-12_delta_CVEs_at_0500Z.zip"
     )
 
@@ -1130,10 +1051,9 @@ def write_index(
     records: list[dict[str, Any]],
     **metadata: Any,
 ) -> Path:
-    bci = ew.builder()
     directory.mkdir(parents=True, exist_ok=True)
-    bci.write_jsonl_gz(directory / "cves.jsonl.gz", records)
-    bci.write_json(
+    ci.write_jsonl_gz(directory / "cves.jsonl.gz", records)
+    dump_json(
         directory / "metadata.json",
         {
             "schema_version": 1,
@@ -1155,14 +1075,14 @@ class FakeDownloader:
         self.fail: set[str] = set()
         self.requested: list[str] = []
         # an old entry sets how far back the delta log goes: it covers the span
-        self.files[ew.builder().DELTA_LOG_URL] = json.dumps(
+        self.files[ci.DELTA_LOG_URL] = json.dumps(
             [{"fetchTime": "2029-12-01T00:00:00Z", "new": [], "updated": []}]
         ).encode()
 
     def fetch(self, url: str, dest: Path) -> dict[str, str] | None:
         self.requested.append(url)
         if url in self.fail:
-            raise ew.builder().DownloadError(f"GET {url}: HTTP 500")
+            raise ci.DownloadError(f"GET {url}: HTTP 500")
         if url not in self.files:
             return None
         dest.write_bytes(self.files[url])
@@ -1189,14 +1109,12 @@ class FakeDownloader:
             }
             for d in documents
         ]
-        log = json.loads(self.files[ew.builder().DELTA_LOG_URL])
+        log = json.loads(self.files[ci.DELTA_LOG_URL])
         log.insert(0, {"fetchTime": fetched, "new": [], "updated": changes})
-        self.files[ew.builder().DELTA_LOG_URL] = json.dumps(log).encode()
+        self.files[ci.DELTA_LOG_URL] = json.dumps(log).encode()
         for document in documents:
             self.files[
-                ew.builder().record_url(
-                    ew.builder().RECORDS_URL, document["cveMetadata"]["cveId"]
-                )
+                ci.record_url(ci.RECORDS_URL, document["cveMetadata"]["cveId"])
             ] = json.dumps(document).encode()
 
 
@@ -1373,7 +1291,7 @@ def test_gaps_of_the_index_and_of_the_deltas_are_both_reported(tmp_path: Path) -
     net.hours_of_today(skip=(4, 5, 11))
     # the log covers every hour since its horizon: the missing deltas are made up
     # by it, and the gaps that it cannot clear are those before its horizon
-    net.files[ew.builder().DELTA_LOG_URL] = json.dumps(
+    net.files[ci.DELTA_LOG_URL] = json.dumps(
         [{"fetchTime": "2030-01-09T00:00:00Z", "new": [], "updated": []}]
     ).encode()
     caught_up(index, net, tmp_path)
@@ -1385,7 +1303,7 @@ def test_missing_deltas_that_the_log_cannot_cover_are_gaps(tmp_path: Path) -> No
     index = loaded(write_index(tmp_path / "index", []))
     net = FakeDownloader()
     net.hours_of_today(skip=(4, 5, 11))
-    net.files[ew.builder().DELTA_LOG_URL] = json.dumps(
+    net.files[ci.DELTA_LOG_URL] = json.dumps(
         [{"fetchTime": "2030-01-10T10:00:00Z", "new": [], "updated": []}]
     ).encode()
     caught_up(index, net, tmp_path)
@@ -1399,7 +1317,7 @@ def test_an_unreadable_delta_log_is_a_gap_of_the_whole_span(tmp_path: Path) -> N
     index = loaded(write_index(tmp_path / "index", []))
     net = FakeDownloader()
     net.hours_of_today()
-    del net.files[ew.builder().DELTA_LOG_URL]
+    del net.files[ci.DELTA_LOG_URL]
     caught_up(index, net, tmp_path)
     assert index.gaps == [
         {"from": "2030-01-10T00:00:00Z", "to": "2030-01-10T13:00:00Z"}
@@ -1474,8 +1392,8 @@ class FakeNetwork:
             key = f"{parts[0]}/{parts[2]}/{parts[4]}"
             answer = self.depsdev.get(key)
             if answer is None:
-                return ew.Response(404)
-            return ew.Response(200, {}, json.dumps(answer).encode())
+                return http.Response(404)
+            return http.Response(200, {}, json.dumps(answer).encode())
         raise AssertionError(f"unexpected request {url}")
 
 
@@ -1549,7 +1467,7 @@ def test_repos_are_asked_per_name_newest_version_first_and_the_next_if_unknown()
 def test_a_failing_request_leaves_the_name_without_repos_and_is_counted() -> None:
     inv = inventory(pkg("npm", "a", "1.0.0"), pkg("npm", "b", "1.0.0"))
     network = FakeNetwork({"npm/b/1.0.0": with_repo("github.com/o/b")})
-    network.script = [ew.Response(500)] * ew.MAX_ATTEMPTS
+    network.script = [http.Response(500)] * http.MAX_ATTEMPTS
     lookup = ew.resolve_repos(depsdev_client(network), inv, workers=1)
     assert lookup.repos[("npm", "a")] == ()
     assert lookup.repos[("npm", "b")] == ("github.com/o/b",)
@@ -1559,7 +1477,7 @@ def test_a_failing_request_leaves_the_name_without_repos_and_is_counted() -> Non
 def test_persistent_failures_make_deps_dev_unavailable() -> None:
     inv = inventory(*(pkg("npm", f"p{i}", "1.0.0") for i in range(30)))
     network = FakeNetwork()
-    network.script = [ew.Response(503)] * 1000
+    network.script = [http.Response(503)] * 1000
     with pytest.raises(ew.DepsDevUnavailable, match="HTTP 503"):
         ew.resolve_repos(depsdev_client(network), inv, workers=1, breaker=3)
 
@@ -1899,7 +1817,7 @@ def test_run_reports_deps_dev_being_down_and_does_not_fail(
     network_requests = network.requests
 
     def failing(client: Any, inv: Any) -> Any:
-        network.script = [ew.Response(500)] * 10_000
+        network.script = [http.Response(500)] * 10_000
         return original(client, inv, workers=1)
 
     monkeypatch.setattr(ew, "resolve_repos", failing)
@@ -1967,7 +1885,7 @@ def test_inventory_records_where_each_package_was_seen(ws: Workspace) -> None:
     )
     ws.add_target("broken", None, status="failed")
     ws.args()
-    targets = ew.load_targets_file(ws.targets_file)
+    targets = load_targets_list(ws.targets_file)
     inv = ew.load_inventory(targets, ws.trivy)
     assert inv.targets_read == 2
     assert inv.sightings[pkg("npm", "x", "1.0.0")] == {

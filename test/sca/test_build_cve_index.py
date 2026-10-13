@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _sca_lib import cve_index as ci
 
 ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2030, 1, 10, 12, 30, 0, tzinfo=UTC)
@@ -34,8 +35,7 @@ def _load():
 
 
 b = _load()
-ew = b.ew
-FEED = b.FEED_URL
+FEED = ci.FEED_URL
 
 
 # --- builders ----------------------------------
@@ -135,20 +135,20 @@ class FakeDownloader:
     def fetch(self, url: str, dest: Path) -> dict[str, str] | None:
         self.requested.append(url)
         if url in self.fail:
-            raise b.DownloadError(f"GET {url}: HTTP 500")
+            raise ci.DownloadError(f"GET {url}: HTTP 500")
         if url not in self.files:
             return None
         dest.write_bytes(self.files[url])
         return {"last-modified": "Wed, 09 Jan 2030 00:00:00 GMT"}
 
     def eod(self, day: date, *docs: dict[str, Any]) -> None:
-        self.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = delta(*docs)
+        self.files[f"{FEED}/{ci.end_of_day_asset(day)}"] = delta(*docs)
 
     def hour(self, day: date, hour: int, *docs: dict[str, Any]) -> None:
-        self.files[f"{FEED}/{ew.hourly_asset(day, hour)}"] = delta(*docs)
+        self.files[f"{FEED}/{ci.hourly_asset(day, hour)}"] = delta(*docs)
 
     def whole(self, day: date, *docs: dict[str, Any]) -> None:
-        self.files[f"{FEED}/{b.baseline_asset(day)}"] = whole_list(*docs)
+        self.files[f"{FEED}/{ci.baseline_asset(day)}"] = whole_list(*docs)
 
     def log(
         self,
@@ -167,12 +167,12 @@ class FakeDownloader:
             for fetched, new, updated in entries
         ]
         items.append({"fetchTime": horizon, "new": [], "updated": []})
-        self.files[b.DELTA_LOG_URL] = json.dumps(items).encode()
+        self.files[ci.DELTA_LOG_URL] = json.dumps(items).encode()
 
     def raw(self, *docs: dict[str, Any]) -> None:
         """The records as the repository serves them."""
         for doc in docs:
-            url = b.record_url(b.RECORDS_URL, doc["cveMetadata"]["cveId"])
+            url = ci.record_url(ci.RECORDS_URL, doc["cveMetadata"]["cveId"])
             self.files[url] = json.dumps(doc).encode()
 
     def drop(self, asset: str) -> None:
@@ -184,12 +184,12 @@ class FakeDownloader:
         published before the current hour."""
         day = (now - timedelta(days=window)).date()
         while day < now.date():
-            url = f"{FEED}/{ew.end_of_day_asset(day)}"
+            url = f"{FEED}/{ci.end_of_day_asset(day)}"
             self.files.setdefault(url, delta())
             day += timedelta(days=1)
         for hour in range(now.hour):
             self.files.setdefault(
-                f"{FEED}/{ew.hourly_asset(now.date(), hour)}", delta()
+                f"{FEED}/{ci.hourly_asset(now.date(), hour)}", delta()
             )
 
 
@@ -215,7 +215,7 @@ def previous_of(built: Any, tmp_path: Path) -> Any:
     """The index as the next build reads it."""
     out = tmp_path / "previous"
     b.write_index(built, out)
-    return b.read_previous(out)
+    return ci.read_previous(out)
 
 
 # --- the feed: completeness -------------------------------------------------------
@@ -228,10 +228,10 @@ def deltas(
     feed: Any = None,
     records: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any]:
-    feed = feed or b.Feed()
+    feed = feed or ci.Feed()
     records = {} if records is None else records
-    client = b.FeedClient(net, FEED, tmp_path / "feed")
-    b.apply_deltas(records, client, start, NOW, NOW - timedelta(days=WINDOW), feed)
+    client = ci.FeedClient(net, FEED, tmp_path / "feed")
+    ci.apply_deltas(records, client, start, NOW, NOW - timedelta(days=WINDOW), feed)
     return records, feed
 
 
@@ -249,20 +249,20 @@ def test_end_of_day_covers_the_hours_of_its_day(
     records, feed = deltas(net, tmp_path, day)
     assert feed.gaps == set()
     assert records == {}  # the hourly deltas of that day are not looked at
-    assert not any(ew.hourly_asset(day, 3) in url for url in net.requested)
+    assert not any(ci.hourly_asset(day, 3) in url for url in net.requested)
 
 
 def test_missing_end_of_day_is_made_up_by_hourly_deltas(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
     day = TODAY - timedelta(days=2)
-    net.drop(ew.end_of_day_asset(day))
+    net.drop(ci.end_of_day_asset(day))
     for hour in set(range(24)) - {5, 6, 20}:
         net.hour(day, hour)
     net.hour(day, 7, cve_doc("CVE-2030-1", published=stamp(8, 7)))
     records, feed = deltas(net, tmp_path, day)
     assert "CVE-2030-1" in records
-    assert b.gap_ranges(feed.gaps) == [
+    assert ci.gap_ranges(feed.gaps) == [
         {"from": "2030-01-08T05:00:00Z", "to": "2030-01-08T07:00:00Z"},
         {"from": "2030-01-08T20:00:00Z", "to": "2030-01-08T21:00:00Z"},
     ]
@@ -272,9 +272,9 @@ def test_a_day_without_any_delta_is_a_gap_of_24_hours(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
     day = TODAY - timedelta(days=2)
-    net.drop(ew.end_of_day_asset(day))
+    net.drop(ci.end_of_day_asset(day))
     _, feed = deltas(net, tmp_path, day)
-    assert b.gap_ranges(feed.gaps) == [
+    assert ci.gap_ranges(feed.gaps) == [
         {"from": "2030-01-08T00:00:00Z", "to": "2030-01-09T00:00:00Z"}
     ]
 
@@ -282,11 +282,11 @@ def test_a_day_without_any_delta_is_a_gap_of_24_hours(
 def test_only_hours_of_today_before_the_current_one_can_be_gaps(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.drop(ew.hourly_asset(TODAY, 3))
+    net.drop(ci.hourly_asset(TODAY, 3))
     # the delta of the current hour (12) is not published yet: not a gap
-    assert f"{FEED}/{ew.hourly_asset(TODAY, 12)}" not in net.files
+    assert f"{FEED}/{ci.hourly_asset(TODAY, 12)}" not in net.files
     _, feed = deltas(net, tmp_path, TODAY)
-    assert b.gap_ranges(feed.gaps) == [
+    assert ci.gap_ranges(feed.gaps) == [
         {"from": "2030-01-10T03:00:00Z", "to": "2030-01-10T04:00:00Z"}
     ]
 
@@ -296,21 +296,21 @@ def test_gaps_round_trip_and_a_rescan_recomputes_the_days_it_covers(
 ) -> None:
     old = {"from": "2030-01-06T01:00:00Z", "to": "2030-01-06T02:00:00Z"}
     rescanned = {"from": "2030-01-08T05:00:00Z", "to": "2030-01-08T07:00:00Z"}
-    assert b.gap_ranges(b.gaps_of([old, rescanned])) == [old, rescanned]
-    with pytest.raises(b.FormatError):
-        b.gaps_of([{"from": "yesterday", "to": "today"}])
+    assert ci.gap_ranges(ci.gaps_of([old, rescanned])) == [old, rescanned]
+    with pytest.raises(ci.FormatError):
+        ci.gaps_of([{"from": "yesterday", "to": "today"}])
     # the day of the second gap is complete now, the first is before the rescan
-    feed = b.Feed(gaps=b.gaps_of([old, rescanned]))
+    feed = ci.Feed(gaps=ci.gaps_of([old, rescanned]))
     deltas(net, tmp_path, date(2030, 1, 7), feed)
-    assert b.gap_ranges(feed.gaps) == [old]
+    assert ci.gap_ranges(feed.gaps) == [old]
 
 
 def test_a_delta_that_cannot_be_downloaded_fails(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
     day = TODAY - timedelta(days=1)
-    net.fail.add(f"{FEED}/{ew.end_of_day_asset(day)}")
-    with pytest.raises(b.DownloadError):
+    net.fail.add(f"{FEED}/{ci.end_of_day_asset(day)}")
+    with pytest.raises(ci.DownloadError):
         deltas(net, tmp_path, day)
 
 
@@ -359,8 +359,8 @@ def test_a_record_that_is_not_json_fails(
 ) -> None:
     day = TODAY - timedelta(days=1)
     members = {"cves/2030/0xxx/CVE-2030-1.json": member}
-    net.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = zip_bytes(members)
-    with pytest.raises(b.FormatError):
+    net.files[f"{FEED}/{ci.end_of_day_asset(day)}"] = zip_bytes(members)
+    with pytest.raises(ci.FormatError):
         deltas(net, tmp_path, day)
 
 
@@ -377,7 +377,7 @@ def test_a_record_of_an_unusual_shape_is_skipped_and_counted(
         "cves/2030/0xxx/CVE-2030-1.json": member,
         "cves/2030/0xxx/CVE-2030-2.json": good,
     }
-    net.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = zip_bytes(members)
+    net.files[f"{FEED}/{ci.end_of_day_asset(day)}"] = zip_bytes(members)
     records, feed = deltas(net, tmp_path, day)
     assert list(records) == ["CVE-2030-2"]
     assert feed.skipped == {"CVE-2030-1"}
@@ -400,7 +400,7 @@ def test_a_fetched_record_of_an_unusual_shape_is_skipped_and_is_no_gap(
 ) -> None:
     odd = cve_doc("CVE-2030-1001", published=stamp(10, 0), updated=stamp(10, 7))
     net.log(("2030-01-10T07:40:00.000Z", [odd], []))
-    net.files[b.record_url(b.RECORDS_URL, "CVE-2030-1001")] = b'{"x": 1}'
+    net.files[ci.record_url(ci.RECORDS_URL, "CVE-2030-1001")] = b'{"x": 1}'
     built = run_build(net, tmp_path)
     assert "CVE-2030-1001" not in built.records
     assert built.metadata["gaps"] == []
@@ -410,24 +410,24 @@ def test_a_fetched_record_of_an_unusual_shape_is_skipped_and_is_no_gap(
 
 def test_a_delta_that_is_not_a_zip_fails(net: FakeDownloader, tmp_path: Path) -> None:
     day = TODAY - timedelta(days=1)
-    net.files[f"{FEED}/{ew.end_of_day_asset(day)}"] = b"<html>rate limited</html>"
-    with pytest.raises(b.FormatError):
+    net.files[f"{FEED}/{ci.end_of_day_asset(day)}"] = b"<html>rate limited</html>"
+    with pytest.raises(ci.FormatError):
         deltas(net, tmp_path, day)
 
 
 def test_a_rejected_record_replaces_the_record_it_follows() -> None:
-    published = b.index_record(
+    published = ci.index_record(
         cve_doc("CVE-2030-1", affected=[pkg_entry("left-pad")], updated=stamp(8)), "t"
     )
-    rejected = b.index_record(
+    rejected = ci.index_record(
         cve_doc("CVE-2030-1", state="REJECTED", updated=stamp(9)), "t"
     )
     assert set(rejected) == {*("cve", "state", "published", "updated"), "assigner"}
     records = {"CVE-2030-1": published}
-    b.merge_record(records, rejected)
+    ci.merge_record(records, rejected)
     assert records["CVE-2030-1"]["state"] == "REJECTED"
     # an older version that comes later does not bring it back
-    b.merge_record(records, published)
+    ci.merge_record(records, published)
     assert records["CVE-2030-1"]["state"] == "REJECTED"
 
 
@@ -445,7 +445,7 @@ def test_bootstrap_is_the_whole_list_and_the_deltas_from_its_day(
     assert set(built.records) == {"CVE-2030-1", "CVE-2030-2"}
     # the deltas of the days before the whole list are not needed
     assert not any(
-        ew.end_of_day_asset(TODAY - timedelta(days=1)) in url for url in net.requested
+        ci.end_of_day_asset(TODAY - timedelta(days=1)) in url for url in net.requested
     )
     meta = built.metadata
     assert meta["mode"] == "bootstrap"
@@ -461,7 +461,7 @@ def test_bootstrap_is_the_whole_list_and_the_deltas_from_its_day(
 def test_the_whole_list_of_yesterday_when_todays_is_not_out_yet(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.drop(b.baseline_asset(TODAY))
+    net.drop(ci.baseline_asset(TODAY))
     yesterday = TODAY - timedelta(days=1)
     net.whole(yesterday, cve_doc("CVE-2030-1", affected=[pkg_entry("a")]))
     built = run_build(net, tmp_path)
@@ -470,16 +470,16 @@ def test_the_whole_list_of_yesterday_when_todays_is_not_out_yet(
 
 
 def test_no_whole_list_fails(net: FakeDownloader, tmp_path: Path) -> None:
-    net.drop(b.baseline_asset(TODAY))
-    with pytest.raises(b.IndexBuildError, match="no baseline"):
+    net.drop(ci.baseline_asset(TODAY))
+    with pytest.raises(ci.IndexBuildError, match="no baseline"):
         run_build(net, tmp_path)
 
 
 def test_a_whole_list_of_another_shape_fails(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.files[f"{FEED}/{b.baseline_asset(TODAY)}"] = zip_bytes({"other.zip": b"x"})
-    with pytest.raises(b.FormatError, match="unexpected members"):
+    net.files[f"{FEED}/{ci.baseline_asset(TODAY)}"] = zip_bytes({"other.zip": b"x"})
+    with pytest.raises(ci.FormatError, match="unexpected members"):
         run_build(net, tmp_path)
 
 
@@ -514,7 +514,7 @@ def test_incremental_build_updates_rejects_and_prunes(
 
     assert second.metadata["mode"] == "incremental"
     assert second.metadata["baseline"] == "2030-01-10"  # no resync yet
-    assert not any(b.baseline_asset(now.date()) in url for url in net.requested)
+    assert not any(ci.baseline_asset(now.date()) in url for url in net.requested)
     assert second.records["CVE-2030-1"]["affected"][0]["versions"][0]["lessThan"] == "9"
     rejected = second.records["CVE-2030-2"]
     assert rejected["state"] == "REJECTED"
@@ -571,7 +571,7 @@ def test_an_index_that_ends_before_the_window_starts_is_a_bootstrap(
     assert built.metadata["mode"] == "bootstrap"
     assert built.metadata["baseline"] == str(later.date())
     # the deltas of the old index are of no use: the whole list starts it again
-    first_day = ew.end_of_day_asset(later.date() - timedelta(days=WINDOW))
+    first_day = ci.end_of_day_asset(later.date() - timedelta(days=WINDOW))
     assert not any(first_day in url for url in net.requested)
 
 
@@ -601,7 +601,7 @@ def test_records_the_deltas_brought_are_not_fetched_again(
     built = run_build(net, tmp_path)
     assert built.metadata["counts"]["reconciled"] == 0
     assert not any(
-        url == b.record_url(b.RECORDS_URL, "CVE-2030-1001") for url in net.requested
+        url == ci.record_url(ci.RECORDS_URL, "CVE-2030-1001") for url in net.requested
     )
 
 
@@ -617,23 +617,23 @@ def test_a_newer_version_than_the_deltas_have_is_fetched(
 
 
 def test_record_urls() -> None:
-    url = b.record_url("https://r/cves", "CVE-2026-108779")
+    url = ci.record_url("https://r/cves", "CVE-2026-108779")
     assert url == "https://r/cves/2026/108xxx/CVE-2026-108779.json"
-    assert b.record_url("https://r/cves", "CVE-2026-6232").endswith(
+    assert ci.record_url("https://r/cves", "CVE-2026-6232").endswith(
         "/2026/6xxx/CVE-2026-6232.json"
     )
-    assert b.record_url("https://r/cves", "CVE-2015-20107").endswith(
+    assert ci.record_url("https://r/cves", "CVE-2015-20107").endswith(
         "/2015/20xxx/CVE-2015-20107.json"
     )
-    with pytest.raises(b.FormatError):
-        b.record_url("https://r/cves", "../etc/passwd")
+    with pytest.raises(ci.FormatError):
+        ci.record_url("https://r/cves", "../etc/passwd")
 
 
 def test_asset_gaps_that_the_log_covers_are_cleared_and_older_ones_stay(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.drop(ew.hourly_asset(TODAY, 3))
-    net.drop(ew.hourly_asset(TODAY, 6))
+    net.drop(ci.hourly_asset(TODAY, 3))
+    net.drop(ci.hourly_asset(TODAY, 6))
     lost = cve_doc("CVE-2030-1001", published=stamp(10, 6), affected=[pkg_entry("a")])
     net.log(
         ("2030-01-10T06:40:00.000Z", [lost], []), horizon="2030-01-10T05:10:00.000Z"
@@ -670,9 +670,9 @@ def test_an_unreadable_log_is_a_gap_of_the_span_and_not_a_failure(
     net.complete_feed(now)
     for broken in (b"not json", b"[]", json.dumps([{"x": 1}]).encode(), None):
         if broken is None:
-            del net.files[b.DELTA_LOG_URL]
+            del net.files[ci.DELTA_LOG_URL]
         else:
-            net.files[b.DELTA_LOG_URL] = broken
+            net.files[ci.DELTA_LOG_URL] = broken
         built = run_build(net, tmp_path, previous, now)
         assert built.metadata["gaps"] == [
             {"from": "2030-01-09T00:00:00Z", "to": "2030-01-11T04:00:00Z"}
@@ -683,7 +683,7 @@ def test_an_unreadable_log_is_a_gap_of_the_span_and_not_a_failure(
 def test_a_failing_log_download_is_a_gap_too(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.fail.add(b.DELTA_LOG_URL)
+    net.fail.add(ci.DELTA_LOG_URL)
     built = run_build(net, tmp_path)
     assert built.metadata["gaps"]
 
@@ -693,7 +693,7 @@ def test_a_record_that_cannot_be_fetched_is_a_gap_of_its_hour(
 ) -> None:
     missed = cve_doc("CVE-2030-1001", published=stamp(10, 0), updated=stamp(10, 7))
     net.log(("2030-01-10T07:40:00.000Z", [missed], []))
-    net.fail.add(b.record_url(b.RECORDS_URL, "CVE-2030-1001"))
+    net.fail.add(ci.record_url(ci.RECORDS_URL, "CVE-2030-1001"))
     built = run_build(net, tmp_path)
     assert "CVE-2030-1001" not in built.records
     assert built.metadata["gaps"] == [
@@ -760,7 +760,7 @@ def test_the_21_records_that_the_deltas_lost_around_midnight(
     ]
     net.raw(*docs)
 
-    previous = b.Previous(
+    previous = ci.Previous(
         {},
         {
             "schema_version": 1,
@@ -797,9 +797,9 @@ def test_the_index_round_trips_and_is_deterministic(
     one, two = tmp_path / "one", tmp_path / "two"
     b.write_index(built, one)
     b.write_index(built, two)
-    for name in b.INDEX_FILES:
+    for name in ci.INDEX_FILES:
         assert (one / name).read_bytes() == (two / name).read_bytes()
-    previous = b.read_previous(one)
+    previous = ci.read_previous(one)
     assert previous.records == built.records
     assert previous.metadata == built.metadata
 
@@ -810,22 +810,24 @@ def test_a_previous_index_that_does_not_fit_fails(
 ) -> None:
     out = tmp_path / "previous"
     b.write_index(run_build(net, tmp_path), out)
-    meta = json.loads((out / b.METADATA_FILE).read_text(encoding="utf-8"))
-    (out / b.METADATA_FILE).write_text(json.dumps({**meta, **change}), encoding="utf-8")
-    with pytest.raises(b.FormatError):
-        b.read_previous(out)
+    meta = json.loads((out / ci.METADATA_FILE).read_text(encoding="utf-8"))
+    (out / ci.METADATA_FILE).write_text(
+        json.dumps({**meta, **change}), encoding="utf-8"
+    )
+    with pytest.raises(ci.FormatError):
+        ci.read_previous(out)
 
 
 def test_a_previous_index_that_is_missing_or_broken_fails(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    with pytest.raises(b.FormatError):
-        b.read_previous(tmp_path / "nothing")
+    with pytest.raises(ci.FormatError):
+        ci.read_previous(tmp_path / "nothing")
     out = tmp_path / "previous"
     b.write_index(run_build(net, tmp_path), out)
-    (out / b.RECORDS_FILE).write_bytes(b"not gzip")
-    with pytest.raises(b.FormatError):
-        b.read_previous(out)
+    (out / ci.RECORDS_FILE).write_bytes(b"not gzip")
+    with pytest.raises(ci.FormatError):
+        ci.read_previous(out)
 
 
 # --- the downloader ----------------------------------
@@ -867,7 +869,7 @@ def downloader(*answers: Any) -> tuple[Any, list[float]]:
             raise answer
         return answer
 
-    return b.UrllibDownloader(opener, sleeps.append, max_attempts=3), sleeps
+    return ci.UrllibDownloader(opener, sleeps.append, max_attempts=3), sleeps
 
 
 def test_the_downloader_saves_the_body_and_returns_the_headers(tmp_path: Path) -> None:
@@ -893,7 +895,7 @@ def test_the_downloader_retries_a_truncated_body(tmp_path: Path) -> None:
 
 def test_the_downloader_gives_up_after_its_attempts(tmp_path: Path) -> None:
     dl, sleeps = downloader(*[http_error(502)] * 3)
-    with pytest.raises(b.DownloadError, match="HTTP 502"):
+    with pytest.raises(ci.DownloadError, match="HTTP 502"):
         dl.fetch("https://x/a.zip", tmp_path / "a.zip")
     assert len(sleeps) == 2
 
@@ -902,10 +904,10 @@ def test_the_downloader_does_not_retry_what_will_not_change(tmp_path: Path) -> N
     dl, sleeps = downloader(http_error(404))
     assert dl.fetch("https://x/a.zip", tmp_path / "a.zip") is None
     dl, sleeps = downloader(http_error(403))
-    with pytest.raises(b.DownloadError, match="HTTP 403"):
+    with pytest.raises(ci.DownloadError, match="HTTP 403"):
         dl.fetch("https://x/a.zip", tmp_path / "a.zip")
     assert sleeps == []
-    with pytest.raises(b.DownloadError, match="HTTPS"):
+    with pytest.raises(ci.DownloadError, match="HTTPS"):
         dl.fetch("http://x/a.zip", tmp_path / "a.zip")
 
 
@@ -930,9 +932,9 @@ def test_main_writes_the_index_and_a_summary(
     args = main_args(tmp_path, "--summary-file", str(summary))
     assert b.main(args, net, NOW) == 0
     out = tmp_path / "index"
-    assert {p.name for p in out.iterdir()} == set(b.INDEX_FILES)
+    assert {p.name for p in out.iterdir()} == set(ci.INDEX_FILES)
     assert not (tmp_path / "work").exists()
-    with gzip.open(out / b.RECORDS_FILE, "rt", encoding="utf-8") as src:
+    with gzip.open(out / ci.RECORDS_FILE, "rt", encoding="utf-8") as src:
         assert [json.loads(line)["cve"] for line in src] == ["CVE-2030-1"]
     assert "1 records" in summary.read_text(encoding="utf-8")
     assert "CVE index for the early warning" in capsys.readouterr().out
@@ -946,7 +948,7 @@ def test_main_uses_the_previous_index(net: FakeDownloader, tmp_path: Path) -> No
     args = main_args(tmp_path, "--previous-dir", str(previous))
     assert b.main(args, net, now) == 0
     meta = json.loads(
-        (tmp_path / "index" / b.METADATA_FILE).read_text(encoding="utf-8")
+        (tmp_path / "index" / ci.METADATA_FILE).read_text(encoding="utf-8")
     )
     assert meta["mode"] == "incremental"
 
@@ -954,7 +956,7 @@ def test_main_uses_the_previous_index(net: FakeDownloader, tmp_path: Path) -> No
 def test_main_fails_without_an_index_when_an_input_fails(
     net: FakeDownloader, tmp_path: Path, capsys: Any
 ) -> None:
-    net.fail.add(f"{FEED}/{b.baseline_asset(TODAY)}")
+    net.fail.add(f"{FEED}/{ci.baseline_asset(TODAY)}")
     assert b.main(main_args(tmp_path), net, NOW) == 1
     assert not (tmp_path / "index").exists()
     assert "::error title=CVE index not built::" in capsys.readouterr().err
@@ -963,7 +965,7 @@ def test_main_fails_without_an_index_when_an_input_fails(
 def test_main_warns_about_the_gaps_of_the_feed(
     net: FakeDownloader, tmp_path: Path, capsys: Any
 ) -> None:
-    net.drop(ew.hourly_asset(TODAY, 3))
+    net.drop(ci.hourly_asset(TODAY, 3))
     net.log(horizon="2030-01-10T05:10:00.000Z")  # the log does not reach hour 3
     assert b.main(main_args(tmp_path), net, NOW) == 0
     out = capsys.readouterr().out

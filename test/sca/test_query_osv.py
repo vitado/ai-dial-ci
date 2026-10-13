@@ -419,10 +419,6 @@ def test_package_names_are_compared_loosely() -> None:
     assert qo.unread_packages(bom, output) == []
 
 
-def test_command_data_is_escaped() -> None:
-    assert qo.escape_command_data("a%b\r\nc") == "a%25b%0D%0Ac"
-
-
 @pytest.mark.parametrize("trivy_status", ["failed", "not_applicable", None, "ok-ish"])
 def test_a_target_whose_trivy_target_was_not_scanned_is_not_applicable(
     tmp_path: Path, trivy_status: str | None

@@ -44,6 +44,8 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        # the shared code of the SCA actions: actions/_sca_lib, a sibling of this directory
+        PYTHONPATH: ${{ github.action_path }}/..
         MODE: ${{ inputs.mode }}
         TARGET_ID: ${{ inputs.target-id }}
         OUTPUT_DIR: ${{ inputs.output-dir }}

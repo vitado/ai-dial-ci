@@ -116,14 +116,6 @@ def tag_routes(runner: FakeRunner, tag: str, sha: str) -> None:
     runner.add(f"repos/{REPOSITORY}/commits/refs/tags/{tag}", ok({"sha": sha}))
 
 
-def git_tags_route(runner: FakeRunner, *pages: list[str]) -> None:
-    """The git tags of the repository, as ``gh api --paginate --slurp`` gives them."""
-    runner.add(
-        f"repos/{REPOSITORY}/tags?per_page=100",
-        ok([[{"name": name} for name in page] for page in pages]),
-    )
-
-
 def run_resolve_targets(
     runner: FakeRunner,
     images: list[str],
@@ -164,40 +156,6 @@ TARGET_KEYS = {"id", "kind", "image", "tag", "ref", "git_ref", "commit_sha"}
 
 def by_id(targets_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {t["id"]: t for t in targets_doc["targets"]}
-
-
-# --- semver -------------------------------------------------------------------
-
-
-def test_semver_numeric_not_lexical() -> None:
-    assert rt.newest_stable_tag(["0.9.1", "0.12.0", "0.10.3"]) == "0.12.0"
-    assert rt.parse_stable_semver("0.12.0") > rt.parse_stable_semver("0.9.1")
-
-
-def test_semver_excludes_prereleases_and_noise() -> None:
-    tags = [
-        "1.2.0-rc.1",
-        "1.2.0",
-        "1.3.0-rc.0",
-        "development",
-        "latest",
-        "1.2",
-        "sha-abc",
-        "1.2.3.4",
-    ]
-    assert rt.newest_stable_tag(tags) == "1.2.0"
-
-
-def test_semver_v_prefix() -> None:
-    assert rt.newest_stable_tag(["v1.2.1", "v1.2.10", "v1.2.9", "1.1.5"]) == "v1.2.10"
-
-
-def test_semver_same_version_prefers_unprefixed() -> None:
-    assert rt.newest_stable_tag(["v1.0.0", "1.0.0"]) == "1.0.0"
-
-
-def test_semver_no_stable_tags() -> None:
-    assert rt.newest_stable_tag(["development", "1.0.0-rc.1"]) is None
 
 
 # --- targets ------------------------------------------------------------------
@@ -253,16 +211,6 @@ def test_v_prefixed_release_matches_the_unprefixed_image_tag() -> None:
     assert targets["x-1.1.14"]["ref"] == "ghcr.io/example/x:1.1.14"
 
 
-def test_no_github_release_falls_back_to_the_newest_git_tag() -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
-    t.add(tags_url("example/x"), tags_out(["development", "0.9.1", "0.12.0"]))
-    targets = by_id(run_resolve_targets(t, ["example/x"]))
-    assert targets["x-0.12.0"]["status"] == "pending"
-    assert "x-0.9.1" not in targets
-
-
 def test_release_tag_missing_for_image_is_not_applicable() -> None:
     t = FakeRunner()
     github_routes(t, release="1.1.14")
@@ -283,21 +231,21 @@ def test_missing_development_tag_is_not_applicable() -> None:
     assert targets["x-1.0.0"]["status"] == "pending"
 
 
-def test_no_stable_tags_gives_single_not_applicable_release_target() -> None:
+def test_no_github_release_gives_single_not_applicable_release_target() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, ["1.0.0-rc.1"])
-    t.add(tags_url("example/x"), tags_out(["development", "1.0.0-rc.1"]))
+    t.add(tags_url("example/x"), tags_out(["development", "0.9.1", "1.0.0-rc.1"]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-release"]["status"] == "not_applicable"
     assert targets["x-release"]["tag"] is None
     assert targets["x-release"]["ref"] is None
+    assert targets["x-release"]["reason"] == "no GitHub release"
+    assert "x-0.9.1" not in targets
 
 
 def test_image_without_tags() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     t.add(tags_url("example/x"), tags_out([]))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "not_applicable"
@@ -320,7 +268,6 @@ def test_registry_error_fails_only_that_image() -> None:
 def test_registry_tool_failure_fails_image() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     t.add(tags_url("example/x"), rt.ToolError("boom"))
     targets = by_id(run_resolve_targets(t, ["example/x"]))
     assert targets["x-development"]["status"] == "failed"
@@ -383,7 +330,6 @@ def test_scan_images_false() -> None:
 def test_id_collision_rejected() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     t.add(tags_url("a/x"), tags_out(["development"]))
     t.add(tags_url("b/x"), tags_out(["development"]))
     with pytest.raises(rt.ResolveError, match="collision"):
@@ -573,13 +519,6 @@ def test_github_requests_go_through_gh_api() -> None:
         assert argv[:2] == ["gh", "api"]
         assert "X-GitHub-Api-Version: 2022-11-28" in argv
         assert stdin is None
-
-
-def test_github_tags_of_all_pages_are_flattened() -> None:
-    t = FakeRunner()
-    git_tags_route(t, ["0.1.0", "0.1.1"], ["0.2.0"])
-    assert rt.GitHubClient(t).repository_tags(REPOSITORY) == ["0.1.0", "0.1.1", "0.2.0"]
-    assert "--paginate" in t.calls[0][0]
 
 
 def test_github_invalid_json_is_a_resolve_error() -> None:
@@ -861,7 +800,6 @@ def test_release_source_target_of_latest_release() -> None:
     assert all(set(m) == TARGET_KEYS for m in matrix)
     assert [m["id"] for m in matrix][:2] == ["source-development", "source-0.12.0"]
     # the GitHub release needs no git tag listing
-    assert not any("/tags?" in url for url in t.urls)
 
 
 def test_release_source_tag_that_cannot_be_resolved_is_a_failed_target() -> None:
@@ -907,40 +845,13 @@ def test_release_source_without_images_python_package() -> None:
     assert not any(url.startswith("ghcr.io/") for url in t.urls)
 
 
-def test_release_source_falls_back_to_the_newest_git_tag() -> None:
+def test_release_source_without_github_release_is_not_applicable() -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, ["0.9.1", "0.12.0", "0.12.0-rc.1", "nightly"])
-    tag_routes(t, "0.12.0", "b" * 40)
-    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
-    assert list(targets) == ["source-development", "source-0.12.0"]
-
-
-def test_release_source_git_tag_listing_is_paginated() -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    git_tags_route(t, [f"0.1.{i}" for i in range(100)], ["0.2.0"])
-    tag_routes(t, "0.2.0", "b" * 40)
-    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
-    assert "source-0.2.0" in targets
-
-
-def test_release_source_no_stable_tag_is_not_applicable() -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    git_tags_route(t, ["0.1.0-rc.1", "nightly"])
     targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
     assert targets["source-release"]["status"] == "not_applicable"
-    assert "no stable release tag" in targets["source-release"]["reason"]
-
-
-def test_release_source_git_tag_listing_failure_is_a_failed_target() -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    t.add(f"repos/{REPOSITORY}/tags?per_page=100", http_error(403))
-    targets = by_id(run_resolve_targets(t, [], scan_release_source=True))
-    assert targets["source-release"]["status"] == "failed"
-    assert "HTTP 403" in targets["source-release"]["reason"]
+    assert targets["source-release"]["reason"] == "no GitHub release"
+    assert not any("/tags" in url for url in t.urls)
 
 
 def test_scan_source_false_disables_release_sources_too() -> None:
@@ -961,7 +872,7 @@ def test_release_source_off_makes_no_extra_requests() -> None:
     github_routes(t, release="0.12.0")
     t.add(tags_url("example/x"), tags_out(["development", "0.12.0"]))
     run_resolve_targets(t, ["example/x"], scan_release_source=False)
-    assert not any("/commits/refs/tags/" in url or "/tags?" in url for url in t.urls)
+    assert not any("/commits/refs/tags/" in url for url in t.urls)
 
 
 def test_release_source_id_sanitized() -> None:
@@ -1303,7 +1214,6 @@ def test_run_passes_the_config_input_and_outputs_the_skip_mode(
 def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     output_file = tmp_path / "github_output"
     rt.run(run_env(tmp_path / "out", GITHUB_OUTPUT=str(output_file)), t, NOW)
     outputs = parse_github_output(output_file.read_text())
@@ -1314,7 +1224,6 @@ def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> Non
 def test_run_outputs_whether_the_early_warning_is_enabled(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     output_file = tmp_path / "github_output"
     env = run_env(
         tmp_path / "out",

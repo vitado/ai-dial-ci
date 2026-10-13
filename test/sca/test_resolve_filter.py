@@ -12,7 +12,6 @@ from test_resolve_targets import (
     CALLER,
     NOW,
     FakeRunner,
-    git_tags_route,
     github_routes,
     ok,
     rt,
@@ -220,7 +219,6 @@ def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
 def test_caller_and_ref_come_from_the_environment(tmp_path: Path) -> None:
     t = FakeRunner()
     github_routes(t, release=None)
-    git_tags_route(t, [])
     t.add("repos/other/caller", ok({"default_branch": "main"}))
     env = run_env(tmp_path, GITHUB_REPOSITORY="other/caller", GITHUB_REF_NAME="main")
     assert rt.run(env, t, NOW) == 0

@@ -52,12 +52,10 @@ STATUS_PENDING = "pending"
 STATUS_NOT_APPLICABLE = "not_applicable"
 STATUS_FAILED = "failed"
 
-GITHUB_TAGS_PAGE_SIZE = 100
 TOOL_TIMEOUT_SECONDS = 120.0
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
 
-STABLE_SEMVER = re.compile(r"(v?)(\d+)\.(\d+)\.(\d+)", re.ASCII)
 _NAME_PART = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
 IMAGE_NAME = re.compile(rf"{_NAME_PART}(?:/{_NAME_PART})*", re.ASCII)
 REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", re.ASCII)
@@ -174,18 +172,9 @@ class GitHubClient:
             raise ResolveError(f"cannot read {path} in {repo}@{ref}: {err!r}") from err
 
     def latest_release_tag(self, repo: str) -> str | None:
-        """Tag of the latest stable release, or None if the repo has none (HTTP 404)."""
+        """Tag of the latest GitHub release, or None if the repo has none (HTTP 404)."""
         release = self._api(f"repos/{repo}/releases/latest", missing_ok=True)
         return None if release is None else str(release["tag_name"])
-
-    def repository_tags(self, repo: str) -> list[str]:
-        """Names of all git tags of the repository."""
-        pages = self._api(
-            f"repos/{repo}/tags?per_page={GITHUB_TAGS_PAGE_SIZE}",
-            "--paginate",
-            "--slurp",
-        )
-        return [str(tag["name"]) for page in pages for tag in page]
 
     def tag_commit_sha(self, repo: str, tag: str) -> str:
         """Commit a git tag points to (the API peels an annotated tag to its commit)."""
@@ -228,24 +217,6 @@ class RegistryClient:
             raise RegistryError(
                 f"{self.registry}: listing tags of {image} failed: {err}"
             ) from err
-
-
-def parse_stable_semver(tag: str) -> tuple[int, int, int] | None:
-    """(major, minor, patch) of a stable ``[v]X.Y.Z`` tag; None for anything else."""
-    match = STABLE_SEMVER.fullmatch(tag)
-    if not match:
-        return None
-    return int(match.group(2)), int(match.group(3)), int(match.group(4))
-
-
-def newest_stable_tag(tags: Sequence[str]) -> str | None:
-    """The highest stable ``[v]X.Y.Z`` tag; on a tie the unprefixed one."""
-    stable = [tag for tag in tags if parse_stable_semver(tag)]
-    return max(
-        stable,
-        key=lambda tag: (parse_stable_semver(tag), not tag.startswith("v")),
-        default=None,
-    )
 
 
 def find_release_tag(release_tag: str, tags: Sequence[str]) -> str | None:
@@ -344,19 +315,16 @@ def parse_bool(value: str, name: str) -> bool:
 
 class Release(NamedTuple):
     """The release of the run: its ``tag``, or the ``error`` of the lookup; both are
-    None if the repository has no stable release."""
+    None if the repository has no GitHub release."""
 
     tag: str | None
     error: str | None = None
 
 
 def resolve_release(github: GitHubClient, repository: str) -> Release:
-    """The release to scan: the latest GitHub release, else the newest stable
-    ``[v]X.Y.Z`` git tag of the repository."""
+    """The release to scan: the latest GitHub release, as it is."""
     try:
         tag = github.latest_release_tag(repository)
-        if tag is None:
-            tag = newest_stable_tag(github.repository_tags(repository))
     except ResolveError as err:
         return Release(None, str(err))
     return Release(tag)
@@ -389,7 +357,7 @@ def resolve_image_targets(
     if release.error is not None:
         targets.append(image_target(None, STATUS_FAILED, release.error))
     elif release.tag is None:
-        reason = "no stable release tag published for this image"
+        reason = "no GitHub release"
         targets.append(image_target(None, STATUS_NOT_APPLICABLE, reason))
     elif (found := find_release_tag(release.tag, tags)) is None:
         reason = f"release {release.tag} not published for this image"
@@ -418,9 +386,7 @@ def resolve_release_source_target(
     if release.error is not None:
         return source_target(STATUS_FAILED, release.error)
     if release.tag is None:
-        return source_target(
-            STATUS_NOT_APPLICABLE, "no stable release tag in the repository"
-        )
+        return source_target(STATUS_NOT_APPLICABLE, "no GitHub release")
     try:
         sha = github.tag_commit_sha(repository, release.tag)
     except ResolveError as err:

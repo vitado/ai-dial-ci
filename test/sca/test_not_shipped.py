@@ -15,7 +15,7 @@ from test_merge_results import (
     Workspace,
     make_targets_doc,
     mr,
-    records_by_cve,
+    records_by_id,
 )
 
 SKIP_RECORD = {
@@ -177,7 +177,7 @@ def test_record_only_in_not_shipped_locations_is_source_only_without_images(
 ) -> None:
     ws = workspace(tmp_path, ["app/", "core/"])
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     # CVE-2000-0003 is only in app/ and core/gradle.lockfile; the record is kept
     assert recs["CVE-2000-0003"]["exposure"] == "source_only"
     assert recs["CVE-2000-0003"]["locations"] == [
@@ -197,7 +197,7 @@ def test_record_also_seen_in_a_shipped_location_keeps_its_exposure(
     ws = workspace(tmp_path, ["app/"])
     ws.run()
     # core/gradle.lockfile holds CVE-2000-0003, too
-    assert records_by_cve(ws)["CVE-2000-0003"]["exposure"] == "development_only"
+    assert records_by_id(ws)["CVE-2000-0003"]["exposure"] == "development_only"
 
 
 def test_images_are_never_matched_by_not_shipped_paths(tmp_path: Path) -> None:
@@ -210,7 +210,7 @@ def test_images_are_never_matched_by_not_shipped_paths(tmp_path: Path) -> None:
     ws.add_part("app-development", "app-development")
     ws.add_part("app-1.0.0", "app-1.0.0")
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     # CVE-2000-0001: the source lockfile is not shipped, the image still counts
     assert recs["CVE-2000-0001"]["exposure"] == "development_only"
     assert recs["CVE-2000-0010"]["exposure"] == "release_and_development"
@@ -226,7 +226,7 @@ def test_not_shipped_source_does_not_make_a_record_development_in_a_run_with_ima
     ws.add_part("app-1.0.0", "app-1.0.0")
     ws.run()
     # without the config, a source finding is source_only here anyway
-    assert records_by_cve(ws)["CVE-2000-0003"]["exposure"] == "source_only"
+    assert records_by_id(ws)["CVE-2000-0003"]["exposure"] == "source_only"
 
 
 def test_without_config_the_outputs_are_those_of_a_run_without_not_shipped_paths(
@@ -318,7 +318,7 @@ def test_skip_paths_scanned_as_non_shipped_count_as_not_shipped(
     ws = workspace(tmp_path, None)
     add_skip_record(ws, skip_dirs=["app", "core"])
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-2000-0003"]["exposure"] == "source_only"
     assert recs["CVE-2000-0001"]["exposure"] == "development_only"
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
@@ -340,7 +340,7 @@ def test_skip_files_count_too(tmp_path: Path) -> None:
     ws = workspace(tmp_path, None)
     add_skip_record(ws, skip_files=["**/gradle.lockfile"])
     ws.run()
-    assert records_by_cve(ws)["CVE-2000-0003"]["exposure"] == "source_only"
+    assert records_by_id(ws)["CVE-2000-0003"]["exposure"] == "source_only"
 
 
 @pytest.mark.parametrize("mode", ["apply", "ignore"])
@@ -350,7 +350,7 @@ def test_skip_paths_of_other_modes_do_not_change_the_classification(
     ws = workspace(tmp_path, None)
     add_skip_record(ws, mode=mode, skip_dirs=["app", "core"], paths_scanned=False)
     ws.run()
-    assert records_by_cve(ws)["CVE-2000-0003"]["exposure"] == "development_only"
+    assert records_by_id(ws)["CVE-2000-0003"]["exposure"] == "development_only"
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "not shipped" not in md
     assert "trivy.yaml skip paths" in md  # still listed in the coverage
@@ -387,7 +387,7 @@ def test_absolute_skip_entries_never_match(tmp_path: Path) -> None:
     ws = workspace(tmp_path, None)
     add_skip_record(ws, skip_dirs=["/app"])
     ws.run()
-    assert records_by_cve(ws)["CVE-2000-0003"]["exposure"] == "development_only"
+    assert records_by_id(ws)["CVE-2000-0003"]["exposure"] == "development_only"
 
 
 @pytest.mark.parametrize(

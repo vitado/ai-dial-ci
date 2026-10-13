@@ -36,7 +36,6 @@ def _load():
 b = _load()
 ew = b.ew
 FEED = b.FEED_URL
-OSV = b.OSV_URL
 
 
 # --- builders ----------------------------------
@@ -93,37 +92,6 @@ def cve_doc(
             "references": [{"url": url} for url in refs],
         }
     return {"cveMetadata": meta, "containers": {"cna": cna}}
-
-
-def osv_doc(
-    osv_id: str,
-    cves: tuple[str, ...],
-    packages: dict[tuple[str, str], list[str]],
-    *,
-    published: str = "2030-01-09T12:00:00Z",
-    withdrawn: str | None = None,
-    fixed: str = "1.2.2",
-    refs: tuple[str, ...] = (),
-) -> dict[str, Any]:
-    """``packages`` maps (OSV ecosystem, name) to the vulnerable versions listed."""
-    events = [{"introduced": "0"}, {"fixed": fixed}]
-    document: dict[str, Any] = {
-        "id": osv_id,
-        "aliases": list(cves),
-        "published": published,
-        "references": [{"type": "WEB", "url": url} for url in refs],
-        "affected": [
-            {
-                "package": {"ecosystem": ecosystem, "name": name},
-                "ranges": [{"type": "SEMVER", "events": events}],
-                "versions": versions,
-            }
-            for (ecosystem, name), versions in packages.items()
-        ],
-    }
-    if withdrawn:
-        document["withdrawn"] = withdrawn
-    return document
 
 
 LOG_HORIZON = "2029-12-20T00:00:00.000Z"
@@ -224,21 +192,12 @@ class FakeDownloader:
                 f"{FEED}/{ew.hourly_asset(now.date(), hour)}", delta()
             )
 
-    def osv(self, *docs: dict[str, Any]) -> None:
-        """The OSV exports: each has a filler package of its ecosystem, and the given
-        records (a record is in the export of each of its ecosystems)."""
-        for export in b.OSV_EXPORTS:
-            filler = osv_doc(f"GHSA-fill-{export}", (), {(export, "filler"): []})
-            members = {f"{d['id']}.json": d for d in [filler, *docs]}
-            self.files[f"{OSV}/{export}/all.zip"] = zip_bytes(members)
-
 
 @pytest.fixture
 def net() -> FakeDownloader:
     fake = FakeDownloader()
     fake.complete_feed()
     fake.whole(TODAY)
-    fake.osv()
     fake.log()
     return fake
 
@@ -257,15 +216,6 @@ def previous_of(built: Any, tmp_path: Path) -> Any:
     out = tmp_path / "previous"
     b.write_index(built, out)
     return b.read_previous(out)
-
-
-def evidence_of(built: Any, cve: str) -> list[dict[str, Any]]:
-    return [line for line in built.reputation.evidence if line["cve"] == cve]
-
-
-def verdict(built: Any, cve: str) -> str:
-    (line,) = evidence_of(built, cve)
-    return line["verdict"] + (":" + line["reason"] if "reason" in line else "")
 
 
 # --- the feed: completeness -------------------------------------------------------
@@ -423,24 +373,17 @@ def test_a_delta_that_is_not_a_zip_fails(net: FakeDownloader, tmp_path: Path) ->
         deltas(net, tmp_path, day)
 
 
-def test_a_rejected_record_keeps_the_claims_of_the_record_it_replaces() -> None:
+def test_a_rejected_record_replaces_the_record_it_follows() -> None:
     published = b.index_record(
         cve_doc("CVE-2030-1", affected=[pkg_entry("left-pad")], updated=stamp(8)), "t"
     )
     rejected = b.index_record(
         cve_doc("CVE-2030-1", state="REJECTED", updated=stamp(9)), "t"
     )
-    assert rejected["affected"] == []
-    assert set(rejected) == {
-        *("cve", "state", "published", "updated"),
-        "assigner",
-        "affected",
-    }
+    assert set(rejected) == {*("cve", "state", "published", "updated"), "assigner"}
     records = {"CVE-2030-1": published}
     b.merge_record(records, rejected)
     assert records["CVE-2030-1"]["state"] == "REJECTED"
-    assert records["CVE-2030-1"]["affected"] == published["affected"]
-    assert records["CVE-2030-1"]["published"] == published["published"]
     # an older version that comes later does not bring it back
     b.merge_record(records, published)
     assert records["CVE-2030-1"]["state"] == "REJECTED"
@@ -449,15 +392,19 @@ def test_a_rejected_record_keeps_the_claims_of_the_record_it_replaces() -> None:
 # --- the build: bootstrap, incremental, resync --------------------------------------
 
 
-def test_bootstrap_applies_the_window_deltas_then_the_whole_list(
+def test_bootstrap_is_the_whole_list_and_the_deltas_from_its_day(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
-    net.eod(TODAY - timedelta(days=4), cve_doc("CVE-2030-1", affected=[pkg_entry("a")]))
-    # in no delta (updated around midnight), but in the whole list
-    midnight = cve_doc("CVE-2030-2", published=stamp(10, 0), affected=[pkg_entry("b")])
+    # in the whole list, which has what the deltas lack (updated around midnight)
+    midnight = cve_doc("CVE-2030-1", published=stamp(10, 0), affected=[pkg_entry("a")])
     net.whole(TODAY, midnight)
+    net.hour(TODAY, 5, cve_doc("CVE-2030-2", published=stamp(10, 5)))
     built = run_build(net, tmp_path)
     assert set(built.records) == {"CVE-2030-1", "CVE-2030-2"}
+    # the deltas of the days before the whole list are not needed
+    assert not any(
+        ew.end_of_day_asset(TODAY - timedelta(days=1)) in url for url in net.requested
+    )
     meta = built.metadata
     assert meta["mode"] == "bootstrap"
     assert meta["baseline"] == "2030-01-10"
@@ -498,8 +445,8 @@ def test_incremental_build_updates_rejects_and_prunes(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
     claim = [pkg_entry("left-pad")]
-    net.eod(
-        TODAY - timedelta(days=3),
+    net.whole(
+        TODAY,
         cve_doc("CVE-2030-1", affected=claim, published=stamp(7)),
         cve_doc("CVE-2030-2", affected=claim, published=stamp(7)),
         cve_doc("CVE-2030-3", affected=claim, published=stamp(5, 13)),
@@ -529,11 +476,9 @@ def test_incremental_build_updates_rejects_and_prunes(
     assert second.records["CVE-2030-1"]["affected"][0]["versions"][0]["lessThan"] == "9"
     rejected = second.records["CVE-2030-2"]
     assert rejected["state"] == "REJECTED"
-    assert rejected["affected"] == claim
     assert "CVE-2030-4" in second.records
     # CVE-2030-3 was updated before the window of the second build starts
     assert "CVE-2030-3" not in second.records
-    assert verdict(second, "CVE-2030-2") == "error:rejected"
     assert second.metadata["counts"]["rejected"] == 1
 
 
@@ -562,7 +507,7 @@ def test_the_whole_list_is_not_downloaded_by_an_incremental_build(
     assert not any("all_CVEs_at_midnight" in url for url in net.requested)
 
 
-def test_the_claims_of_a_rejection_survive_the_whole_list(
+def test_a_rejection_of_the_whole_list_replaces_the_published_version(
     net: FakeDownloader, tmp_path: Path
 ) -> None:
     # the deltas have the published version, the whole list the rejected one
@@ -571,7 +516,6 @@ def test_the_claims_of_a_rejection_survive_the_whole_list(
     net.whole(TODAY, cve_doc("CVE-2030-1", state="REJECTED", updated=stamp(10, 0)))
     built = run_build(net, tmp_path)
     assert built.records["CVE-2030-1"]["state"] == "REJECTED"
-    assert verdict(built, "CVE-2030-1") == "error:rejected"
 
 
 def test_an_index_that_ends_before_the_window_starts_is_a_bootstrap(
@@ -584,9 +528,9 @@ def test_an_index_that_ends_before_the_window_starts_is_a_bootstrap(
     built = run_build(net, tmp_path, previous, later)
     assert built.metadata["mode"] == "bootstrap"
     assert built.metadata["baseline"] == str(later.date())
-    # every day of its window was fetched: it is not connected to the old index
+    # the deltas of the old index are of no use: the whole list starts it again
     first_day = ew.end_of_day_asset(later.date() - timedelta(days=WINDOW))
-    assert any(first_day in url for url in net.requested)
+    assert not any(first_day in url for url in net.requested)
 
 
 # --- reconciliation with the delta log ---------------------------------------------
@@ -762,7 +706,6 @@ def test_the_21_records_that_the_deltas_lost_around_midnight(
     now = datetime(2026, 10, 12, 12, 30, 0, tzinfo=UTC)
     window = 10
     net = FakeDownloader()
-    net.osv()
     day = (now - timedelta(days=window)).date()
     while day < now.date():
         net.eod(day)  # the deltas are all there, and without those records
@@ -841,329 +784,6 @@ def test_a_previous_index_that_is_missing_or_broken_fails(
     (out / b.RECORDS_FILE).write_bytes(b"not gzip")
     with pytest.raises(b.FormatError):
         b.read_previous(out)
-
-
-# --- claims and verdicts ----------------------------------
-
-
-def one_claim(
-    net: FakeDownloader,
-    tmp_path: Path,
-    affected: dict[str, Any],
-    *osv_docs: dict[str, Any],
-    **doc: Any,
-) -> Any:
-    """Build an index of one CVE (CVE-2030-1) with one entry and the OSV records."""
-    net.eod(
-        TODAY - timedelta(days=1), cve_doc("CVE-2030-1", affected=[affected], **doc)
-    )
-    net.osv(*osv_docs)
-    return run_build(net, tmp_path)
-
-
-def mapping(*cves: str, **packages: list[str]) -> dict[str, Any]:
-    """An OSV record of the CVEs for npm packages (the keys are their names)."""
-    return osv_doc("GHSA-1", cves, {("npm", name): v for name, v in packages.items()})
-
-
-@pytest.mark.parametrize(
-    ("claimed", "ecosystem", "osv_name"),
-    [
-        ("Left-Pad", "npm", "left-pad"),
-        ("@scope/Pkg", "npm", "@scope/pkg"),
-        ("Foo_Bar.baz", "PyPI", "foo-bar-baz"),
-        ("foo_bar", "crates.io", "foo-bar"),
-        ("com.google.guava:guava", "Maven", "com.google.guava:guava"),
-        ("guava", "Maven", "com.google.guava:guava"),  # the artifact id
-        ("bcprov", "Maven", "org.bouncycastle:bcprov-jdk18on"),  # the BC family
-    ],
-)
-def test_a_package_claim_is_confirmed_by_the_same_package_of_an_ecosystem(
-    net: FakeDownloader, tmp_path: Path, claimed: str, ecosystem: str, osv_name: str
-) -> None:
-    record = osv_doc("GHSA-1", ("CVE-2030-1",), {(ecosystem, osv_name): []})
-    built = one_claim(net, tmp_path, pkg_entry(claimed), record)
-    assert verdict(built, "CVE-2030-1") == "confirmed"
-    assert built.reputation.cnas == {
-        "acme": {"confirmed": 1, "errors": 0, "pending": 0}
-    }
-
-
-def test_the_evidence_of_a_claim(net: FakeDownloader, tmp_path: Path) -> None:
-    built = one_claim(
-        net,
-        tmp_path,
-        pkg_entry("left-pad"),
-        mapping("CVE-2030-1", **{"left-pad": ["1.0.0"]}),
-        osv_doc("PYSEC-1", ("CVE-2030-1", "GHSA-1"), {("PyPI", "left-pad"): []}),
-    )
-    (line,) = built.reputation.evidence
-    assert line == {
-        "cve": "CVE-2030-1",
-        "cna": "acme",
-        "package": "left-pad",
-        "repo": None,
-        "ecosystems": ["npm", "pypi", "maven", "cargo"],
-        "verdict": "confirmed",
-        "osv": ["GHSA-1", "PYSEC-1"],
-    }
-
-
-def test_the_cve_may_be_the_id_of_the_osv_record(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    record = osv_doc("CVE-2030-1", (), {("npm", "left-pad"): []})
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"), record)
-    assert verdict(built, "CVE-2030-1") == "confirmed"
-
-
-def test_packages_of_other_ecosystems_are_not_a_mapping(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    record = osv_doc("GHSA-1", ("CVE-2030-1",), {("NuGet", "left-pad"): []})
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"), record)
-    assert verdict(built, "CVE-2030-1") == "pending"
-
-
-def test_nothing_mapped_is_pending(net: FakeDownloader, tmp_path: Path) -> None:
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"))
-    assert verdict(built, "CVE-2030-1") == "pending"
-    assert built.reputation.cnas["acme"]["pending"] == 1
-
-
-def test_osv_mapping_only_other_packages_is_an_error(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    record = mapping("CVE-2030-1", **{"right-pad": []})
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"), record)
-    assert verdict(built, "CVE-2030-1") == "error:other_package"
-    assert built.reputation.cnas["acme"]["errors"] == 1
-
-
-def test_a_claim_of_a_registry_is_judged_in_its_ecosystem_only(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    claim = pkg_entry("left-pad", collectionURL="https://pypi.org/project")
-    # an npm package of that name is not a mapping of a PyPI claim
-    built = one_claim(net, tmp_path, claim, mapping("CVE-2030-1", **{"left-pad": []}))
-    assert verdict(built, "CVE-2030-1") == "pending"
-    assert evidence_of(built, "CVE-2030-1")[0]["ecosystems"] == ["pypi"]
-
-
-def test_a_claim_of_a_foreign_registry_is_not_a_claim(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    claim = pkg_entry("left-pad", collectionURL="https://access.redhat.com/")
-    assert one_claim(net, tmp_path, claim).reputation.evidence == []
-
-
-def test_a_rejected_cve_is_an_error(net: FakeDownloader, tmp_path: Path) -> None:
-    claim = cve_doc("CVE-2030-1", affected=[pkg_entry("left-pad")], updated=stamp(8))
-    net.eod(TODAY - timedelta(days=2), claim)
-    rejected = cve_doc("CVE-2030-1", state="REJECTED", updated=stamp(9))
-    net.eod(TODAY - timedelta(days=1), rejected)
-    assert verdict(run_build(net, tmp_path), "CVE-2030-1") == "error:rejected"
-
-
-def test_a_withdrawn_advisory_is_an_error_unless_another_one_confirms(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    packages = {("npm", "left-pad"): []}
-    withdrawn = osv_doc(
-        "GHSA-1", ("CVE-2030-1",), packages, withdrawn="2030-01-09T20:00:00Z"
-    )
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"), withdrawn)
-    assert verdict(built, "CVE-2030-1") == "error:withdrawn"
-    live = osv_doc("GHSA-2", ("CVE-2030-1",), packages)
-    built = one_claim(net, tmp_path, pkg_entry("left-pad"), withdrawn, live)
-    assert verdict(built, "CVE-2030-1") == "confirmed"
-
-
-def osv_package(**fields: Any) -> Any:
-    values: dict[str, Any] = {
-        "osv_id": "GHSA-1",
-        "ecosystem": "npm",
-        "name": "left-pad",
-        "published": datetime(2030, 1, 9, 12, 0, tzinfo=UTC),
-        "withdrawn": None,
-        "fixed": (),
-        "versions": (),
-        "repos": frozenset(),
-    }
-    return b.OsvPackage(**{**values, **fields})
-
-
-def test_the_databases_as_of_a_time() -> None:
-    record = b.index_record(
-        cve_doc("CVE-2030-1", affected=[pkg_entry("left-pad")], published=stamp(9, 10)),
-        "t",
-    )
-    withdrawn_at = datetime(2030, 1, 9, 14, 0, tzinfo=UTC)
-    osv = {"CVE-2030-1": [osv_package(withdrawn=withdrawn_at)]}
-    start = datetime(2030, 1, 5, tzinfo=UTC)
-
-    def counts(hour: int) -> dict[str, int]:
-        as_of = datetime(2030, 1, 9, hour, 0, tzinfo=UTC)
-        return b.evaluate([record], osv, start, as_of).cnas["acme"]
-
-    assert counts(11)["pending"] == 1  # the record was not there yet
-    assert counts(13)["confirmed"] == 1
-    assert counts(15)["errors"] == 1  # it was withdrawn in the meantime
-    # a record that is published after the time is not in the window of that time
-    assert (
-        b.evaluate([record], osv, start, datetime(2030, 1, 9, 9, tzinfo=UTC)).cnas == {}
-    )
-
-
-def test_reputation_is_over_the_records_published_in_the_window(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    claim = [pkg_entry("left-pad")]
-    long_ago = "2029-06-01T10:00:00.000Z"
-    net.eod(
-        TODAY - timedelta(days=1),
-        # published long ago, updated now: in the index, not in the reputation
-        cve_doc("CVE-2030-1", affected=claim, published=long_ago, updated=stamp(9)),
-        cve_doc("CVE-2030-2", affected=claim),
-        cve_doc("CVE-2030-3", affected=claim, assigner="other"),
-        cve_doc("CVE-2030-4", affected=[entry(vendor="v", product="p")]),  # no claim
-    )
-    net.osv(mapping("CVE-2030-2", **{"left-pad": []}))
-    built = run_build(net, tmp_path)
-    assert set(built.records) == {f"CVE-2030-{n}" for n in (1, 2, 3, 4)}
-    assert built.reputation.cnas == {
-        "acme": {"confirmed": 1, "errors": 0, "pending": 0},
-        "other": {"confirmed": 0, "errors": 0, "pending": 1},
-    }
-    assert built.metadata["counts"] == {
-        **{"records": 4, "rejected": 0, "claims": 2, "confirmed": 1},
-        **{"errors": 0, "pending": 1, "cnas": 2, "reconciled": 0},
-    }
-
-
-def test_one_claim_per_cve_and_package(net: FakeDownloader, tmp_path: Path) -> None:
-    entries = [pkg_entry("left-pad"), pkg_entry("Left_Pad", "1.0")]
-    net.eod(TODAY - timedelta(days=1), cve_doc("CVE-2030-1", affected=entries))
-    assert len(run_build(net, tmp_path).reputation.evidence) == 1
-
-
-# --- repository claims ----------------------------------
-
-
-def test_a_repository_claim_is_confirmed_by_a_record_that_links_it(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    advisory = "https://github.com/google/guava/security/advisories/GHSA-1"
-    record = osv_doc(
-        "GHSA-1",
-        ("CVE-2030-1",),
-        {("Maven", "com.google.guava:guava"): []},
-        refs=(advisory,),
-    )
-    claim = repo_entry("https://github.com/Google/Guava")
-    built = one_claim(net, tmp_path, claim, record)
-    assert verdict(built, "CVE-2030-1") == "confirmed"
-    assert evidence_of(built, "CVE-2030-1")[0]["repo"] == "github.com/google/guava"
-
-
-def test_a_repository_claim_is_pending_when_the_mapping_does_not_link_it(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    other = osv_doc(
-        "GHSA-1",
-        ("CVE-2030-1",),
-        {("Maven", "x:y"): []},
-        refs=("https://example.org/x",),
-    )
-    claim = repo_entry("https://github.com/google/guava")
-    assert verdict(one_claim(net, tmp_path, claim, other), "CVE-2030-1") == "pending"
-
-
-def test_a_repository_that_is_not_a_code_host_is_not_a_claim(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    claim = repo_entry("https://git.kernel.org/pub/scm/linux")
-    assert one_claim(net, tmp_path, claim).reputation.evidence == []
-
-
-# --- ranges ----------------------------------
-
-
-def test_a_range_that_disagrees_with_osv_is_flagged_and_still_confirmed(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    # the CNA says every version up to 5.0.7 is affected, OSV fixed 1.1.17 on
-    # another branch: a fixed version is called affected
-    version = {"version": "0", "lessThanOrEqual": "5.0.7", "status": "affected"}
-    claim = entry(
-        packageName="brace-expansion", versions=[{**version, "versionType": "semver"}]
-    )
-    record = osv_doc(
-        "GHSA-1", ("CVE-2030-1",), {("npm", "brace-expansion"): []}, fixed="1.1.17"
-    )
-    built = one_claim(net, tmp_path, claim, record)
-    (line,) = built.reputation.evidence
-    assert line["verdict"] == "confirmed"
-    assert line["range_differs"] is True
-    assert built.reputation.cnas["acme"]["errors"] == 0
-
-
-def test_a_listed_vulnerable_version_that_the_cna_does_not_call_affected_is_flagged(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    record = mapping("CVE-2030-1", **{"left-pad": ["0.5.0", "1.2.1"]})
-    built = one_claim(net, tmp_path, pkg_entry("left-pad", "1.0.0"), record)
-    assert evidence_of(built, "CVE-2030-1")[0]["range_differs"] is True
-
-
-def test_ranges_that_agree_are_not_flagged(net: FakeDownloader, tmp_path: Path) -> None:
-    record = mapping("CVE-2030-1", **{"left-pad": ["1.0.0", "1.2.1"]})
-    built = one_claim(net, tmp_path, pkg_entry("left-pad", "1.2.2"), record)
-    assert "range_differs" not in evidence_of(built, "CVE-2030-1")[0]
-
-
-# --- OSV exports ----------------------------------
-
-
-def test_an_osv_export_without_packages_of_its_ecosystem_fails(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    other = osv_doc("X-1", (), {("npm", "a"): []})
-    net.files[f"{OSV}/crates.io/all.zip"] = zip_bytes({"x.json": other})
-    with pytest.raises(b.FormatError, match="crates.io"):
-        run_build(net, tmp_path)
-
-
-@pytest.mark.parametrize(
-    "content", [b"{broken", json.dumps({"no": "id"}), json.dumps([1])]
-)
-def test_an_osv_record_of_an_unexpected_shape_fails(
-    net: FakeDownloader, tmp_path: Path, content: str | bytes
-) -> None:
-    good = osv_doc("GHSA-fill", (), {("crates.io", "filler"): []})
-    members = {"good.json": good, "bad.json": content}
-    net.files[f"{OSV}/crates.io/all.zip"] = zip_bytes(members)
-    with pytest.raises(b.FormatError):
-        run_build(net, tmp_path)
-
-
-def test_an_osv_export_that_is_missing_or_not_a_zip_fails(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    del net.files[f"{OSV}/Maven/all.zip"]
-    with pytest.raises(b.DownloadError, match="Maven"):
-        run_build(net, tmp_path)
-    net.files[f"{OSV}/Maven/all.zip"] = b"<html>"
-    with pytest.raises(b.FormatError, match="Maven"):
-        run_build(net, tmp_path)
-
-
-def test_the_osv_export_times_are_in_the_metadata(
-    net: FakeDownloader, tmp_path: Path
-) -> None:
-    meta = run_build(net, tmp_path).metadata
-    assert set(meta["osv"]) == {"npm", "PyPI", "Maven", "crates.io"}
-    assert meta["osv"]["npm"] == {"last_modified": "Wed, 09 Jan 2030 00:00:00 GMT"}
 
 
 # --- the downloader ----------------------------------
@@ -1263,17 +883,13 @@ def test_main_writes_the_index_and_a_summary(
     net: FakeDownloader, tmp_path: Path, capsys: Any
 ) -> None:
     claim = cve_doc("CVE-2030-1", affected=[pkg_entry("left-pad")])
-    net.eod(TODAY - timedelta(days=1), claim)
+    net.whole(TODAY, claim)
     summary = tmp_path / "summary.md"
     args = main_args(tmp_path, "--summary-file", str(summary))
     assert b.main(args, net, NOW) == 0
     out = tmp_path / "index"
     assert {p.name for p in out.iterdir()} == set(b.INDEX_FILES)
     assert not (tmp_path / "work").exists()
-    reputation = json.loads((out / b.REPUTATION_FILE).read_text(encoding="utf-8"))
-    assert reputation["schema_version"] == 1
-    assert reputation["as_of"] == "2030-01-10T12:30:00Z"
-    assert reputation["cnas"] == {"acme": {"confirmed": 0, "errors": 0, "pending": 1}}
     with gzip.open(out / b.RECORDS_FILE, "rt", encoding="utf-8") as src:
         assert [json.loads(line)["cve"] for line in src] == ["CVE-2030-1"]
     assert "1 records" in summary.read_text(encoding="utf-8")
@@ -1296,7 +912,7 @@ def test_main_uses_the_previous_index(net: FakeDownloader, tmp_path: Path) -> No
 def test_main_fails_without_an_index_when_an_input_fails(
     net: FakeDownloader, tmp_path: Path, capsys: Any
 ) -> None:
-    net.fail.add(f"{OSV}/npm/all.zip")
+    net.fail.add(f"{FEED}/{b.baseline_asset(TODAY)}")
     assert b.main(main_args(tmp_path), net, NOW) == 1
     assert not (tmp_path / "index").exists()
     assert "::error title=CVE index not built::" in capsys.readouterr().err

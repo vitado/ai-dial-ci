@@ -2,61 +2,34 @@
 """Build the CVE index of the SCA early warning.
 
 The early warning matches CVE records (cvelistV5, published by the CVE Numbering
-Authorities, CNAs) with the packages of a scan. Two things are the same for every
-caller and are expensive to find out per run, so this script builds them once a
-day: the records of the last 180 days, and how far each CNA can be trusted to name
-the right package (its reputation). Bulk data only, no per-CVE request:
+Authorities, CNAs) with the packages of a scan. The records of the last 180 days
+are the same for every caller and are expensive to find out per run, so this script
+builds them once a day. Bulk data only, no per-CVE request:
 
   * the CVE records: the ``end_of_day`` and hourly delta zips of the cvelistV5
     GitHub releases; to start with, the whole list
-    (``*_all_CVEs_at_midnight.zip.zip``) is merged in, too: it loses the claims of
-    the records that were rejected, which the deltas keep, and the deltas have
-    holes that no check of their assets finds (what was updated around midnight
-    is in none of them), which the whole list has not;
+    (``*_all_CVEs_at_midnight.zip.zip``) and the deltas from its day on: the deltas
+    have holes that no check of their assets finds (what was updated around
+    midnight is in none of them), which the whole list has not;
   * ``cves/deltaLog.json`` of the cvelistV5 repository, which lists every record
     that changed and when: a record that it lists and that the deltas did not
     bring (such a hole, or a delta that is missing) is fetched on its own;
-  * what the vulnerability databases say: the OSV exports of npm, PyPI, Maven and
-    crates.io (``<ecosystem>/all.zip``; the reviewed GitHub advisories are in them);
   * the previous index (``--previous-dir``), to which the new deltas are applied.
 
 Outputs (``--output-dir``), ``schema_version: 1``:
   * ``cves.jsonl.gz`` - one slim CVE record per line (what the matcher of the early
     warning reads, in the form of ``early_warning.slim_record``) for the records
-    published or updated in the window, and the REJECTED ones that have claims;
-  * ``reputation.json`` - per CNA, over the claims of the records published in the
-    window: ``confirmed``, ``errors``, ``pending`` (see below);
-  * ``evidence.jsonl.gz`` - one line per evaluated claim: why it counts as it does;
+    published or updated in the window, and the REJECTED ones (a rejection replaces
+    the published version of its record);
   * ``metadata.json`` - when it was built, what it covers, the gaps of the feed,
-    the OSV exports used, the counts.
-
-Claims. A CNA entry claims a package (``packageName``, with ``collectionURL``
-naming the registry when it does) or a repository (``repo`` of a code host) for
-npm, PyPI, Maven or Cargo; one claim per CVE and package or repository. The OSV
-exports then say:
-
-  confirmed  an OSV record that has the CVE (its id or an alias) maps a package
-             that agrees with the claimed name (the agreement the matcher of the
-             early warning requires of a CNA entry), or, for a repository, a
-             package of a record that links that repository;
-  errors     the CVE is REJECTED, or OSV maps it only to other packages of the
-             claimed ecosystems, or the record that confirmed it was withdrawn;
-  pending    nothing maps the CVE yet (or, for a repository, nothing that links it).
-
-A confirmed claim whose affected versions disagree with OSV (the CNA says a fixed
-version is affected or a version OSV lists as vulnerable is not) is flagged
-``range_differs`` in the evidence and is not counted as an error: it is the package
-the CNA is trusted for here, and judging ranges across version schemes is a problem
-of its own. How far a CNA is believed is not decided here: the early warning shows
-the counts of a CNA as the confidence of its signals, without a threshold.
+    the counts.
 
 A feed with holes does not fail the build: every hour of every day of the covered
 span must be covered by the ``end_of_day`` delta of its day or by its own hourly
 delta, and what is not is listed in ``gaps`` of ``metadata.json``. Anything else
 that is not as expected (a download that fails after its retries, a file that
-cannot be read, a record of an unknown shape, an OSV export without packages)
-fails the build, and nothing is written: the index of the day before stays the
-latest one.
+cannot be read, a record of an unknown shape) fails the build, and nothing is
+written: the index of the day before stays the latest one.
 
 The download layer is injectable (``Downloader.fetch(url, dest)``), so the logic is
 tested with no network. Python standard library only; the helpers of the matcher
@@ -78,7 +51,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -94,7 +66,6 @@ DELTA_LOG_URL = (
     "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/deltaLog.json"
 )
 RECORDS_URL = "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves"
-OSV_URL = "https://osv-vulnerabilities.storage.googleapis.com"
 USER_AGENT = "ai-dial-ci-sca-build-cve-index"
 
 SCHEMA_VERSION = 1
@@ -103,12 +74,6 @@ MAX_WINDOW_DAYS = 365
 # The deltas of this many days before the previous index ended are fetched again:
 # an end_of_day delta is published after midnight and a delta can come late
 RESCAN_DAYS = 2
-
-# OSV export name -> ecosystem name of the early warning
-OSV_EXPORTS = {"npm": "npm", "PyPI": "pypi", "Maven": "maven", "crates.io": "cargo"}
-ECOSYSTEMS = ew.ECOSYSTEMS
-# the repositories of packages are those of code hosts (Linux's is git.kernel.org)
-CODE_HOSTS = ("github.com", "gitlab.com", "bitbucket.org")
 
 REQUEST_TIMEOUT_SECONDS = 60.0
 MAX_ATTEMPTS = 4
@@ -122,18 +87,9 @@ MAX_MEMBER_BYTES = 16 * 1024 * 1024
 STATE_PUBLISHED = "PUBLISHED"
 STATE_REJECTED = "REJECTED"
 
-VERDICT_CONFIRMED = "confirmed"
-VERDICT_ERROR = "error"
-VERDICT_PENDING = "pending"
-REASON_REJECTED = "rejected"
-REASON_WITHDRAWN = "withdrawn"
-REASON_OTHER_PACKAGE = "other_package"
-
 RECORDS_FILE = "cves.jsonl.gz"
-REPUTATION_FILE = "reputation.json"
-EVIDENCE_FILE = "evidence.jsonl.gz"
 METADATA_FILE = "metadata.json"
-INDEX_FILES = (RECORDS_FILE, REPUTATION_FILE, EVIDENCE_FILE, METADATA_FILE)
+INDEX_FILES = (RECORDS_FILE, METADATA_FILE)
 
 
 class IndexBuildError(Exception):
@@ -242,7 +198,7 @@ def index_record(document: Any, where: str) -> dict[str, Any]:
         raise FormatError(f"{where}: no usable dates")
     if record["state"] == STATE_REJECTED:
         # nothing else of a rejected record is of use
-        keep = ("cve", "state", "published", "updated", "assigner", "affected")
+        keep = ("cve", "state", "published", "updated", "assigner")
         record = {k: record[k] for k in keep}
     return record
 
@@ -273,17 +229,12 @@ def read_cve_zip(path: Path, cutoff: datetime) -> Iterator[dict[str, Any]]:
 
 
 def merge_record(records: dict[str, dict[str, Any]], new: dict[str, Any]) -> None:
-    """Keep the latest version of each record. A REJECTED record keeps the claims of
-    the version it replaces (a rejected record has no ``affected`` of its own): a
-    CNA that rejects what it claimed made an error, and the reputation counts it.
-    """
+    """Keep the latest version of each record."""
     known = records.get(new["cve"])
     if known is not None and ew.parse_time(new["updated"]) < ew.parse_time(  # type: ignore[operator]
         known["updated"]
     ):
         return
-    if new["state"] == STATE_REJECTED and known is not None:
-        new = {**new, "published": known["published"], "affected": known["affected"]}
     records[new["cve"]] = new
 
 
@@ -512,274 +463,6 @@ def gaps_of(ranges: Iterable[Mapping[str, str]]) -> set[datetime]:
 
 
 # --------------------------------------------------------------------------
-# What the vulnerability databases say (OSV)
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class OsvPackage:
-    """One package that an OSV record maps a CVE to."""
-
-    osv_id: str
-    ecosystem: str
-    name: str
-    published: datetime | None
-    withdrawn: datetime | None
-    fixed: tuple[str, ...]  # versions that fix it, by the ranges of the record
-    versions: tuple[str, ...]  # versions the record lists as vulnerable
-    repos: frozenset[str]  # repositories the record links (references, git ranges)
-
-
-def osv_repos(document: Mapping[str, Any]) -> frozenset[str]:
-    urls = [r.get("url") for r in document.get("references") or []]
-    for affected in document.get("affected") or []:
-        urls += [r.get("repo") for r in affected.get("ranges") or []]
-    return frozenset(r for r in map(ew.normalize_repo, urls) if r)
-
-
-def osv_packages(document: Mapping[str, Any]) -> dict[tuple[str, str], list[Any]]:
-    """The ``affected`` entries of a record by (ecosystem, package name), for the
-    packages of the ecosystems of the early warning.
-    """
-    packages: dict[tuple[str, str], list[Any]] = {}
-    for affected in document.get("affected") or []:
-        package = affected.get("package") or {}
-        ecosystem = OSV_EXPORTS.get(str(package.get("ecosystem", "")).split(":")[0])
-        if ecosystem and package.get("name"):
-            packages.setdefault((ecosystem, package["name"]), []).append(affected)
-    return packages
-
-
-def load_osv(
-    exports: Mapping[str, Path], wanted: set[str]
-) -> dict[str, list[OsvPackage]]:
-    """The packages that OSV maps the ``wanted`` CVEs to, from the exports.
-
-    A record maps a CVE if the CVE is its id or one of its aliases. Only packages
-    of npm, PyPI, Maven and crates.io count, in whichever export the record is. An
-    export without any package of its ecosystem is a FormatError: the exports
-    changed, or the download is not one.
-    """
-    mapped: dict[str, dict[tuple[str, str, str], OsvPackage]] = {}
-    for export, path in exports.items():
-        found = 0
-        try:
-            archive = zipfile.ZipFile(path)
-        except zipfile.BadZipFile as err:
-            raise FormatError(f"OSV {export}: not a valid zip file: {err}") from err
-        with archive:
-            for info in archive.infolist():
-                if not info.filename.endswith(".json"):
-                    continue
-                where = f"OSV {export}:{info.filename}"
-                if info.file_size > MAX_MEMBER_BYTES:
-                    raise FormatError(f"{where}: {info.file_size} bytes")
-                try:
-                    document = json.loads(archive.read(info))
-                except ValueError as err:
-                    raise FormatError(f"{where}: unreadable: {err}") from err
-                if not isinstance(document, dict) or not document.get("id"):
-                    raise FormatError(f"{where}: no id")
-                packages = osv_packages(document)
-                found += any(e == OSV_EXPORTS[export] for e, _ in packages)
-                cves = {i for i in [document["id"], *(document.get("aliases") or [])]}
-                cves &= wanted
-                if not cves:
-                    continue
-                for (ecosystem, name), entries in packages.items():
-                    fixed = tuple(
-                        str(event["fixed"])
-                        for entry in entries
-                        for rng in entry.get("ranges") or []
-                        if rng.get("type") in ("ECOSYSTEM", "SEMVER")
-                        for event in rng.get("events") or []
-                        if event.get("fixed")
-                    )
-                    versions = tuple(
-                        str(v) for e in entries for v in e.get("versions") or []
-                    )
-                    package = OsvPackage(
-                        document["id"],
-                        ecosystem,
-                        name,
-                        ew.parse_time(document.get("published")),
-                        ew.parse_time(document.get("withdrawn")),
-                        fixed,
-                        versions,
-                        osv_repos(document),
-                    )
-                    for cve in cves:
-                        mapped.setdefault(cve, {})[
-                            (package.osv_id, ecosystem, name)
-                        ] = package
-        if not found:
-            raise FormatError(f"OSV {export}: no package of its ecosystem in it")
-    return {
-        cve: sorted(found.values(), key=lambda p: (p.osv_id, p.name))
-        for cve, found in mapped.items()
-    }
-
-
-# --------------------------------------------------------------------------
-# Claims and reputation
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class Claim:
-    cve: str
-    cna: str
-    package: str | None  # the claimed name, or None for a claim of a repository
-    repo: str | None
-    ecosystems: tuple[str, ...]
-    entries: list[Mapping[str, Any]] = field(default_factory=list)
-
-
-def claims_of(record: Mapping[str, Any]) -> list[Claim]:
-    """The package or repository claims of a record, one per package or repository."""
-    claims: dict[tuple[Any, ...], Claim] = {}
-    cna = record.get("assigner") or "unknown"
-    for entry in record["affected"]:
-        name = entry.get("packageName")
-        repo = ew.normalize_repo(entry.get("repo"))
-        if isinstance(name, str) and name.strip():
-            registry = ew.registry_ecosystem(entry.get("collectionURL"))
-            if registry == ew.FOREIGN_REGISTRY:
-                continue
-            ecosystems = (registry,) if registry else ECOSYSTEMS
-            key: tuple[Any, ...] = ("package", ew.squash(name), ecosystems)
-            claim = Claim(record["cve"], cna, name.strip(), None, ecosystems)
-        elif repo and repo.split("/")[0] in CODE_HOSTS:
-            key = ("repo", repo)
-            claim = Claim(record["cve"], cna, None, repo, ECOSYSTEMS)
-        else:
-            continue
-        claims.setdefault(key, claim).entries.append(entry)
-    return list(claims.values())
-
-
-def claims_in_window(
-    records: Iterable[Mapping[str, Any]], window_start: datetime, as_of: datetime
-) -> Iterator[tuple[Mapping[str, Any], list[Claim]]]:
-    for record in sorted(records, key=lambda r: r["cve"]):
-        published = ew.parse_time(record["published"])
-        if published is None or not window_start <= published <= as_of:
-            continue
-        claims = claims_of(record)
-        if claims:
-            yield record, claims
-
-
-def affected_at(claim: Claim, ecosystem: str, version: str) -> bool | None:
-    """What the entries of a claim say about a version: True (affected), False (not
-    affected) or None (cannot tell: another version scheme, a commit, nothing).
-    """
-    statuses = {ew.entry_status(ecosystem, version, entry) for entry in claim.entries}
-    if statuses & {ew.STATUS_AFFECTED, ew.STATUS_ALL}:
-        return True
-    return False if ew.STATUS_NOT_AFFECTED in statuses else None
-
-
-def ranges_differ(claim: Claim, packages: Iterable[OsvPackage]) -> bool:
-    """Whether the CNA says a version that fixes the CVE by OSV is affected, or that
-    a version that OSV lists as vulnerable is not.
-    """
-    for package in packages:
-        if any(affected_at(claim, package.ecosystem, v) for v in package.fixed):
-            return True
-        if any(
-            affected_at(claim, package.ecosystem, v) is False for v in package.versions
-        ):
-            return True
-    return False
-
-
-def judge(
-    claim: Claim, rejected: bool, mapped: Sequence[OsvPackage], as_of: datetime
-) -> dict[str, Any]:
-    """The evidence line of a claim, as the databases said at ``as_of``."""
-    line: dict[str, Any] = {
-        "cve": claim.cve,
-        "cna": claim.cna,
-        "package": claim.package,
-        "repo": claim.repo,
-        "ecosystems": list(claim.ecosystems),
-    }
-    if rejected:
-        return {**line, "verdict": VERDICT_ERROR, "reason": REASON_REJECTED, "osv": []}
-    known = [
-        p
-        for p in mapped
-        if p.ecosystem in claim.ecosystems and p.published and p.published <= as_of
-    ]
-
-    def supports(package: OsvPackage) -> bool:
-        if claim.package is not None:
-            return ew.name_agrees(
-                claim.package, ew.Package(package.ecosystem, package.name, "")
-            )
-        return claim.repo in package.repos
-
-    live = [p for p in known if not (p.withdrawn and p.withdrawn <= as_of)]
-    confirming = [p for p in live if supports(p)]
-    if confirming:
-        line.update(
-            verdict=VERDICT_CONFIRMED, osv=sorted({p.osv_id for p in confirming})
-        )
-        if ranges_differ(claim, confirming):
-            line["range_differs"] = True
-        return line
-    withdrawn = [p for p in known if p not in live and supports(p)]
-    if withdrawn and not live:
-        return {
-            **line,
-            "verdict": VERDICT_ERROR,
-            "reason": REASON_WITHDRAWN,
-            "osv": sorted({p.osv_id for p in withdrawn}),
-        }
-    if live and claim.package is not None:
-        # a package claim that OSV maps only to other packages of its ecosystems
-        return {
-            **line,
-            "verdict": VERDICT_ERROR,
-            "reason": REASON_OTHER_PACKAGE,
-            "osv": sorted({p.osv_id for p in live}),
-        }
-    return {**line, "verdict": VERDICT_PENDING, "osv": []}
-
-
-@dataclass
-class Reputation:
-    evidence: list[dict[str, Any]] = field(default_factory=list)
-    cnas: dict[str, dict[str, int]] = field(default_factory=dict)
-
-
-def evaluate(
-    records: Iterable[Mapping[str, Any]],
-    osv: Mapping[str, Sequence[OsvPackage]],
-    window_start: datetime,
-    as_of: datetime,
-) -> Reputation:
-    """The verdict of every claim of the records published in the window."""
-    result = Reputation()
-    counted = {
-        VERDICT_CONFIRMED: "confirmed",
-        VERDICT_ERROR: "errors",
-        VERDICT_PENDING: "pending",
-    }
-    for record, claims in claims_in_window(records, window_start, as_of):
-        rejected = record["state"] == STATE_REJECTED
-        for claim in claims:
-            line = judge(claim, rejected, osv.get(claim.cve, ()), as_of)
-            result.evidence.append(line)
-            counts = result.cnas.setdefault(
-                claim.cna, {"confirmed": 0, "errors": 0, "pending": 0}
-            )
-            counts[counted[line["verdict"]]] += 1
-    return result
-
-
-# --------------------------------------------------------------------------
 # The index on disk
 # --------------------------------------------------------------------------
 
@@ -838,7 +521,6 @@ def read_previous(directory: Path) -> Previous:
 @dataclass
 class Built:
     records: dict[str, dict[str, Any]]
-    reputation: Reputation
     metadata: dict[str, Any]
 
 
@@ -870,15 +552,14 @@ def build(
             start, min(prev_to.date(), now.date() - timedelta(days=RESCAN_DAYS))
         )
         mode = "incremental"
+    if previous is None or prev_to < cutoff:  # type: ignore[operator]
+        # Nothing the deltas connect to: the whole list, then the deltas from its day
+        start = load_baseline(client, now.date(), cutoff, records)
+        baseline = str(start)
+        mode = "bootstrap"
     apply_deltas(records, client, start, now, cutoff, feed)
     since = datetime(start.year, start.month, start.day, tzinfo=UTC)
-    if previous is None or prev_to < cutoff:  # type: ignore[operator]
-        # Nothing the deltas connect to. After the deltas: a REJECTED record of the
-        # whole list has no claims, the version it replaces in ``records`` has
-        snapshot = load_baseline(client, now.date(), cutoff, records)
-        baseline = str(snapshot)
-        mode = "bootstrap"
-        since = datetime(snapshot.year, snapshot.month, snapshot.day, tzinfo=UTC)
+    if mode == "bootstrap":
         feed.gaps = {h for h in feed.gaps if h >= since}
     # what the deltas missed, and the gaps that are left over from earlier builds
     since = min([since, *feed.gaps])
@@ -893,21 +574,6 @@ def build(
     first_hour = cutoff.replace(minute=0, second=0)
     feed.gaps = {h for h in feed.gaps if h >= first_hour}
 
-    osv_dir = work_dir / "osv"
-    osv_dir.mkdir(parents=True, exist_ok=True)
-    exports: dict[str, Path] = {}
-    osv_info: dict[str, dict[str, Any]] = {}
-    for export in OSV_EXPORTS:
-        dest = osv_dir / f"{export}.zip"
-        headers = downloader.fetch(f"{OSV_URL}/{export}/all.zip", dest)
-        if headers is None:
-            raise DownloadError(f"OSV export {export}: not found")
-        exports[export] = dest
-        osv_info[export] = {"last_modified": headers.get("last-modified")}
-    wanted = {r["cve"] for r, _ in claims_in_window(records.values(), cutoff, now)}
-    reputation = evaluate(records.values(), load_osv(exports, wanted), cutoff, now)
-
-    counts = Counter(line["verdict"] for line in reputation.evidence)
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "built_at": format_time(now),
@@ -921,19 +587,13 @@ def build(
         "last_asset": feed.last_asset
         or (previous.metadata.get("last_asset") if previous else None),
         "gaps": gap_ranges(feed.gaps),
-        "osv": osv_info,
         "counts": {
             "records": len(records),
             "rejected": sum(r["state"] == STATE_REJECTED for r in records.values()),
-            "claims": len(reputation.evidence),
-            "confirmed": counts[VERDICT_CONFIRMED],
-            "errors": counts[VERDICT_ERROR],
-            "pending": counts[VERDICT_PENDING],
-            "cnas": len(reputation.cnas),
             "reconciled": reconciled,
         },
     }
-    return Built(records, reputation, metadata)
+    return Built(records, metadata)
 
 
 def write_index(built: Built, out_dir: Path) -> None:
@@ -941,17 +601,6 @@ def write_index(built: Built, out_dir: Path) -> None:
     meta = built.metadata
     records = (built.records[cve] for cve in sorted(built.records))
     write_jsonl_gz(out_dir / RECORDS_FILE, records)
-    write_jsonl_gz(out_dir / EVIDENCE_FILE, built.reputation.evidence)
-    write_json(
-        out_dir / REPUTATION_FILE,
-        {
-            "schema_version": SCHEMA_VERSION,
-            "as_of": meta["built_at"],
-            "window_days": meta["window_days"],
-            "window_start": meta["covered"]["from"],
-            "cnas": built.reputation.cnas,
-        },
-    )
     write_json(out_dir / METADATA_FILE, meta)
 
 
@@ -968,10 +617,7 @@ def summary_markdown(built: Built, out_dir: Path, seconds: float) -> str:
         "",
         f"- built {meta['built_at']} ({meta['mode']}, {seconds / 60:.1f} min), "
         f"window {meta['window_days']} days, covered to {meta['covered']['to']}",
-        f"- {counts['records']} records ({counts['rejected']} rejected), "
-        f"{counts['claims']} claims: {counts['confirmed']} confirmed, "
-        f"{counts['errors']} errors, {counts['pending']} pending, "
-        f"{counts['cnas']} CNAs",
+        f"- {counts['records']} records ({counts['rejected']} rejected)",
         f"- sizes: {sizes}",
         f"- feed gaps: {len(gaps)}" + (f" ({listed})" if gaps else ""),
     ]

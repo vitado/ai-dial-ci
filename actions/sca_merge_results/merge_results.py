@@ -11,7 +11,7 @@ Inputs:
 
 Outputs (in the output directory):
   * ``_report/vulnerabilities.json`` - the findings only: canonical deduplicated
-    set, one record per (repo, CVE x package x installed version), with the
+    set, one record per (repo, id x package x installed version), with the
     ``exposure`` of the finding (which shipped artifacts carry it), the
     ``scan_targets`` it was found in, its ``locations`` within them and the
     ``scanners`` that reported it;
@@ -51,16 +51,17 @@ shipped. The record stays in ``vulnerabilities.json``.
 
 Early warning (``early-warning/`` part of the sca_early_warning action, when the run
 has one): CVE records whose CNA data matches a language package of the run but that
-no scanner reported. The merge drops the ones whose CVE id or alias is the ``cve`` or
+no scanner reported. The merge drops the ones whose CVE id or alias is the ``id`` or
 an alias of any record (a database maps them now, so a scanner reports them),
 classifies the rest by exposure like a record and reports them in
 ``_report/early_warning.json``, in ``scan_report.json`` (``early_warning``) and in a
 section of ``summary.md``. They are not records: not in ``vulnerabilities.json``,
-not in the scope table, not in the verdict. Every entry carries the ``confidence``
-the part computed (the history of its CNA in the CVE index, or ``name_match``); the
-merge shows it and neither filters nor tiers by it. The part says which CVE index it
-read (``index``: ref, digest, built_at, feed gaps), and the report repeats it. A
-broken or missing part is reported as unavailable, never as an empty result.
+not in the scope table, not in the verdict. Every entry carries the ``match`` the
+part computed, how it was matched (``package_name``, ``source_repo``, ``product_name``
+or ``repo_module``); the merge shows it and neither filters nor tiers by it. The part
+says which CVE index it read (``index``: ref, digest, built_at, feed gaps), and the
+report repeats it. A broken or missing part is reported as unavailable, never as an
+empty result.
 
 A scan that broke is reported as ``failed`` and never looks like a clean
 target. The script still exits 0 once the outputs are written: the workflow
@@ -102,12 +103,14 @@ SEV_ORDER = {name: index for index, name in enumerate(SEVERITIES)}
 UNKNOWN_SEVERITY = "UNKNOWN"
 SCHEMA_VERSION = 1
 SHORT_SHA_LENGTH = 7
+CVE_PREFIX = "CVE-"
 RUN_KINDS = ("full", "partial")
 DIGEST_SHORT_LENGTH = 12
 TRIVY_DB_KEYS = ("vulnerability_db_updated_at", "java_db_updated_at")
 MERGE_KEY = (
-    "(repo, CVE x package x installed-version), merged across scan_targets and "
-    "scanners; a vulnerability only OSV knows is keyed by its OSV id when it has no CVE"
+    "(repo, id x package x installed-version), merged across scan_targets and "
+    "scanners; id is the one Trivy reports, for a vulnerability only OSV knows its "
+    "first CVE, else its first GHSA id, else its first id"
 )
 TARGET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -1027,7 +1030,7 @@ def fixed_in_place(
 
 def blank_record(
     repo: str | None,
-    cve: str | None,
+    vuln_id: str | None,
     pkg: str | None,
     version: str | None,
     pkg_type: str,
@@ -1035,7 +1038,11 @@ def blank_record(
     """A record with nothing known but its key; the scanner fills in the rest."""
     return {
         "repo": repo,
-        "cve": cve,
+        # the id the finding is known by (a CVE, GHSA, DSA, TEMP, RUSTSEC id, ...)
+        "id": vuln_id,
+        # the CVE id of the finding: its id if that is one, else the first CVE of the
+        # aliases, else None (set by ``finish``, once the aliases are complete)
+        "cve": None,
         "aliases": [],
         "pkg": pkg,  # display name, see merge_records
         "version": version,
@@ -1085,8 +1092,10 @@ def new_record(
     vuln: Mapping[str, Any],
 ) -> Record:
     """A record from the first copy of a finding; ``absorb_finding`` adds the rest."""
-    cve, _, version = key
-    record = blank_record(repo, cve, vuln.get("PkgName"), version, package_type(result))
+    vuln_id, _, version = key
+    record = blank_record(
+        repo, vuln_id, vuln.get("PkgName"), version, package_type(result)
+    )
     record.update(
         severity=normalize_severity(vuln.get("Severity")),
         severity_source=vuln.get("SeveritySource") or None,
@@ -1137,7 +1146,7 @@ def absorb_finding(
     absorb_sighting(record, tid, scanner, result, relationships)
     _append_unique(record["pkg_paths"], vuln.get("PkgPath"))
     for alias in vuln.get("VendorIDs") or []:
-        if alias != record["cve"]:
+        if alias != record["id"]:
             _append_unique(record["aliases"], alias)
     fixed_versions = split_fixed_versions(vuln.get("FixedVersion"))
     if fixed_versions and not record["fix_available"]:
@@ -1153,13 +1162,22 @@ def absorb_finding(
 
 
 def record_ids(record: Mapping[str, Any]) -> set[str]:
-    """Every id a record is known by: its ``cve`` and its aliases."""
-    return {record["cve"], *record["aliases"]}
+    """Every id a record is known by: its ``id`` and its aliases."""
+    return {record["id"], *record["aliases"]}
+
+
+def cve_of(record: Mapping[str, Any]) -> str | None:
+    """The CVE id of a record: its ``id`` if that is a CVE, else the first CVE (in
+    string order) of its aliases, else None.
+    """
+    if record["id"].startswith(CVE_PREFIX):
+        return record["id"]
+    return min((a for a in record["aliases"] if a.startswith(CVE_PREFIX)), default=None)
 
 
 class MergeResult(NamedTuple):
     """What the merge knows: the records, where each was seen and which are fixed in
-    place (see ``fixed_in_place``); the last two are keyed by ``(cve, pkg, version)``.
+    place (see ``fixed_in_place``); the last two are keyed by ``(id, pkg, version)``.
     """
 
     records: list[Record]
@@ -1243,7 +1261,7 @@ class RecordSet:
 
         Per package, the OSV ids that alias each other are one vulnerability
         (``osv_vulnerabilities``). It joins every record of the same package
-        version that it shares an id with (the record's ``cve`` or an alias): the
+        version that it shares an id with (the record's ``id`` or an alias): the
         record gains the ``osv`` scanner, the ids and where OSV saw it, and keeps
         everything Trivy said. A vulnerability no record has becomes a record of
         its own, whose package context comes from the Trivy package of the purl.
@@ -1278,13 +1296,13 @@ class RecordSet:
                 key, new_osv_record(self.repo, key, purl, vulnerability, found)
             )
             matched = [key]
-        # Ids of the vulnerability that are the CVE of one of the matched records
+        # Ids of the vulnerability that are the id of one of the matched records
         # stay out of the aliases of the others
-        cves = {self.by_key[key]["cve"] for key in matched}
+        ids = {self.by_key[key]["id"] for key in matched}
         packages = [package]
         for key in matched:
             record = self.by_key[key]
-            for alias in sorted(vulnerability.names - cves):
+            for alias in sorted(vulnerability.names - ids):
                 _append_unique(record["aliases"], alias)
             absorb_sighting(
                 record, tid, SCANNER_OSV, result, package_relationships(packages)
@@ -1303,6 +1321,7 @@ class RecordSet:
             ):
                 record[name].sort()
             record["pkg_paths"].sort()
+            record["cve"] = cve_of(record)
             # OSV may have added targets after the Trivy ones: back to targets order
             record["scan_targets"].sort(key=self._target_order.__getitem__)
             record["dev"] = package_dev_flag(self._dev_packages.get(key, []))
@@ -1313,11 +1332,11 @@ class RecordSet:
                 record["introduced_via"],
             ) = combine_dependency_info(self._chains.get(key, {}).values())
         by_record = {
-            (r["cve"], r["pkg"], r["version"]): self.sightings[key]
+            (r["id"], r["pkg"], r["version"]): self.sightings[key]
             for key, r in self.by_key.items()
         }
         in_place = frozenset(
-            (r["cve"], r["pkg"], r["version"])
+            (r["id"], r["pkg"], r["version"])
             for key, r in self.by_key.items()
             if self._in_place.get(key)
         )
@@ -1336,7 +1355,7 @@ def merge_records(
     targets-file order, which is also the order of each record's ``scan_targets``;
     ``osv_scans`` are the OSV targets, merged into the Trivy records. Returns the
     records (unordered, not enriched yet), where each finding was seen and which
-    findings are fixed in place, keyed by ``(cve, pkg, version)`` of the record. A
+    findings are fixed in place, keyed by ``(id, pkg, version)`` of the record. A
     package seen under several spellings (see ``canonical_package_name``) is shown
     under the spelling of its first image record, else of its first record.
     """
@@ -1706,7 +1725,7 @@ def osv_vulnerabilities(
 
 
 def osv_primary_id(vulnerability: OsvVulnerability) -> str:
-    """The id an OSV-only record is known by (its ``cve``).
+    """The id an OSV-only record is known by (its ``id``).
 
     The first CVE among the ids and aliases (in string order, the only one in
     nearly every case), else the first GHSA id, else the first id OSV reported.
@@ -1815,10 +1834,10 @@ def new_osv_record(
     """A record for a vulnerability only OSV reports, from the OSV records of its
     ids and the Trivy package of the purl.
     """
-    cve, _, version = key
+    vuln_id, _, version = key
     records = vulnerability.records
     record = blank_record(
-        repo, cve, found.package.get("Name"), version, package_type(found.result)
+        repo, vuln_id, found.package.get("Name"), version, package_type(found.result)
     )
     severity = osv_group_severity(records)
     fixed = osv_group_fixes(records, purl, version)
@@ -2118,7 +2137,7 @@ def assign_upgrades(
     """
 
     def needs_upgrade(record: Record) -> bool:
-        identity = (record["cve"], record["pkg"], record["version"])
+        identity = record_identity(record)
         return record["fix_available"] and identity not in in_place
 
     fixed_by_package: dict[tuple[Any, Any], list[list[str]]] = {}
@@ -2146,7 +2165,7 @@ def record_sort_key(record: Record) -> tuple[Any, ...]:
         -(score or 0),
         record["pkg"] or "",
         record["version"] or "",
-        record["cve"] or "",
+        record["id"] or "",
     )
 
 
@@ -2174,9 +2193,8 @@ CVE_RECORD_URL = "https://www.cve.org/CVERecord?id="
 EARLY_WARNING_COLLAPSE_ABOVE = 5
 EARLY_WARNING_GAPS_LISTED = 5
 ADP_SOURCE_PREFIX = "adp:"
-BASIS_CNA_HISTORY = "cna_history"
-BASIS_NAME_MATCH = "name_match"
-CNA_HISTORY_KEYS = ("basis", "cna", "confirmed", "errors", "pending", "ratio")
+# How the part matched a candidate, strongest first (see sca_early_warning)
+EARLY_WARNING_MATCHES = ("package_name", "source_repo", "product_name", "repo_module")
 HEADLINE_SEVERITIES = ("CRITICAL", "HIGH")
 # The fields of an entry of _report/early_warning.json
 EARLY_WARNING_ENTRY_KEYS = (
@@ -2188,8 +2206,7 @@ EARLY_WARNING_ENTRY_KEYS = (
     "title",
     "package",
     "affected_range",
-    "rule",
-    "confidence",
+    "match",
     "severity",
     "severity_source",
     "cvss",
@@ -2321,19 +2338,13 @@ def load_early_warning_part(part_dir: Path) -> tuple[dict[str, Any], Any, list[A
     return status, document.get("generated_from"), candidates
 
 
-def early_warning_confidence(confidence: Any) -> dict[str, Any]:
-    """The confidence of a candidate as the part wrote it: ``{basis: name_match}``, or
-    ``{basis: cna_history, cna, confirmed, errors, pending, ratio}``. TypeError or
-    KeyError if it is anything else.
+def early_warning_match(match: Any) -> str:
+    """How a candidate was matched, as the part wrote it. TypeError if it is not one
+    of ``EARLY_WARNING_MATCHES``.
     """
-    if confidence["basis"] == BASIS_NAME_MATCH:
-        return {"basis": BASIS_NAME_MATCH}
-    history = {key: confidence[key] for key in CNA_HISTORY_KEYS}
-    if history["basis"] != BASIS_CNA_HISTORY or not all(
-        isinstance(history[key], int) for key in ("confirmed", "errors", "pending")
-    ):
-        raise TypeError(f"unknown confidence {confidence!r}")
-    return history
+    if match not in EARLY_WARNING_MATCHES:
+        raise TypeError(f"unknown match {match!r}")
+    return match
 
 
 def early_warning_entry(
@@ -2359,8 +2370,7 @@ def early_warning_entry(
                 "version": package["version"],
             },
             "affected_range": candidate.get("affected_range"),
-            "rule": candidate["rule"],
-            "confidence": early_warning_confidence(candidate["confidence"]),
+            "match": early_warning_match(candidate["match"]),
             "severity": normalize_severity(candidate.get("severity")),
             "severity_source": candidate.get("severity_source"),
             "cvss": candidate.get("cvss"),
@@ -2384,6 +2394,7 @@ def early_warning_entry(
         locations=locations,
         exposure=None,
         # What the shared texts of the summary read from a record
+        id=entry["cve"],
         pkg=entry["package"]["name"],
         version=entry["package"]["version"],
         dev=None,
@@ -2429,7 +2440,7 @@ def build_early_warning(
 ) -> EarlyWarning:
     """The early warning of a run whose records are final.
 
-    A candidate whose CVE id or alias is the ``cve`` or an alias of any record is
+    A candidate whose CVE id or alias is the ``id`` or an alias of any record is
     dropped: a scanner reports that vulnerability. The rest are classified by
     exposure like records. ``scanned`` says whether any Trivy target was scanned; if
     not there is nothing to check and the early warning is ``skipped``. A part that
@@ -2824,7 +2835,7 @@ def severity_phrase(records: Sequence[Record]) -> str:
 
 
 def record_identity(record: Mapping[str, Any]) -> tuple[Any, Any, Any]:
-    return (record["cve"], record["pkg"], record["version"])
+    return (record["id"], record["pkg"], record["version"])
 
 
 def report_not_shipped(report: Mapping[str, Any]) -> NotShipped:
@@ -3396,7 +3407,7 @@ def where_cell(
     sources: dict[str, list[str]] = {}  # "source" / "source @ <tag>" -> lockfiles
     for target in targets:
         for record in group:
-            seen = sightings.get((record["cve"], record["pkg"], record["version"]), {})
+            seen = sightings.get(record_identity(record), {})
             if target["id"] not in seen:
                 continue
             if target.get("kind") == KIND_FS:
@@ -3691,9 +3702,9 @@ def is_osv_only(record: Mapping[str, Any]) -> bool:
     return record["scanners"] == [SCANNER_OSV]
 
 
-def cve_cell(record: Record) -> str:
-    cve = record["cve"]
-    text = f"[{cve}]({record['primary_url']})" if record["primary_url"] else cve
+def id_cell(record: Record) -> str:
+    vuln_id = record["id"]
+    text = f"[{vuln_id}]({record['primary_url']})" if record["primary_url"] else vuln_id
     text = f"{text} · OSV only" if is_osv_only(record) else text
     return text
 
@@ -3723,7 +3734,7 @@ def render_severity_section(
 ) -> list[str]:
     rows = (
         [
-            cve_cell(r),
+            id_cell(r),
             r["pkg"],
             installed_to_fixed_cell(r),
             cvss_cell(r),
@@ -3734,7 +3745,7 @@ def render_severity_section(
         for r in records
     )
     header = [
-        "CVE",
+        "ID",
         "Package",
         "Installed → Fixed",
         "CVSS",
@@ -3895,8 +3906,7 @@ EARLY_WARNING_HEADER = [
     "CNA",
     "Published",
     "Affected",
-    "Rule",
-    "Confidence",
+    "Match",
     "Exposure",
     "Where",
 ]
@@ -3942,23 +3952,6 @@ def early_warning_severity_text(entry: Record) -> str:
     return text
 
 
-def confidence_text(confidence: Mapping[str, Any]) -> str:
-    """``97% · VulnCheck 119/123 confirmed`` (the claims of the CNA that a
-    vulnerability database confirmed, of those it resolved), ``no history · Google
-    0/0`` without any resolved claim, ``name match`` for a match by names, where the
-    history of the CNA says nothing about our error. The percentage is never 100 while
-    there are errors.
-    """
-    if confidence["basis"] == BASIS_NAME_MATCH:
-        return "name match"
-    confirmed, errors = confidence["confirmed"], confidence["errors"]
-    counts = f"{confidence['cna'] or '?'} {confirmed}/{confirmed + errors}"
-    if not confirmed + errors:
-        return f"no history · {counts}"
-    percent = round(100 * confirmed / (confirmed + errors))
-    return f"{min(percent, 99) if errors else percent}% · {counts} confirmed"
-
-
 def early_warning_row(
     group: Sequence[Record],
     early_warning: EarlyWarning,
@@ -3967,7 +3960,7 @@ def early_warning_row(
 ) -> list[Any]:
     """One package version: the worst severity of its CVEs, and the CVEs (with their
     own severity if there are several) with the distinct CNAs, publication dates,
-    affected ranges and rules.
+    affected ranges and matches.
     """
     links = []
     for entry in group:
@@ -3978,14 +3971,12 @@ def early_warning_row(
     cnas: list[str] = []
     dates: list[str] = []
     ranges: list[str] = []
-    rules: list[str] = []
-    confidences: list[str] = []
+    matches: list[str] = []
     for entry in group:
         _append_unique(cnas, entry["cna"])
         _append_unique(dates, (entry["published"] or "?")[:10])
         _append_unique(ranges, entry["affected_range"] or "?")
-        _append_unique(rules, entry["rule"])
-        _append_unique(confidences, confidence_text(entry["confidence"]))
+        _append_unique(matches, entry["match"].replace("_", " "))
     return [
         f"{group[0]['pkg']} {group[0]['version']}",
         early_warning_severity_text(group[0]),
@@ -3993,8 +3984,7 @@ def early_warning_row(
         ", ".join(cnas),
         ", ".join(dates),
         " · ".join(ranges),
-        ", ".join(rules),
-        "; ".join(confidences),
+        ", ".join(matches),
         group_exposure_label(group, targets),
         where_cell(group, early_warning.sightings, targets, not_shipped),
     ]

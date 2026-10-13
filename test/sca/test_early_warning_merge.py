@@ -15,7 +15,7 @@ from test_merge_results import (
     Workspace,
     make_targets_doc,
     mr,
-    records_by_cve,
+    records_by_id,
 )
 
 GUAVA = {
@@ -33,14 +33,6 @@ INDEX = {
     "digest": "sha256:" + "0123456789abcdef" * 4,
     "built_at": "2030-01-01T03:21:00Z",
     "gaps": [],
-}
-HISTORY = {
-    "basis": "cna_history",
-    "cna": "Google",
-    "confirmed": 119,
-    "errors": 4,
-    "pending": 7,
-    "ratio": 0.9675,
 }
 
 
@@ -69,8 +61,7 @@ def candidate(
         "title": "A title",
         "package": package or GUAVA,
         "affected_range": ">= 4.0, < 33.7.2",
-        "rule": "T2",
-        "confidence": HISTORY,
+        "match": "source_repo",
         "severity": severity,
         "severity_source": "cna" if cvss else None,
         "cvss": cvss,
@@ -207,8 +198,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "title": "A title",
         "package": GUAVA,
         "affected_range": ">= 4.0, < 33.7.2",
-        "rule": "T2",
-        "confidence": HISTORY,
+        "match": "source_repo",
         "severity": "HIGH",
         "severity_source": "cna",
         "cvss": {
@@ -224,7 +214,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "exposure": "source_only",
     }
     # not a record, not in the totals
-    assert "CVE-2030-0001" not in records_by_cve(ws)
+    assert "CVE-2030-0001" not in records_by_id(ws)
     assert ws.json("_report/scan_report.json")["totals"] == without
     assert ws.json("_report/vulnerabilities.json")["records"]
 
@@ -256,7 +246,7 @@ def test_a_record_with_an_alias_drops_the_candidate_of_the_cve(
     ws: Workspace,
 ) -> None:
     ws.run()
-    victim = records_by_cve(ws)["CVE-2000-0001"]
+    victim = records_by_id(ws)["CVE-2000-0001"]
     assert victim  # the fixture record the candidate below is an alias of
     write_part(
         ws,
@@ -401,8 +391,7 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
                 severity="MEDIUM",
                 score=5.0,
                 cna="bcorg",
-                rule="repo-level",
-                confidence={"basis": "name_match"},
+                match="repo_module",
                 affected_range="< 1.86",
             ),
         ],
@@ -416,8 +405,8 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
     ) in text
     lines = text.splitlines()
     header = (
-        "| Package | Severity | CVE | CNA | Published | Affected | Rule "
-        "| Confidence | Exposure | Where |"
+        "| Package | Severity | CVE | CNA | Published | Affected | Match "
+        "| Exposure | Where |"
     )
     start = lines.index(header)
     table = []
@@ -437,15 +426,15 @@ def test_summary_section_has_a_row_per_package_version(ws: Workspace) -> None:
     ) in guava
     # distinct values only
     assert (
-        "| Google | 2030-01-05 | &lt; 33.8.0 · &gt;= 4.0, &lt; 33.7.2 | T2 "
-        "| 97% · Google 119/123 confirmed |" in guava
+        "| Google | 2030-01-05 | &lt; 33.8.0 · &gt;= 4.0, &lt; 33.7.2 "
+        "| source repo |" in guava
     )
     assert "development only" in guava
     assert "image :development" in guava
     assert "source gradle.lockfile" in guava
     assert bcprov.startswith("| org.bouncycastle:bcprov-jdk18on 1.85 | MEDIUM 5.0 | ")
     assert "| bcorg |" in bcprov
-    assert "| repo-level | name match |" in bcprov
+    assert "| repo module |" in bcprov
     assert "<details>" not in section  # up to 5 packages stay open
 
 
@@ -475,63 +464,38 @@ def test_summary_section_is_collapsed_above_five_packages(ws: Workspace) -> None
     assert "Show the" not in summary(five)
 
 
-def history(confirmed: int, errors: int, cna: str | None = "VulnCheck") -> dict:
-    ratio = confirmed / (confirmed + errors) if confirmed + errors else None
-    return {
-        "basis": "cna_history",
-        "cna": cna,
-        "confirmed": confirmed,
-        "errors": errors,
-        "pending": 3,
-        "ratio": ratio,
-    }
-
-
-@pytest.mark.parametrize(
-    ("confidence", "expected"),
-    [
-        (history(119, 4), "97% · VulnCheck 119/123 confirmed"),
-        (history(0, 0, "Google"), "no history · Google 0/0"),
-        (history(10, 0), "100% · VulnCheck 10/10 confirmed"),
-        # rounded up to 100 would hide the error
-        (history(299, 1), "99% · VulnCheck 299/300 confirmed"),
-        (history(0, 5), "0% · VulnCheck 0/5 confirmed"),
-        (history(4, 0, None), "100% · ? 4/4 confirmed"),
-        ({"basis": "name_match"}, "name match"),
-    ],
-)
-def test_confidence_text(confidence: dict[str, Any], expected: str) -> None:
-    assert mr.confidence_text(confidence) == expected
-
-
-def test_a_candidate_with_an_unknown_or_missing_confidence_is_unavailable(
+def test_a_candidate_with_an_unknown_or_missing_match_is_unavailable(
     ws: Workspace,
 ) -> None:
-    for confidence in ({"basis": "magic"}, {"basis": "cna_history"}, None, "high"):
-        write_part(ws, [candidate(confidence=confidence)])
+    for match in ("magic", "T2", None, 7):
+        write_part(ws, [candidate(match=match)])
         assert merge(ws)["status"] == "failed"
     broken = candidate()
-    del broken["confidence"]
+    del broken["match"]
     write_part(ws, [broken])
     assert merge(ws)["status"] == "failed"
 
 
-def test_the_confidence_does_not_filter_or_reorder_the_entries(ws: Workspace) -> None:
+def test_the_match_does_not_filter_or_reorder_the_entries(ws: Workspace) -> None:
     write_part(
         ws,
         [
-            candidate("CVE-2030-0001", confidence=history(0, 9)),
-            candidate("CVE-2030-0002", confidence={"basis": "name_match"}),
+            candidate("CVE-2030-0001", match="repo_module"),
+            candidate("CVE-2030-0002", match="package_name"),
             candidate("CVE-2030-0003", severity="CRITICAL", score=9.8),
         ],
     )
     merge(ws)
     assert [e["cve"] for e in entries(ws)] == [
         "CVE-2030-0003",
-        "CVE-2030-0001",  # the worst confidence, and still before the next one
+        "CVE-2030-0001",  # the weakest match, and still before the next one
         "CVE-2030-0002",
     ]
-    assert entries(ws)[1]["confidence"] == history(0, 9)
+    assert [e["match"] for e in entries(ws)] == [
+        "source_repo",
+        "repo_module",
+        "package_name",
+    ]
 
 
 def test_short_digest() -> None:

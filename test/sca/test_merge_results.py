@@ -148,8 +148,8 @@ def full(tmp_path: Path) -> Workspace:
     return ws
 
 
-def records_by_cve(ws: Workspace) -> dict[str, dict[str, Any]]:
-    return {r["cve"]: r for r in ws.json("_report/vulnerabilities.json")["records"]}
+def records_by_id(ws: Workspace) -> dict[str, dict[str, Any]]:
+    return {r["id"]: r for r in ws.json("_report/vulnerabilities.json")["records"]}
 
 
 # ---------------------------------------------------------------- merging
@@ -159,7 +159,7 @@ def test_dedup_across_lockfiles_within_one_target(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE))
     ws.add_part("source-development", "source", lockfiles=3)
     ws.run()
-    rec = records_by_cve(ws)["CVE-2000-0003"]
+    rec = records_by_id(ws)["CVE-2000-0003"]
     assert rec["locations"] == ["app/gradle.lockfile", "core/gradle.lockfile"]
     assert rec["scan_targets"] == ["source-development"]
     entry = ws.targets["source-development"]
@@ -180,7 +180,7 @@ def test_dedup_across_lockfiles_within_one_target(tmp_path: Path) -> None:
 
 def test_fixed_version_backfilled_from_other_copy(full: Workspace) -> None:
     full.run()
-    rec = records_by_cve(full)["CVE-2000-0003"]
+    rec = records_by_id(full)["CVE-2000-0003"]
     # the first lockfile copy has no FixedVersion, the second one does
     assert rec["fix_available"] is True
     assert rec["fixed_versions"] == ["1.1"]
@@ -190,7 +190,7 @@ def test_fixed_version_backfilled_from_other_copy(full: Workspace) -> None:
 
 def test_merge_across_fs_and_images_keeps_targets_file_order(full: Workspace) -> None:
     full.run()
-    recs = records_by_cve(full)
+    recs = records_by_id(full)
     assert recs["CVE-2000-0001"]["scan_targets"] == [
         "source-development",
         "app-development",
@@ -213,16 +213,17 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
     assert vulns["merge_key"] == mr.MERGE_KEY
     assert vulns["repo"] == "example/app"
     assert vulns["generated_utc"] == GENERATED
-    assert [r["cve"] for r in vulns["records"]] == [
+    assert [r["id"] for r in vulns["records"]] == [
         "CVE-2000-0010",  # release_and_development
         "CVE-2000-0011",  # release_only
         "CVE-2000-0001",  # development_only (source + development image)
         "CVE-2000-0002",  # source_only, CRITICAL
         "CVE-2000-0003",  # source_only, MEDIUM
     ]
-    openssl = records_by_cve(full)["CVE-2000-0011"]
+    openssl = records_by_id(full)["CVE-2000-0011"]
     assert openssl == {
         "repo": "example/app",
+        "id": "CVE-2000-0011",
         "cve": "CVE-2000-0011",
         "aliases": [],
         "pkg": "openssl",
@@ -252,18 +253,20 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "primary_url": "https://example.invalid/CVE-2000-0011",
         "scanners": ["trivy"],
     }
-    assert records_by_cve(full)["CVE-2000-0001"]["pkg_type"] == "library"
+    assert records_by_id(full)["CVE-2000-0001"]["pkg_type"] == "library"
 
 
 def test_record_sort_key_orders_exposure_severity_cvss_then_identity() -> None:
-    def record(cve: str, exposure: str, severity: str, score: float | None) -> Record:
+    def record(
+        vuln_id: str, exposure: str, severity: str, score: float | None
+    ) -> Record:
         return {
             "exposure": exposure,
             "severity": severity,
             "cvss": None if score is None else {"score": score},
             "pkg": "p",
             "version": "1",
-            "cve": cve,
+            "id": vuln_id,
         }
 
     records = [
@@ -275,7 +278,7 @@ def test_record_sort_key_orders_exposure_severity_cvss_then_identity() -> None:
         record("F", "release_only", "HIGH", 8.0),
     ]
     ordered = sorted(records, key=mr.record_sort_key)
-    assert [r["cve"] for r in ordered] == ["A", "B", "F", "C", "D", "E"]
+    assert [r["id"] for r in ordered] == ["A", "B", "F", "C", "D", "E"]
 
 
 def test_totals_by_severity_and_exposure(full: Workspace) -> None:
@@ -457,7 +460,7 @@ def test_failed_target_does_not_hide_the_others(full: Workspace) -> None:
     assert full.run() == 1
     assert full.targets["source-development"]["status"] == "ok"
     assert full.targets["app-1.0.0"]["status"] == "failed"
-    assert "CVE-2000-0011" not in records_by_cve(full)
+    assert "CVE-2000-0011" not in records_by_id(full)
     assert "failed" in (full.out / "summary.md").read_text(encoding="utf-8")
 
 
@@ -982,7 +985,7 @@ def test_missing_parts_dir_marks_pending_targets_failed(tmp_path: Path) -> None:
 
 def test_ecosystem_is_a_sorted_list_of_result_types(full: Workspace) -> None:
     full.run()
-    recs = records_by_cve(full)
+    recs = records_by_id(full)
     assert recs["CVE-2000-0002"]["ecosystem"] == ["npm"]
     assert recs["CVE-2000-0003"]["ecosystem"] == ["gradle"]
     assert recs["CVE-2000-0010"]["ecosystem"] == ["alpine"]
@@ -1095,7 +1098,7 @@ def test_target_class() -> None:
 
 def test_exposure_classes_end_to_end(full: Workspace) -> None:
     full.run()
-    recs = records_by_cve(full)
+    recs = records_by_id(full)
     assert recs["CVE-2000-0010"]["exposure"] == "release_and_development"
     assert recs["CVE-2000-0011"]["exposure"] == "release_only"
     assert recs["CVE-2000-0001"]["exposure"] == "development_only"
@@ -1132,7 +1135,7 @@ def rec(exposure: str, severity: str = "HIGH", **extra: Any) -> Record:
         "scan_targets": [],
         "fix_available": False,
         "pkg_type": "library",
-        "cve": "CVE-1",
+        "id": "CVE-1",
         "pkg": "p",
         "version": "1",
         **extra,
@@ -1208,7 +1211,7 @@ def test_verdict_orders_equally_severe_actions_by_count_then_exposure(
 ) -> None:
     both = fixable("release_and_development", scan_targets=["app-1.0.0"])
     only = [
-        fixable("release_only", scan_targets=["app-1.0.0"], cve=f"CVE-{i}")
+        fixable("release_only", scan_targets=["app-1.0.0"], id=f"CVE-{i}")
         for i in range(2)
     ]
     development = fixable("development_only", scan_targets=["app-development"])
@@ -1222,7 +1225,7 @@ def test_verdict_orders_equally_severe_actions_by_count_then_exposure(
 def test_verdict_ignores_the_findings_fixed_in_place(
     source_and_images: dict[str, Any],
 ) -> None:
-    fixed = fixable("release_and_development", scan_targets=["app-1.0.0"], cve="CVE-9")
+    fixed = fixable("release_and_development", scan_targets=["app-1.0.0"], id="CVE-9")
     other = fixable("release_only", "LOW", scan_targets=["app-1.0.0"])
     in_place = {("CVE-9", "p", "1")}
     # it makes no clause of its own and does not count in the one of its exposure
@@ -1264,12 +1267,12 @@ def test_verdict_counts_only_what_has_a_fix(
             "CRITICAL" if i == 0 else "HIGH",
             scan_targets=["app-1.0.0"],
             pkg_type="os",
-            cve=f"CVE-{i}",
+            id=f"CVE-{i}",
         )
         for i in range(3)
     ]
-    library = rec("release_only", scan_targets=["app-1.0.0"], cve="CVE-L")
-    low = rec("release_only", "LOW", scan_targets=["app-1.0.0"], cve="CVE-M")
+    library = rec("release_only", scan_targets=["app-1.0.0"], id="CVE-L")
+    low = rec("release_only", "LOW", scan_targets=["app-1.0.0"], id="CVE-M")
     verdict = mr.verdict_text
     # one short trailing clause for what has no fix, never in the action counts
     assert verdict(source_and_images, [fixed, *os_unfixed, library]) == (
@@ -1502,7 +1505,7 @@ def test_upgrade_to_is_shared_by_all_records_of_a_package_version(
         json.dumps(native), encoding="utf-8"
     )
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-1"]["upgrade_to"] == recs["CVE-2"]["upgrade_to"] == "2.9.1"
     assert recs["CVE-2"]["fixed_versions"] == ["2.9.1", "3.0.0"]
     assert recs["CVE-3"]["upgrade_to"] == "9.9"  # the unfixable CVE-4 does not count
@@ -1614,7 +1617,7 @@ def test_relationship_pkg_paths_and_aliases_are_extracted(tmp_path: Path) -> Non
         json.dumps(native), encoding="utf-8"
     )
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-1"]["aliases"] == ["GHSA-aaaa"]  # never the CVE itself
     assert recs["CVE-1"]["relationship"] == ["direct", "indirect"]
     assert recs["CVE-1"]["pkg_paths"] == [
@@ -1641,7 +1644,7 @@ def test_unknown_severity_is_normalized(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     ws.run()
-    assert records_by_cve(ws)["CVE-1"]["severity"] == "UNKNOWN"
+    assert records_by_id(ws)["CVE-1"]["severity"] == "UNKNOWN"
     by_severity = ws.targets["source-development"]["findings"]["by_severity"]
     assert by_severity["UNKNOWN"] == 1
 
@@ -1991,7 +1994,7 @@ def test_dev_flag_and_chains_end_to_end(tmp_path: Path) -> None:
     other = {**SOURCE, "id": "source-release", "git_ref": "release/1.0"}
     ws = graph_source(tmp_path, SOURCE, other)
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     braces, react = recs["CVE-1"], recs["CVE-2"]
     assert braces["dev"] is True
     assert braces["relationship"] == ["indirect"]
@@ -2024,7 +2027,7 @@ def test_dev_flag_is_null_without_package_entry_and_false_if_any_is_runtime(
         json.dumps(native_with(shared, vuln("CVE-2", None))), encoding="utf-8"
     )
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-1"]["dev"] is True  # the image has no package entry: unknown
     assert recs["CVE-2"]["dev"] is None
     assert recs["CVE-2"]["dependency_paths"] == []
@@ -2199,7 +2202,7 @@ def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
         json.dumps(native), encoding="utf-8"
     )
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-1"]["upgrade_to"] == recs["CVE-3"]["upgrade_to"] == "2.9.1"
     assert recs["CVE-2"]["upgrade_to"] is None
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
@@ -2339,7 +2342,7 @@ def test_gradle_graph_gives_relationship_and_chains(
 ) -> None:
     ws = gradle_workspace(tmp_path)
     ws.run()
-    rec = records_by_cve(ws)["CVE-1"]
+    rec = records_by_id(ws)["CVE-1"]
     # direct in lib, indirect in app: both, as for any lockfile pair
     assert rec["relationship"] == ["direct", "indirect"]
     # shortest first, through the direct dependency of lib and both routes of app
@@ -2352,7 +2355,7 @@ def test_gradle_graph_gives_relationship_and_chains(
     # a direct dependency introduces itself (lib), so only app names its roots
     assert rec["introduced_via"] == ["org.example:util", "org.example:web"]
     # the lockfile without a graph is as before: unknown relationship, no chains
-    other = records_by_cve(ws)["CVE-2"]
+    other = records_by_id(ws)["CVE-2"]
     assert other["relationship"] == []
     assert other["dependency_paths"] == []
     out = capsys.readouterr().out
@@ -2377,7 +2380,7 @@ def test_gradle_without_graph_warns_per_lockfile_and_changes_nothing(
 ) -> None:
     ws = gradle_workspace(tmp_path, with_graph=False)
     assert ws.run() == 0
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-1"]["relationship"] == []
     assert recs["CVE-1"]["dependency_paths"] == []
     assert recs["CVE-1"]["introduced_via"] == []
@@ -2397,7 +2400,7 @@ def test_gradle_graph_file_that_cannot_be_used_is_skipped_with_a_warning(
         json.dumps({"schema_version": 2}), encoding="utf-8"
     )
     assert ws.run() == 0  # the graph is an enrichment: the target stays ok
-    assert records_by_cve(ws)["CVE-1"]["relationship"] == ["direct", "indirect"]
+    assert records_by_id(ws)["CVE-1"]["relationship"] == ["direct", "indirect"]
     out = capsys.readouterr().out
     assert out.count("::warning title=Gradle dependency graph ignored::") == 2
     assert "graph-2.json" in out
@@ -2662,7 +2665,7 @@ def test_run_without_images_is_classified_and_headlined_by_the_sources(
         json.dumps(fresh), encoding="utf-8"
     )
     ws.run()
-    recs = records_by_cve(ws)
+    recs = records_by_id(ws)
     assert recs["CVE-9"]["scan_targets"] == ["source-1.0.0", "source-0.9.0"]
     assert recs["CVE-9"]["exposure"] == "release_only"
     assert recs["CVE-DEV"]["exposure"] == "development_only"
@@ -2756,7 +2759,7 @@ def test_without_release_sources_the_report_is_as_before(full: Workspace) -> Non
     md = (full.out / "summary.md").read_text(encoding="utf-8")
     assert "source @ development" in md
     assert "source @ 1.0.0" not in md
-    assert all(r["exposure"] != "release_source" for r in records_by_cve(full).values())
+    assert all(r["exposure"] != "release_source" for r in records_by_id(full).values())
 
 
 def test_source_only_action_when_the_default_branch_is_clear() -> None:
@@ -2873,7 +2876,7 @@ def test_osv_findings_are_records_next_to_the_trivy_ones(
     with_osv: Workspace,
 ) -> None:
     with_osv.run()
-    records = records_by_cve(with_osv)
+    records = records_by_id(with_osv)
     scanners = {cve: r["scanners"] for cve, r in records.items()}
     # CVE-2000-0001 and CVE-2000-0003 are alias-matched Trivy records, CVE-2000-0002
     # is Trivy's alone, the rest are the OSV-only ones (one OSV id each here)
@@ -3603,7 +3606,7 @@ def test_osv_joins_the_trivy_record_by_a_cve_alias(tmp_path: Path) -> None:
         )
     }
     ws = merge_scan(tmp_path, trivy, osv, SOURCE)
-    records = records_by_cve(ws)
+    records = records_by_id(ws)
     assert list(records) == ["CVE-2030-1"]
     record = records["CVE-2030-1"]
     assert record["scanners"] == ["osv", "trivy"]
@@ -3635,7 +3638,7 @@ def test_osv_joins_a_trivy_record_by_an_id_in_its_aliases(tmp_path: Path) -> Non
             osv_record("GHSA-aaaa-aaaa-aaaa"),
         )
     }
-    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    records = records_by_id(merge_scan(tmp_path, trivy, osv, SOURCE))
     assert list(records) == ["CVE-2030-1"]
     assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
     assert records["CVE-2030-1"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa"]
@@ -3660,7 +3663,7 @@ def test_an_alias_group_is_one_vulnerability_matching_by_any_of_its_ids(
             osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1"]),
         )
     }
-    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    records = records_by_id(merge_scan(tmp_path, trivy, osv, SOURCE))
     assert list(records) == ["CVE-2030-1"]
     assert records["CVE-2030-1"]["aliases"] == ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]
     assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
@@ -3686,7 +3689,7 @@ def test_a_vulnerability_matches_every_record_it_shares_an_id_with(
             osv_record("GHSA-aaaa-aaaa-aaaa", aliases=["CVE-2030-1", "CVE-2030-2"]),
         )
     }
-    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    records = records_by_id(merge_scan(tmp_path, trivy, osv, SOURCE))
     assert len(records) == 2
     # each is joined, and the CVE of the other is not an alias of it
     assert records["CVE-2030-1"]["scanners"] == ["osv", "trivy"]
@@ -3745,7 +3748,7 @@ def test_osv_related_does_not_join_vulnerabilities(tmp_path: Path) -> None:
             osv_record("GHSA-bbbb-bbbb-bbbb", related=["GHSA-aaaa-aaaa-aaaa"]),
         )
     }
-    records = records_by_cve(merge_scan(tmp_path, trivy, osv, SOURCE))
+    records = records_by_id(merge_scan(tmp_path, trivy, osv, SOURCE))
     assert sorted(records) == ["GHSA-aaaa-aaaa-aaaa", "GHSA-bbbb-bbbb-bbbb"]
 
 
@@ -3848,7 +3851,7 @@ def test_osv_only_record_fields_from_the_osv_records(tmp_path: Path) -> None:
         "Foo_Bar",
         "1.0",
     )
-    assert record["cve"] == "CVE-2030-1"
+    assert (record["id"], record["cve"]) == ("CVE-2030-1", "CVE-2030-1")
     assert record["aliases"] == ["GHSA-aaaa-aaaa-aaaa", "PYSEC-2030-1"]
     assert record["scanners"] == ["osv"]
     assert record["scan_targets"] == ["source-development"]
@@ -3876,6 +3879,49 @@ def test_osv_only_record_fields_from_the_osv_records(tmp_path: Path) -> None:
     assert record["exposure"] == "development_only"
 
 
+@pytest.mark.parametrize(
+    ("vuln_id", "aliases", "expected"),
+    [
+        ("CVE-2030-1", ["GHSA-aaaa-aaaa-aaaa", "CVE-2030-0"], "CVE-2030-1"),
+        ("GHSA-aaaa-aaaa-aaaa", ["CVE-2030-2", "CVE-2030-1"], "CVE-2030-1"),
+        ("DSA-5000-1", ["CVE-2030-9"], "CVE-2030-9"),
+        ("TEMP-0000-ABC", [], None),
+        ("RUSTSEC-2030-0001", ["GHSA-aaaa-aaaa-aaaa"], None),
+    ],
+)
+def test_the_cve_of_a_record_is_its_id_or_the_first_cve_of_its_aliases(
+    vuln_id: str, aliases: list[str], expected: str | None
+) -> None:
+    assert mr.cve_of({"id": vuln_id, "aliases": aliases}) == expected
+
+
+def test_a_record_known_by_another_id_than_a_cve_has_its_cve_when_it_has_one(
+    tmp_path: Path,
+) -> None:
+    trivy = source_with(
+        lang_result(
+            "npm",
+            "package-lock.json",
+            [lang_package("lib", "1.0", "pkg:npm/lib@1.0")],
+            [
+                trivy_vuln(
+                    "DSA-5000-1", "lib", "1.0", VendorIDs=["CVE-2030-9", "CVE-2030-2"]
+                ),
+                trivy_vuln("TEMP-0000-ABC", "lib", "1.0"),
+                # its own id among the vendor ids is not an alias
+                trivy_vuln("CVE-2030-1", "lib", "1.0", VendorIDs=["CVE-2030-1", "G-1"]),
+            ],
+        )
+    )
+    records = records_by_id(merge_scan(tmp_path, trivy, {}, SOURCE))
+    shown = {i: (r["cve"], r["aliases"]) for i, r in records.items()}
+    assert shown == {
+        "DSA-5000-1": ("CVE-2030-2", ["CVE-2030-2", "CVE-2030-9"]),
+        "TEMP-0000-ABC": (None, []),
+        "CVE-2030-1": ("CVE-2030-1", ["G-1"]),
+    }
+
+
 def test_osv_only_record_without_optional_fields(tmp_path: Path) -> None:
     trivy = source_with(
         lang_result(
@@ -3891,7 +3937,7 @@ def test_osv_only_record_without_optional_fields(tmp_path: Path) -> None:
     }
     ws = merge_scan(tmp_path, trivy, osv, SOURCE)
     (record,) = ws.json("_report/vulnerabilities.json")["records"]
-    assert record["cve"] == "PYSEC-2030-1"
+    assert (record["id"], record["cve"]) == ("PYSEC-2030-1", None)
     assert record["aliases"] == []
     assert (record["severity"], record["severity_source"]) == ("UNKNOWN", None)
     assert record["cvss"] is None
@@ -4124,7 +4170,7 @@ def test_osv_only_on_an_image_python_package(tmp_path: Path) -> None:
     }
     ws = merge_scan(tmp_path, {"app-development": image}, osv, DEV)
     (record,) = ws.json("_report/vulnerabilities.json")["records"]
-    assert (record["cve"], record["pkg"], record["version"]) == (
+    assert (record["id"], record["pkg"], record["version"]) == (
         "CVE-2030-1",
         "Mako",
         "1.3.0",
@@ -5141,9 +5187,9 @@ def test_a_record_needs_the_fix_in_place_in_every_sighting(tmp_path: Path) -> No
 
 
 def test_a_cve_fixed_in_place_does_not_hold_back_the_upgrade_of_the_others() -> None:
-    def record(cve: str, fixed: list[str]) -> Record:
+    def record(vuln_id: str, fixed: list[str]) -> Record:
         return {
-            "cve": cve,
+            "id": vuln_id,
             "pkg": "lib",
             "version": "1.0",
             "fix_available": True,

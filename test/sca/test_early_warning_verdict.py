@@ -160,6 +160,7 @@ def early_warning_of(*severities: str, exposure: str = "development_only") -> An
         entries.append(
             {
                 "cve": f"CVE-2030-{index}",
+                "id": f"CVE-2030-{index}",
                 "severity": severity,
                 "exposure": exposure,
                 "pkg": f"p{index}",

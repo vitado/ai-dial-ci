@@ -1,8 +1,8 @@
 name: SCA CVE index
 
-# The daily index of the CVE records and of the reputation of their CNAs that the
-# early warning of the SCA scheduled scan reads (see "CVE index for the early warning"
-# in the README). It is an OCI artifact in the GitHub Container Registry.
+# The daily index of the CVE records that the early warning of the SCA scheduled scan
+# reads (see "CVE index for the early warning" in the README). It is an OCI artifact
+# in the GitHub Container Registry.
 
 on:
   schedule:
@@ -79,8 +79,6 @@ jobs:
             --annotation "org.opencontainers.image.revision=$REVISION" \
             --format json \
             cves.jsonl.gz:application/gzip \
-            reputation.json:application/json \
-            evidence.jsonl.gz:application/gzip \
             metadata.json:application/json \
             > "$RUNNER_TEMP/push.json"
           digest=$(jq -r .digest "$RUNNER_TEMP/push.json")

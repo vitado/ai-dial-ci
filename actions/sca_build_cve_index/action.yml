@@ -1,9 +1,9 @@
 name: Build the CVE index of the SCA early warning
-description: Build the index of the CVE records of the last days and of the reputation of their CNAs from the cvelistV5 releases and the OSV exports, on top of the previous index if there is one. Writes the files; publishing them is up to the caller
+description: Build the index of the CVE records of the last days from the cvelistV5 releases, on top of the previous index if there is one. Writes the files; publishing them is up to the caller
 
 inputs:
   output-dir:
-    description: Directory to write the index into (cves.jsonl.gz, reputation.json, evidence.jsonl.gz, metadata.json)
+    description: Directory to write the index into (cves.jsonl.gz, metadata.json)
     required: true
   previous-dir:
     description: Directory with the previous index. Empty means none, and the build starts from the whole CVE list

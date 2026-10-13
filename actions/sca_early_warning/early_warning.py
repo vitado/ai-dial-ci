@@ -19,7 +19,7 @@ Inputs:
   * the central CVE index (see sca_build_cve_index), an OCI artifact pulled with
     ORAS (``--cve-index``), or a directory that holds one (``--index-dir``, for
     tests and for running the script by hand with no registry): the CVE records of
-    the last 180 days and the reputation of their CNAs. The deltas of the cvelistV5
+    the last 180 days. The deltas of the cvelistV5
     releases since the index was built are applied to its records, with the code of
     the builder (the ``end_of_day`` delta of each past day, the hourly deltas of
     today, the delta log for what they lack), so the records are hours old and not
@@ -34,34 +34,27 @@ Outputs (``<output-dir>/early-warning/``):
     applied since), or null if no index was read;
   * ``candidates.json`` (``ok`` only) - ``{schema_version, generated_utc,
     generated_from, candidates[]}``; a candidate is one CVE for one package
-    version, with the CNA data it was matched by, how far the match can be trusted
-    (``confidence``) and where the package was seen.
-
-Confidence. There are no tiers and no threshold here: the signal is shown with the
-numbers that say how far it can be believed, and what is done with it is a policy of
-the report and of the notifications. For T1 and T2 (the CNA itself named the package
-or the repository) it is the history of that CNA in the index: of the claims of its
-records in the window, how many a vulnerability database confirmed
-(``basis: cna_history``, ``cna``, ``confirmed``, ``errors``, ``pending`` and
-``ratio = confirmed / (confirmed + errors)``, null with no resolved claim). For T3
-and repo-level, where the CVE only matches by names, the history of the CNA says
-nothing about our matching error, so there is none (``basis: name_match``).
+    version, with the CNA data it was matched by, how it was matched (``match``) and
+    where the package was seen.
 
 Matching (the narrow form recommended by the study of the CVE feed; only npm, PyPI,
 Maven and Cargo packages, OS packages are out of scope like in OSV):
 
-  T1  ``affected[].packageName`` equals the package name (``collectionURL`` names
-      the registry: a foreign registry or a repository of the entry that differs
-      from the package's one rejects the match);
-  T2  ``affected[].repo`` equals the source repository of the package AND the entry
-      is about this artifact (``packageName`` or ``product`` agrees with the
-      artifact; a repository of many artifacts must not match them all);
-  T3  the entry has neither ``packageName`` nor ``repo``: ``product`` is the
-      artifact, ``vendor`` is the repository owner (or the artifact), a reference
-      of the CVE points at the repository of the package and, for a scoped npm
-      package, the scope is the vendor or owner;
-  repo-level  ``product`` is the repository (and not the artifact) and the CVE
+  package_name  ``affected[].packageName`` equals the package name
+      (``collectionURL`` names the registry: a foreign registry or a repository of
+      the entry that differs from the package's one rejects the match);
+  source_repo  ``affected[].repo`` equals the source repository of the package AND
+      the entry is about this artifact (``packageName`` or ``product`` agrees with
+      the artifact; a repository of many artifacts must not match them all);
+  product_name  the entry has neither ``packageName`` nor ``repo``: ``product`` is
+      the artifact, ``vendor`` is the repository owner (or the artifact), a
+      reference of the CVE points at the repository of the package and, for a
+      scoped npm package, the scope is the vendor or owner;
+  repo_module  ``product`` is the repository (and not the artifact) and the CVE
       text names the artifact itself.
+
+``match`` says how the candidate was matched, not how likely it is right: there is
+no threshold on it. When several entries match, the first of these is kept.
 
 The affected versions are checked with the version scheme of the package
 ecosystem. A version that cannot be parsed or compared never makes a match
@@ -134,11 +127,16 @@ MAX_DESCRIPTION_CHARS = 3000
 MAX_REFERENCES = 100
 MAX_LOCATIONS = 50
 
-RULE_T1 = "T1"
-RULE_T2 = "T2"
-RULE_T3 = "T3"
-RULE_REPO_LEVEL = "repo-level"
-RULE_PRIORITY = {RULE_T1: 0, RULE_T2: 1, RULE_T3: 2, RULE_REPO_LEVEL: 3}
+MATCH_PACKAGE_NAME = "package_name"
+MATCH_SOURCE_REPO = "source_repo"
+MATCH_PRODUCT_NAME = "product_name"
+MATCH_REPO_MODULE = "repo_module"
+MATCH_PRIORITY = {
+    MATCH_PACKAGE_NAME: 0,
+    MATCH_SOURCE_REPO: 1,
+    MATCH_PRODUCT_NAME: 2,
+    MATCH_REPO_MODULE: 3,
+}
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 UNKNOWN_SEVERITY = "UNKNOWN"
@@ -1230,9 +1228,6 @@ def hourly_asset(day: date, hour: int) -> str:
 # The CVE index
 # --------------------------------------------------------------------------
 
-REPUTATION_FILE = "reputation.json"
-BASIS_CNA_HISTORY = "cna_history"
-BASIS_NAME_MATCH = "name_match"
 STATE_PUBLISHED = "PUBLISHED"
 _BUILDER_DIR = Path(__file__).resolve().parents[1] / "sca_build_cve_index"
 
@@ -1254,14 +1249,12 @@ def builder() -> Any:
 
 @dataclass
 class IndexData:
-    """The CVE index as read: the records (the latest version of each), the reputation
-    of the CNAs (``cnas``: name -> ``{confirmed, errors, pending}``), its metadata and
-    the gaps of the feed in its window (``{from, to}`` ranges of hours). ``ref`` and
-    ``digest`` say which artifact it is (no digest for a directory).
+    """The CVE index as read: the records (the latest version of each), its metadata
+    and the gaps of the feed in its window (``{from, to}`` ranges of hours). ``ref``
+    and ``digest`` say which artifact it is (no digest for a directory).
     """
 
     records: dict[str, dict[str, Any]]
-    cnas: dict[str, dict[str, int]]
     metadata: dict[str, Any]
     ref: str
     digest: str | None = None
@@ -1303,22 +1296,6 @@ def pull_index(ref: str, dest: Path, run: Runner = subprocess.run) -> str:
     return digest
 
 
-def _valid_reputation(document: Any, schema_version: int) -> bool:
-    cnas = document.get("cnas") if isinstance(document, dict) else None
-    return (
-        isinstance(cnas, dict)
-        and document.get("schema_version") == schema_version
-        and all(
-            isinstance(counts, dict)
-            and all(
-                isinstance(counts.get(name), int) and not isinstance(counts[name], bool)
-                for name in ("confirmed", "errors", "pending")
-            )
-            for counts in cnas.values()
-        )
-    )
-
-
 def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
     """The index in a directory. An index that cannot be read, or that has another
     schema, is IndexUnavailable: the early warning is not made from a guess.
@@ -1326,16 +1303,11 @@ def read_index(directory: Path, ref: str, digest: str | None) -> IndexData:
     bci = builder()
     try:
         previous = bci.read_previous(directory)
-        reputation = read_json(directory / REPUTATION_FILE)
         gaps = list(previous.metadata.get("gaps") or [])
         bci.gaps_of(gaps)  # the shape of the gaps is checked here and not later
     except (bci.IndexBuildError, OSError, ValueError) as err:
         raise IndexUnavailable(f"the index {ref} cannot be read: {err}") from err
-    if not _valid_reputation(reputation, bci.SCHEMA_VERSION):
-        raise IndexUnavailable(f"the index {ref}: {REPUTATION_FILE} is not valid")
-    return IndexData(
-        previous.records, reputation["cnas"], previous.metadata, ref, digest, gaps
-    )
+    return IndexData(previous.records, previous.metadata, ref, digest, gaps)
 
 
 def catch_up(
@@ -1392,30 +1364,6 @@ def index_document(index: IndexData) -> dict[str, Any]:
         "digest": index.digest,
         "built_at": index.metadata.get("built_at"),
         "gaps": index.gaps,
-    }
-
-
-def confidence_of(
-    rule: str, cna: str | None, cnas: Mapping[str, Mapping[str, int]]
-) -> dict[str, Any]:
-    """How far a match can be believed. T1 and T2 rest on what the CNA claimed, so
-    its history in the index is the confidence; T3 and repo-level match by names,
-    where the history of the CNA says nothing about our error.
-    """
-    if rule not in (RULE_T1, RULE_T2):
-        return {"basis": BASIS_NAME_MATCH}
-    counts = cnas.get(cna or "") or {}
-    confirmed, errors, pending = (
-        counts.get(name, 0) for name in ("confirmed", "errors", "pending")
-    )
-    resolved = confirmed + errors
-    return {
-        "basis": BASIS_CNA_HISTORY,
-        "cna": cna,
-        "confirmed": confirmed,
-        "errors": errors,
-        "pending": pending,
-        "ratio": round(confirmed / resolved, 4) if resolved else None,
     }
 
 
@@ -1515,7 +1463,7 @@ class Hit:
     """One entry of one record meeting one package version."""
 
     package: Package
-    rule: str
+    match: str
     status: str
     entry: Mapping[str, Any]
 
@@ -1534,7 +1482,7 @@ def entry_hits(
     collection_eco = registry_ecosystem(collection)
 
     if package_name:
-        # T1
+        # package_name
         collection_repo = (
             normalize_repo(collection)
             if collection and collection_eco is None
@@ -1555,13 +1503,13 @@ def entry_hits(
                 else:
                     yield Hit(
                         package,
-                        RULE_T1,
+                        MATCH_PACKAGE_NAME,
                         entry_status(package.ecosystem, package.version, entry),
                         entry,
                     )
 
     if entry_repo:
-        # T2 / repo-level
+        # source_repo / repo_module
         for package in index.by_repo.get(entry_repo, ()):
             consistency = entry_consistency(package, entry, entry_repo, text)
             if consistency == INCONSISTENT:
@@ -1569,10 +1517,14 @@ def entry_hits(
             elif consistency == MODULE_UNKNOWN:
                 outcomes["module_unknown"] += 1
             else:
-                rule = RULE_T2 if consistency == CONSISTENT else RULE_REPO_LEVEL
+                match = (
+                    MATCH_SOURCE_REPO
+                    if consistency == CONSISTENT
+                    else MATCH_REPO_MODULE
+                )
                 yield Hit(
                     package,
-                    rule,
+                    match,
                     entry_status(package.ecosystem, package.version, entry),
                     entry,
                 )
@@ -1582,17 +1534,17 @@ def entry_hits(
         return
     product = squash(entry["product"])
     vendor = squash(entry.get("vendor"))
-    # T3: the product is the artifact
+    # product_name: the product is the artifact
     for package in index.by_artifact.get(product, ()):
-        yield from _t3_hit(index, record, entry, package, vendor, outcomes)
-    # repo-level: vendor/product are the owner/name of the source repository
+        yield from _product_name_hit(index, record, entry, package, vendor, outcomes)
+    # repo_module: vendor/product are the owner/name of the source repository
     for package in index.by_owner_base.get((vendor, product), ()):
         if product in {squash(package.artifact), squash(package.name)}:
-            continue  # that is T3's: the artifact, with its stricter checks
+            continue  # that is product_name's: the artifact, with its stricter checks
         if named_in_text(package, text):
             yield Hit(
                 package,
-                RULE_REPO_LEVEL,
+                MATCH_REPO_MODULE,
                 entry_status(package.ecosystem, package.version, entry),
                 entry,
             )
@@ -1600,7 +1552,7 @@ def entry_hits(
             outcomes["module_unknown"] += 1
 
 
-def _t3_hit(
+def _product_name_hit(
     index: Index,
     record: Mapping[str, Any],
     entry: Mapping[str, Any],
@@ -1623,7 +1575,7 @@ def _t3_hit(
         return
     yield Hit(
         package,
-        RULE_T3,
+        MATCH_PRODUCT_NAME,
         entry_status(package.ecosystem, package.version, entry),
         entry,
     )
@@ -1649,12 +1601,10 @@ def match_records(
     records: Iterable[Mapping[str, Any]],
     index: Index,
     inventory: Inventory,
-    cnas: Mapping[str, Mapping[str, int]],
 ) -> MatchResult:
     """Candidates: one per CVE and package version that the CNA data says is
-    affected. When several entries or rules say so, the strongest rule (T1, T2, T3,
-    repo-level) and its entry are kept. ``cnas`` is the reputation of the CNAs, for
-    the confidence of each candidate.
+    affected. When several entries say so, the strongest match (``package_name``,
+    ``source_repo``, ``product_name``, ``repo_module``) and its entry are kept.
     """
     result = MatchResult()
     for record in sorted(records, key=lambda r: r["cve"]):
@@ -1672,9 +1622,9 @@ def match_records(
                 else:
                     result.outcomes["version_outside_range"] += 1
                 continue
-            best = min(affecting, key=lambda h: RULE_PRIORITY[h.rule])
+            best = min(affecting, key=lambda h: MATCH_PRIORITY[h.match])
             result.candidates.append(
-                candidate_document(record, best, inventory.sightings[package], cnas)
+                candidate_document(record, best, inventory.sightings[package])
             )
     result.candidates.sort(key=candidate_sort_key)
     return result
@@ -1684,7 +1634,6 @@ def candidate_document(
     record: Mapping[str, Any],
     hit: Hit,
     sightings: Mapping[str, set[str]],
-    cnas: Mapping[str, Mapping[str, int]],
 ) -> dict[str, Any]:
     package = hit.package
     return {
@@ -1700,8 +1649,7 @@ def candidate_document(
             "version": package.version,
         },
         "affected_range": describe_range(hit.entry),
-        "rule": hit.rule,
-        "confidence": confidence_of(hit.rule, record["assigner"], cnas),
+        "match": hit.match,
         **select_severity(record["metrics"]),
         "exploitation": record["metrics"]["exploitation"],
         "sightings": {
@@ -1818,7 +1766,7 @@ def analyse(
         ), None
     window_days = index.metadata["window_days"]
     match_index = build_index(inventory, lookup.repos)
-    matched = match_records(index.records.values(), match_index, inventory, index.cnas)
+    matched = match_records(index.records.values(), match_index, inventory)
     diagnostics.update(
         index_records=len(index.records),
         depsdev_requests=lookup.requests,

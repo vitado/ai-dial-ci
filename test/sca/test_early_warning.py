@@ -102,14 +102,13 @@ def match(
     records: list[dict[str, Any]],
     inv: Any,
     repos: Mapping[Any, Any] = (),
-    cnas: Mapping[str, Mapping[str, int]] | None = None,
 ) -> Any:
-    return ew.match_records(records, index_of(inv, repos), inv, cnas or {})
+    return ew.match_records(records, index_of(inv, repos), inv)
 
 
 def found(result: Any) -> set[tuple[str, str, str, str]]:
     return {
-        (c["cve"], c["package"]["name"], c["package"]["version"], c["rule"])
+        (c["cve"], c["package"]["name"], c["package"]["version"], c["match"])
         for c in result.candidates
     }
 
@@ -462,7 +461,7 @@ GUAVA_REPOS = {
 }
 
 
-def test_t2_repo_with_the_artifact_named_by_product() -> None:
+def test_source_repo_repo_with_the_artifact_named_by_product() -> None:
     entry = cna(
         vendor="Google",
         product="Guava",
@@ -474,16 +473,16 @@ def test_t2_repo_with_the_artifact_named_by_product() -> None:
         inventory(GUAVA, FAILUREACCESS, LISTENABLE),
         GUAVA_REPOS,
     )
-    assert found(result) == {("CVE-2030-0001", GUAVA.name, GUAVA.version, "T2")}
+    assert found(result) == {
+        ("CVE-2030-0001", GUAVA.name, GUAVA.version, "source_repo")
+    }
     # the other artifacts of the repository are out: the product is the repository
     # and the text does not name them
     assert result.outcomes["module_unknown"] == 2
     assert result.candidates[0]["affected_range"] == ">= 4.0, < 33.7.2"
 
 
-def test_t2_without_the_product_check_the_repository_would_match_every_artifact() -> (
-    None
-):
+def test_source_repo_without_the_product_check_every_artifact_would_match() -> None:
     entry = cna(
         vendor="Google",
         repo="https://github.com/google/guava",
@@ -495,7 +494,7 @@ def test_t2_without_the_product_check_the_repository_would_match_every_artifact(
     assert result.candidates == []
 
 
-def test_t2_bouncy_castle_family_name_and_other_modules_of_the_repo() -> None:
+def test_source_repo_bouncy_castle_family_name_and_other_modules_of_the_repo() -> None:
     bcprov = pkg("maven", "org.bouncycastle:bcprov-jdk18on", "1.85")
     bcpkix = pkg("maven", "org.bouncycastle:bcpkix-jdk18on", "1.85")
     repos = {
@@ -521,8 +520,8 @@ def test_t2_bouncy_castle_family_name_and_other_modules_of_the_repo() -> None:
         repos,
     )
     assert found(result) == {
-        ("CVE-2030-0001", bcprov.name, "1.85", "T2"),
-        ("CVE-2030-0003", bcpkix.name, "1.85", "T2"),
+        ("CVE-2030-0001", bcprov.name, "1.85", "source_repo"),
+        ("CVE-2030-0003", bcpkix.name, "1.85", "source_repo"),
     }
     # bcprov-for-bcpkix, bcpg for both, bcpkix-for-bcprov
     assert result.outcomes["wrong_artifact"] == 4
@@ -544,10 +543,10 @@ def test_jackson_smile_cve_does_not_match_the_cbor_module() -> None:
     assert result.candidates == []
     entry["packageName"] = "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor"
     result = match([record(entries=[entry])], inventory(cbor), repos)
-    assert found(result) == {("CVE-2030-0001", cbor.name, "2.21.0", "T1")}
+    assert found(result) == {("CVE-2030-0001", cbor.name, "2.21.0", "package_name")}
 
 
-def test_t1_by_package_name_in_the_ecosystem_of_the_collection() -> None:
+def test_package_name_by_package_name_in_the_ecosystem_of_the_collection() -> None:
     inv = inventory(pkg("npm", "zod", "3.0.0"), pkg("pypi", "zod", "3.0.0"))
     entry = cna(
         packageName="zod",
@@ -555,12 +554,12 @@ def test_t1_by_package_name_in_the_ecosystem_of_the_collection() -> None:
         **affected(below("3.5.0")),
     )
     result = match([record(entries=[entry])], inv)
-    assert found(result) == {("CVE-2030-0001", "zod", "3.0.0", "T1")}
+    assert found(result) == {("CVE-2030-0001", "zod", "3.0.0", "package_name")}
     assert result.candidates[0]["package"]["ecosystem"] == "npm"
     assert result.outcomes["rejected_registry"] == 1
 
 
-def test_t1_name_collision_with_a_foreign_registry_is_rejected() -> None:
+def test_package_name_name_collision_with_a_foreign_registry_is_rejected() -> None:
     inv = inventory(pkg("maven", "io.netty:netty-codec-http", "4.1.0"))
     entry = cna(
         packageName="io.netty:netty-codec-http",
@@ -572,7 +571,7 @@ def test_t1_name_collision_with_a_foreign_registry_is_rejected() -> None:
     assert result.outcomes["rejected_registry"] == 1
 
 
-def test_t1_repository_of_the_entry_that_differs_from_the_package_is_rejected() -> None:
+def test_package_name_with_a_repository_that_differs_is_rejected() -> None:
     package = pkg("cargo", "console", "0.15.0")
     repos = {("cargo", "console"): ("github.com/console-rs/console",)}
     entry = cna(
@@ -588,15 +587,15 @@ def test_t1_repository_of_the_entry_that_differs_from_the_package_is_rejected() 
     assert len(result.candidates) == 1
 
 
-def test_t1_name_is_compared_the_way_of_the_ecosystem() -> None:
+def test_package_name_name_is_compared_the_way_of_the_ecosystem() -> None:
     result = match(
         [record(entries=[cna(packageName="Ruamel_Yaml", **affected(below("1.0")))])],
         inventory(pkg("pypi", "ruamel.yaml", "0.5")),
     )
-    assert found(result) == {("CVE-2030-0001", "ruamel.yaml", "0.5", "T1")}
+    assert found(result) == {("CVE-2030-0001", "ruamel.yaml", "0.5", "package_name")}
 
 
-def test_the_strongest_rule_of_several_entries_is_kept() -> None:
+def test_the_strongest_match_of_several_entries_is_kept() -> None:
     package = pkg("npm", "left-pad", "1.0.0")
     repos = {("npm", "left-pad"): ("github.com/stevemao/left-pad",)}
     by_repo = cna(
@@ -607,7 +606,7 @@ def test_the_strongest_rule_of_several_entries_is_kept() -> None:
     by_name = cna(packageName="left-pad", **affected(below("1.5.0")))
     result = match([record(entries=[by_repo, by_name])], inventory(package), repos)
     (candidate,) = result.candidates
-    assert candidate["rule"] == "T1"
+    assert candidate["match"] == "package_name"
     assert candidate["affected_range"] == "< 1.5.0"
 
 
@@ -641,7 +640,7 @@ ZOD = pkg("npm", "zod", "3.0.0")
 ZOD_REPOS = {("npm", "zod"): ("github.com/colinhacks/zod",)}
 
 
-def t3_entry(**fields: Any) -> dict[str, Any]:
+def product_name_entry(**fields: Any) -> dict[str, Any]:
     return {
         "vendor": "colinhacks",
         "product": "zod",
@@ -650,15 +649,17 @@ def t3_entry(**fields: Any) -> dict[str, Any]:
     }
 
 
-def test_t3_needs_the_artifact_the_owner_and_a_reference_to_the_repository() -> None:
+def test_product_name_needs_the_artifact_owner_and_repository_reference() -> None:
     refs = (
         "https://github.com/colinhacks/zod/security/advisories/GHSA-xxxx-xxxx-xxxx",
     )
-    result = match([record(entries=[t3_entry()], refs=refs)], inventory(ZOD), ZOD_REPOS)
-    assert found(result) == {("CVE-2030-0001", "zod", "3.0.0", "T3")}
+    result = match(
+        [record(entries=[product_name_entry()], refs=refs)], inventory(ZOD), ZOD_REPOS
+    )
+    assert found(result) == {("CVE-2030-0001", "zod", "3.0.0", "product_name")}
 
 
-def test_t3_the_elastic_shape_is_not_reported() -> None:
+def test_product_name_the_elastic_shape_is_not_reported() -> None:
     """A CVE about the Elasticsearch server must not hit the Python client."""
     client = pkg("pypi", "elasticsearch", "8.0.0")
     repos = {("pypi", "elasticsearch"): ("github.com/elastic/elasticsearch-py",)}
@@ -669,22 +670,24 @@ def test_t3_the_elastic_shape_is_not_reported() -> None:
     assert result.outcomes["uncorroborated"] == 1
 
 
-def test_t3_vendor_must_be_the_owner_or_the_artifact() -> None:
+def test_product_name_vendor_must_be_the_owner_or_the_artifact() -> None:
     refs = ("https://github.com/colinhacks/zod",)
     result = match(
-        [record(entries=[t3_entry(vendor="someone-else")], refs=refs)],
+        [record(entries=[product_name_entry(vendor="someone-else")], refs=refs)],
         inventory(ZOD),
         ZOD_REPOS,
     )
     assert result.candidates == []
     assert result.outcomes["wrong_vendor"] == 1
     result = match(
-        [record(entries=[t3_entry(vendor="Zod")], refs=refs)], inventory(ZOD), ZOD_REPOS
+        [record(entries=[product_name_entry(vendor="Zod")], refs=refs)],
+        inventory(ZOD),
+        ZOD_REPOS,
     )
     assert len(result.candidates) == 1
 
 
-def test_t3_a_scoped_npm_package_needs_the_vendor_scope() -> None:
+def test_product_name_a_scoped_npm_package_needs_the_vendor_scope() -> None:
     types = pkg("npm", "@types/multer", "1.0.0")
     repos = {("npm", "@types/multer"): ("github.com/definitelytyped/definitelytyped",)}
     entry = cna(vendor="expressjs", product="multer", **affected(below("2.0.0")))
@@ -706,8 +709,8 @@ def test_t3_a_scoped_npm_package_needs_the_vendor_scope() -> None:
     assert len(result.candidates) == 1
 
 
-def test_t3_needs_a_repository_of_the_package() -> None:
-    entry = t3_entry()
+def test_product_name_needs_a_repository_of_the_package() -> None:
+    entry = product_name_entry()
     refs = ("https://github.com/colinhacks/zod",)
     result = match([record(entries=[entry], refs=refs)], inventory(ZOD), {})
     assert result.candidates == []
@@ -721,7 +724,7 @@ NETTY_REPOS = {
 }
 
 
-def repo_level_entry() -> dict[str, Any]:
+def repo_module_entry() -> dict[str, Any]:
     return cna(
         vendor="netty",
         product="netty",
@@ -729,21 +732,21 @@ def repo_level_entry() -> dict[str, Any]:
     )
 
 
-def test_repo_level_needs_the_module_to_be_named_in_the_text() -> None:
+def test_repo_module_needs_the_module_to_be_named_in_the_text() -> None:
     named = record(
         description="A flaw in netty-codec-http allows request smuggling.",
-        entries=[repo_level_entry()],
+        entries=[repo_module_entry()],
     )
     result = match([named], inventory(NETTY_HTTP, NETTY_COMMON), NETTY_REPOS)
-    assert found(result) == {("CVE-2030-0001", NETTY_HTTP.name, "4.1.0", "repo-level")}
+    assert found(result) == {("CVE-2030-0001", NETTY_HTTP.name, "4.1.0", "repo_module")}
     assert result.outcomes["module_unknown"] == 1
-    unnamed = record(description="Netty has a flaw.", entries=[repo_level_entry()])
+    unnamed = record(description="Netty has a flaw.", entries=[repo_module_entry()])
     result = match([unnamed], inventory(NETTY_HTTP, NETTY_COMMON), NETTY_REPOS)
     assert result.candidates == []
     assert result.outcomes["module_unknown"] == 2
 
 
-def test_repo_level_with_a_repo_field_and_a_product_that_is_the_repository() -> None:
+def test_repo_module_with_a_repo_field_and_a_product_that_is_the_repository() -> None:
     entry = cna(
         vendor="netty",
         product="netty",
@@ -753,19 +756,19 @@ def test_repo_level_with_a_repo_field_and_a_product_that_is_the_repository() -> 
     text = record(description="netty-common is affected", entries=[entry])
     result = match([text], inventory(NETTY_HTTP, NETTY_COMMON), NETTY_REPOS)
     assert found(result) == {
-        ("CVE-2030-0001", NETTY_COMMON.name, "4.1.0", "repo-level")
+        ("CVE-2030-0001", NETTY_COMMON.name, "4.1.0", "repo_module")
     }
 
 
 def test_a_module_is_not_named_by_a_longer_name_that_contains_it() -> None:
     longer = record(
-        description="netty-codec-http3 is affected", entries=[repo_level_entry()]
+        description="netty-codec-http3 is affected", entries=[repo_module_entry()]
     )
     result = match([longer], inventory(NETTY_HTTP), NETTY_REPOS)
     assert result.candidates == []
 
 
-def test_repo_level_a_scoped_npm_package_is_named_by_its_full_name_only() -> None:
+def test_repo_module_a_scoped_npm_package_is_named_by_its_full_name_only() -> None:
     common = pkg("npm", "@nestjs/common", "10.0.0")
     repos = {("npm", "@nestjs/common"): ("github.com/nestjs/nest",)}
     entry = cna(vendor="nestjs", product="nest", **affected(below("11.0.0")))
@@ -812,15 +815,7 @@ def test_candidate_document_has_the_cna_data_and_where_the_package_was_seen() ->
             "version": "33.4.8-jre",
         },
         "affected_range": ">= 4.0, < 33.7.2",
-        "rule": "T2",
-        "confidence": {
-            "basis": "cna_history",
-            "cna": "ExampleCNA",
-            "confirmed": 0,
-            "errors": 0,
-            "pending": 0,
-            "ratio": None,
-        },
+        "match": "source_repo",
         "severity": "UNKNOWN",
         "severity_source": None,
         "cvss": None,
@@ -1111,78 +1106,6 @@ def test_asset_names_follow_the_release_naming() -> None:
     )
 
 
-# --- confidence -----------------------------------------------------------------
-
-
-def test_confidence_of_t1_and_t2_is_the_history_of_the_cna() -> None:
-    cnas = {"VulnCheck": {"confirmed": 119, "errors": 4, "pending": 1483}}
-    for rule in ("T1", "T2"):
-        assert ew.confidence_of(rule, "VulnCheck", cnas) == {
-            "basis": "cna_history",
-            "cna": "VulnCheck",
-            "confirmed": 119,
-            "errors": 4,
-            "pending": 1483,
-            "ratio": 0.9675,
-        }
-
-
-def test_a_cna_without_resolved_claims_has_no_ratio() -> None:
-    cnas = {"Google": {"confirmed": 0, "errors": 0, "pending": 6}}
-    expected = {
-        "basis": "cna_history",
-        "cna": "Google",
-        "confirmed": 0,
-        "errors": 0,
-        "pending": 6,
-        "ratio": None,
-    }
-    assert ew.confidence_of("T2", "Google", cnas) == expected
-    # a CNA that the index does not know has no history either
-    unknown = ew.confidence_of("T1", "Nobody", cnas)
-    assert unknown == {**expected, "cna": "Nobody", "pending": 0}
-    assert ew.confidence_of("T1", None, cnas)["cna"] is None
-
-
-def test_a_match_by_names_has_no_cna_history() -> None:
-    cnas = {"ExampleCNA": {"confirmed": 50, "errors": 0, "pending": 0}}
-    for rule in ("T3", "repo-level"):
-        assert ew.confidence_of(rule, "ExampleCNA", cnas) == {"basis": "name_match"}
-
-
-def test_candidates_carry_the_confidence_of_their_rule() -> None:
-    package = pkg("npm", "lodash", "4.17.0")
-    inv = inventory(package)
-    by_name = record(
-        entries=[cna(packageName="lodash", **affected(below("4.17.21")))],
-        refs=("https://github.com/lodash/lodash/issues/1",),
-    )
-    by_names = record(
-        "CVE-2030-0002",
-        entries=[cna(vendor="lodash", product="lodash", **affected(below("5.0.0")))],
-        refs=("https://github.com/lodash/lodash/issues/1",),
-    )
-    cnas = {"ExampleCNA": {"confirmed": 3, "errors": 1, "pending": 0}}
-    result = match(
-        [by_name, by_names],
-        inv,
-        {("npm", "lodash"): ("github.com/lodash/lodash",)},
-        cnas,
-    )
-    confidence = {c["rule"]: c["confidence"] for c in result.candidates}
-    assert confidence == {
-        "T1": {
-            "basis": "cna_history",
-            "cna": "ExampleCNA",
-            "confirmed": 3,
-            "errors": 1,
-            "pending": 0,
-            "ratio": 0.75,
-        },
-        "T3": {"basis": "name_match"},
-    }
-
-
 # --- the CVE index --------------------------------------------------------------
 
 BUILT = "2030-01-10T03:21:00Z"
@@ -1205,16 +1128,11 @@ def slim(cve: str, **fields: Any) -> dict[str, Any]:
 def write_index(
     directory: Path,
     records: list[dict[str, Any]],
-    cnas: Mapping[str, Mapping[str, int]] | None = None,
     **metadata: Any,
 ) -> Path:
     bci = ew.builder()
     directory.mkdir(parents=True, exist_ok=True)
     bci.write_jsonl_gz(directory / "cves.jsonl.gz", records)
-    bci.write_json(
-        directory / "reputation.json",
-        {"schema_version": 1, "cnas": dict(cnas or {})},
-    )
     bci.write_json(
         directory / "metadata.json",
         {
@@ -1291,12 +1209,10 @@ def caught_up(index: Any, net: FakeDownloader, tmp_path: Path) -> Any:
     return index
 
 
-def test_an_index_is_read_with_its_reputation(tmp_path: Path) -> None:
-    cnas = {"Google": {"confirmed": 1, "errors": 0, "pending": 2}}
-    directory = write_index(tmp_path / "index", [slim("CVE-2030-0001")], cnas)
+def test_an_index_is_read(tmp_path: Path) -> None:
+    directory = write_index(tmp_path / "index", [slim("CVE-2030-0001")])
     index = loaded(directory)
     assert set(index.records) == {"CVE-2030-0001"}
-    assert index.cnas == cnas
     assert (index.ref, index.digest) == (IMAGE + ":1", DIGEST)
     assert ew.index_document(index) == {
         "ref": IMAGE + ":1",
@@ -1314,19 +1230,6 @@ def test_an_index_is_read_with_its_reputation(tmp_path: Path) -> None:
         lambda d: (d / "metadata.json").write_text('{"schema_version": 2}'),
         lambda d: (d / "metadata.json").write_text(
             '{"schema_version": 1, "gaps": [{"from": "x", "to": "y"}]}'
-        ),
-        lambda d: (d / "reputation.json").unlink(),
-        lambda d: (d / "reputation.json").write_text("{"),
-        lambda d: (d / "reputation.json").write_text('{"schema_version": 1}'),
-        lambda d: (d / "reputation.json").write_text(
-            '{"schema_version": 2, "cnas": {}}'
-        ),
-        lambda d: (d / "reputation.json").write_text(
-            '{"schema_version": 1, "cnas": {"A": {"confirmed": 1}}}'
-        ),
-        lambda d: (d / "reputation.json").write_text(
-            '{"schema_version": 1, "cnas": {"A": {"confirmed": 1, "errors": true, '
-            '"pending": 0}}}'
         ),
     ],
 )
@@ -1744,7 +1647,7 @@ def guava_network() -> FakeNetwork:
 
 
 def guava_index(tmp_path: Path, **metadata: Any) -> Path:
-    """An index with a Guava CVE of a CNA with a history, and one of an unknown CNA."""
+    """An index with a Guava CVE."""
     return write_index(
         tmp_path / "cve-index",
         [
@@ -1755,7 +1658,6 @@ def guava_index(tmp_path: Path, **metadata: Any) -> Path:
                 updated="2030-01-09T18:00:00Z",
             ),
         ],
-        {"Google": {"confirmed": 9, "errors": 1, "pending": 2}},
         **metadata,
     )
 
@@ -1832,15 +1734,7 @@ def test_run_writes_the_part(ws: Workspace, tmp_path: Path) -> None:
     assert candidate["cve"] == "CVE-2030-0001"
     assert candidate["package"]["name"] == "com.google.guava:guava"
     assert set(candidate["sightings"]) == {"source-development", "app-development"}
-    assert candidate["rule"] == "T2"
-    assert candidate["confidence"] == {
-        "basis": "cna_history",
-        "cna": "Google",
-        "confirmed": 9,
-        "errors": 1,
-        "pending": 2,
-        "ratio": 0.9,
-    }
+    assert candidate["match"] == "source_repo"
 
 
 def test_run_pulls_the_index_and_reports_its_digest(
@@ -1870,7 +1764,7 @@ def test_deltas_since_the_index_are_part_of_the_result(
 ) -> None:
     ws.add_target("source-development", trivy_native(*GUAVA_PURLS))
     net = todays_deltas()
-    # published after the index was built, by a CNA that the index does not know
+    # published after the index was built
     net.hour(
         "2030-01-10",
         9,
@@ -1891,8 +1785,7 @@ def test_deltas_since_the_index_are_part_of_the_result(
     )
     candidates = {c["cve"]: c for c in ws.json("candidates.json")["candidates"]}
     assert set(candidates) == {"CVE-2030-0001", "CVE-2030-0002"}
-    assert candidates["CVE-2030-0002"]["rule"] == "T1"
-    assert candidates["CVE-2030-0002"]["confidence"]["ratio"] is None
+    assert candidates["CVE-2030-0002"]["match"] == "package_name"
 
 
 def test_run_reports_the_gaps_of_the_feed(

@@ -687,7 +687,7 @@ def render_unfixed(
 ) -> list[str]:
     """Findings without a fix in the databases.
 
-    The dependencies are open if anything HIGH or CRITICAL is in them, else
+    The dependencies are open if anything CRITICAL is in them, else
     collapsed; the OS packages of the base image are always collapsed.
     """
     unfixed = [r for r in records if not r["fix_available"]]
@@ -735,7 +735,7 @@ def render_unfixed_dependencies(
     ]
     table = md_table(["#", *header], ([i, *row] for i, row in enumerate(rows, 1)))
     title = "No fix available"
-    if any(r["severity"] in ("CRITICAL", "HIGH") for r in unfixed):
+    if any(r["severity"] == "CRITICAL" for r in unfixed):
         return ["", f"## {title}", "", *table]
     return ["", *md_details(f"{title} ({len(unfixed)})", table)]
 
@@ -819,7 +819,7 @@ def render_severity_section(
     ]
     body = md_table(header, rows)
     summary = f"{severity} ({len(records)})"
-    return md_details(summary, body, is_open=severity in ("CRITICAL", "HIGH"))
+    return md_details(summary, body, is_open=severity == "CRITICAL")
 
 
 def render_severity_sections(

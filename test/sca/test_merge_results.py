@@ -511,9 +511,9 @@ def test_summary_md_sections(full: Workspace) -> None:
     assert md.startswith("# SCA · example/app\n")
     assert "<summary>Scan coverage</summary>" in md
     assert "## No fix available" in md  # a CRITICAL is in it
-    # CRITICAL and HIGH are expanded, the others collapsed
+    # only CRITICAL is expanded, the others collapsed
     assert "<details open>\n<summary>CRITICAL (1)</summary>" in md
-    assert "<details open>\n<summary>HIGH (1)</summary>" in md
+    assert "<details>\n<summary>HIGH (1)</summary>" in md
     assert "<details>\n<summary>MEDIUM (1)</summary>" in md
     # the OS packages are one collapsed block of their own
     assert "<details>\n<summary>Base image (OS packages) (2)</summary>" in md
@@ -1347,7 +1347,7 @@ def test_summary_md_shows_chains_in_actions_watch_and_paths_section(
         "| 1 | braces 3.0.3 · npm | 1 HIGH | dev, indirect | jest › core › braces "
         "| not in production · dev dependency |" in md
     )
-    assert "## No fix available" in md
+    assert "No fix available (1)" in md  # collapsed: only a HIGH
     assert "<summary>Dependency paths (1)</summary>" in md
     assert "- **braces 3.0.3** (1 path)\n  - jest › core › braces" in md
     # react is a runtime dependency: source only, but not marked as not in production
@@ -1383,7 +1383,7 @@ def test_summary_md_without_indirect_packages_has_no_paths_section(
     assert "Dependency paths" not in md
 
 
-def test_watch_section_is_collapsed_without_high_or_critical(tmp_path: Path) -> None:
+def test_watch_section_is_collapsed_without_critical(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(DEV))
     ws.add_part("app-development", None)
     (ws.trivy_parts / "app-development.json").write_text(
@@ -1395,7 +1395,7 @@ def test_watch_section_is_collapsed_without_high_or_critical(tmp_path: Path) -> 
     assert "## No fix available" not in md
 
 
-def test_watch_section_is_open_with_high_or_critical(full: Workspace) -> None:
+def test_watch_section_is_open_with_critical(full: Workspace) -> None:
     full.run()
     md = (full.out / "summary.md").read_text(encoding="utf-8")
     assert "\n## No fix available\n\n| # | Package |" in md
@@ -3724,7 +3724,7 @@ def test_findings_by_severity_keep_the_os_packages_in_one_collapsed_block(
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     dependencies, base = md.split("<summary>Base image (OS packages) (2)</summary>")
     # the dependency sections count dependencies only
-    assert "<details open>\n<summary>HIGH (1)</summary>" in dependencies
+    assert "<details>\n<summary>HIGH (1)</summary>" in dependencies
     assert "CVE-A" not in dependencies.split("<summary>HIGH (1)</summary>")[1]
     assert "<summary>LOW" not in dependencies
     # the block of the OS packages holds a section per severity

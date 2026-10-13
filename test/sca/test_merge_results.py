@@ -152,6 +152,13 @@ def records_by_cve(ws: Workspace) -> dict[str, dict[str, Any]]:
     return {r["cve"]: r for r in ws.json("_report/vulnerabilities.json")["records"]}
 
 
+def without_diff(item: dict[str, Any]) -> dict[str, Any]:
+    """A record or an early warning without its ``diff`` (what changed since the
+    baseline run, tested in test_diff.py), to compare the rest.
+    """
+    return {k: v for k, v in item.items() if k != "diff"}
+
+
 # ---------------------------------------------------------------- merging
 
 
@@ -220,7 +227,7 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "CVE-2000-0002",  # source_only, CRITICAL
         "CVE-2000-0003",  # source_only, MEDIUM
     ]
-    openssl = records_by_cve(full)["CVE-2000-0011"]
+    openssl = without_diff(records_by_cve(full)["CVE-2000-0011"])
     assert openssl == {
         "repo": "example/app",
         "cve": "CVE-2000-0011",
@@ -251,7 +258,6 @@ def test_record_fields_and_ordering(full: Workspace) -> None:
         "published": "2020-01-01T00:00:00Z",
         "primary_url": "https://example.invalid/CVE-2000-0011",
         "scanners": ["trivy"],
-        "diff": "baseline",
     }
     assert records_by_cve(full)["CVE-2000-0001"]["pkg_type"] == "library"
 
@@ -670,8 +676,10 @@ def test_summary_md_separates_headline_lines(full: Workspace) -> None:
     # a bare newline would merge the paragraphs into one
     assert quote[0].startswith("> **") and quote[1] == ">"
     assert quote[2].startswith("> | Scope |")
-    assert quote[-4] == ">" and quote[-3] == "> 3/3 targets scanned"
-    assert quote[-2] == ">" and quote[-1].startswith("> No baseline to compare with")
+    scanned = quote.index("> 3/3 targets scanned")
+    assert quote[scanned - 1] == ">"
+    if scanned + 1 < len(quote):  # a paragraph after it is separated as well
+        assert quote[scanned + 1] == ">"
     assert all(line.startswith(">") for line in quote)
 
 

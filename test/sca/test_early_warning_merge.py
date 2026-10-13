@@ -16,6 +16,7 @@ from test_merge_results import (
     make_targets_doc,
     mr,
     records_by_cve,
+    without_diff,
 )
 
 GUAVA = {
@@ -198,7 +199,7 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
     assert document["generated_from"] == GENERATED_FROM
     assert document["status"] == "ok"
     (entry,) = document["entries"]
-    assert entry == {
+    assert without_diff(entry) == {
         "cve": "CVE-2030-0001",
         "aliases": [],
         "cna": "Google",
@@ -222,7 +223,6 @@ def test_an_early_warning_is_reported_and_is_not_a_finding(ws: Workspace) -> Non
         "scan_targets": ["source-development"],
         "locations": ["gradle.lockfile"],
         "exposure": "source_only",
-        "diff": "baseline",
     }
     # not a record, not in the totals
     assert "CVE-2030-0001" not in records_by_cve(ws)
@@ -603,8 +603,8 @@ def test_section_is_there_without_any_records(tmp_path: Path) -> None:
 
 def headline(ws: Workspace) -> str:
     quoted = [line for line in summary(ws).splitlines() if line.startswith("> ")]
-    # the last paragraph is what changed since the baseline
-    return quoted[-2]
+    # the paragraph with the totals line, the one that reports the early warnings
+    return next(line for line in quoted if " targets scanned" in line)
 
 
 def test_headline_counts_early_warnings_and_names_the_urgent_ones(

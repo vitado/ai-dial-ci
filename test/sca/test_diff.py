@@ -373,13 +373,20 @@ def test_a_package_upgrade_is_resolved_and_new(tmp_path: Path) -> None:
 
 def test_python_package_names_are_compared_pep_503_style(tmp_path: Path) -> None:
     mako = {"repo": "r", "cve": "C", "pkg": "Mako", "version": "1"}
-    assert mr.record_key({**mako, "ecosystem": ["python-pkg"]}) == (
+    assert sca_diff.record_key(
+        mr.diff_tools(), {**mako, "ecosystem": ["python-pkg"]}
+    ) == (
         "r",
         "C",
         "mako",
         "1",
     )
-    assert mr.record_key({**mako, "ecosystem": ["npm"]}) == ("r", "C", "Mako", "1")
+    assert sca_diff.record_key(mr.diff_tools(), {**mako, "ecosystem": ["npm"]}) == (
+        "r",
+        "C",
+        "Mako",
+        "1",
+    )
 
 
 def test_no_baseline_marks_records_baseline_not_new(tmp_path: Path) -> None:
@@ -513,7 +520,7 @@ def test_summary_line_and_marks(tmp_path: Path) -> None:
 
 def test_the_resolved_list_is_short(tmp_path: Path) -> None:
     def mutate(report: dict[str, Any], vulns: dict[str, Any]) -> None:
-        for i in range(mr.MAX_LISTED_RESOLVED + 5):
+        for i in range(sca_diff.MAX_LISTED_RESOLVED + 5):
             gone = copy.deepcopy(vulns["records"][0])
             gone.update(cve=f"CVE-9999-{i:04d}")
             vulns["records"].append(gone)
@@ -521,10 +528,10 @@ def test_the_resolved_list_is_short(tmp_path: Path) -> None:
     baseline = baseline_of(make_ws(tmp_path, "41"), mutate)
     ws = make_ws(tmp_path, "42")
     diff = merged(ws, baseline)
-    assert len(diff["resolved"]) == mr.MAX_LISTED_RESOLVED + 5
+    assert len(diff["resolved"]) == sca_diff.MAX_LISTED_RESOLVED + 5
     text = summary(ws)
     assert "+5 more, see `_report/diff.json`" in text
-    assert text.count("| CVE-9999-") == mr.MAX_LISTED_RESOLVED
+    assert text.count("| CVE-9999-") == sca_diff.MAX_LISTED_RESOLVED
 
 
 def test_not_comparable_is_counted_in_the_line(tmp_path: Path) -> None:

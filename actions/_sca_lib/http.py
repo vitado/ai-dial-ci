@@ -2,8 +2,8 @@
 
 The transport (``(method, url, headers, body) -> Response``) is injectable, so the
 code that uses it is tested with no network. ``backoff_delay`` is the retry policy
-(429/5xx and network errors, exponential backoff, ``Retry-After``) of
-``HttpClient``.
+(429/5xx and network errors, exponential backoff, ``Retry-After``) that the
+streaming downloader of the CVE index shares with ``HttpClient``.
 """
 
 from __future__ import annotations

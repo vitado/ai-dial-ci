@@ -540,7 +540,6 @@ def test_summary_md_sections(full: Workspace) -> None:
     full.run()
     md = plain((full.out / "summary.md").read_text(encoding="utf-8"))
     assert md.startswith("# SCA · example/app\n")
-    assert "## What to fix" in md
     assert "<summary>Scan coverage</summary>" in md
     assert "## No fix available — watch" in md  # a CRITICAL is in it
     # CRITICAL and HIGH are expanded, the others collapsed
@@ -568,31 +567,7 @@ def test_summary_md_sections(full: Workspace) -> None:
     assert "> | development | 0 | 1 | 1 | 0 | 2 | 1 |" in md
     assert "> | Source only (build / test) | 1 | 0 | 1 | 0 | 1 | — |" in md
     assert "> 3/3 targets scanned\n" in md
-    # what to fix: only what an upgrade resolves; the OS packages are one row of
-    # the base image, listed below the table
-    assert (
-        "| 1 | Base image · alpine (1 package) | rebuild on an updated base image "
-        "| 1 MEDIUM | Released 1.0.0 + development "
-        "| Rebuild on an updated base image in development, backport to release-1.0 "
-        "| image :development, :1.0.0 |" in md
-    )
-    assert (
-        "<summary>Base image packages (1)</summary>\n\n"
-        "| # | Package | Upgrade | Resolves | Exposure | Action | Where |\n"
-        "|---:|---|---|---|---|---|---|\n"
-        "| 1 | zlib · alpine (base image) | 1.2.0 → 1.2.1 | 1 MEDIUM "
-        "| Released 1.0.0 + development "
-        "| Rebuild on an updated base image in development, backport to release-1.0 "
-        "| image :development, :1.0.0 |" in md
-    )
-    assert (
-        "| 3 | org.example:lib · java | 1.0 → 1.1 | 1 MEDIUM "
-        "| Source only · not in images "
-        "| Upgrade in development — not in published images |" in md
-    )
-    fix_table = md.split("## What to fix")[1].split("## No fix available")[0]
-    assert "minimist" not in fix_table
-    assert "openssl" not in fix_table
+    assert "## What to fix" not in md
     # the watch section: dependencies, then the OS packages collapsed
     assert (
         "| 1 | minimist 1.0.0 · npm | 1 CRITICAL | - | - | Source only · not in images "
@@ -703,7 +678,6 @@ def test_summary_md_labels_images_by_name_when_there_are_several(
     ws.add_part("other-development", "app-development")
     ws.run()
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert "app :development · other :development" in md
     assert "| other :development | ok · " in md
 
 
@@ -1748,13 +1722,6 @@ def test_python_package_names_are_one_package_across_ecosystems(
     assert ws.targets["source-development"]["findings"]["total"] == 1
     totals = ws.json("_report/scan_report.json")["totals"]["findings"]
     assert totals["by_exposure"]["source_only"] == 0
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert (
-        "| 1 | Mako · python | 1.3.12 → 1.4.2 | 1 HIGH "
-        "| Released 1.0.0 + development "
-        "| Upgrade in development, backport to release-1.0 "
-        "| image :development, :1.0.0 · source poetry.lock |" in md
-    )
 
 
 def test_display_name_falls_back_to_first_seen_without_an_image() -> None:
@@ -1783,22 +1750,15 @@ def test_case_sensitive_ecosystems_are_not_merged() -> None:
     assert len(records) == 2
 
 
-def test_package_cell_shows_ecosystem_families() -> None:
-    def cell(ecosystem: list[str], pkg_type: str = "library", rel=()) -> str:
-        record = {
-            "pkg": "p",
-            "pkg_type": pkg_type,
-            "ecosystem": ecosystem,
-            "relationship": list(rel),
-        }
-        return mr.package_cell([record])
+def test_package_families_group_the_ecosystems_of_a_package() -> None:
+    def families(*ecosystems: str) -> str:
+        return mr.package_families([{"ecosystem": list(ecosystems)}])
 
-    assert cell(["python-pkg", "poetry"], rel=["indirect"]) == "p · python, indirect"
-    assert cell(["node-pkg", "npm"]) == "p · npm"
-    assert cell(["gradle", "jar"]) == "p · java"
-    assert cell(["alpine"], "os") == "p · alpine (base image)"
-    assert cell(["conan"]) == "p · conan"
-    assert cell(["npm"], rel=["direct", "indirect"]) == "p · npm"
+    assert families("python-pkg", "poetry") == "python"
+    assert families("node-pkg", "npm") == "npm"
+    assert families("gradle", "jar") == "java"
+    assert families("alpine") == "alpine"
+    assert families("conan") == "conan"
 
 
 @pytest.mark.parametrize(
@@ -2085,17 +2045,18 @@ def test_summary_md_shows_chains_in_actions_watch_and_paths_section(
     # braces has no fix: watch section, the chain in "Introduced via"
     assert (
         "| 1 | braces 3.0.3 · npm | 1 HIGH | dev, indirect | jest › core › braces "
-        "| Source only · dev dependency |" in md
+        "| not in production · dev dependency |" in md
     )
     assert "## No fix available — watch" in md
     assert "<summary>Dependency paths (1)</summary>" in md
     assert "- **braces 3.0.3** (1 path)\n  - jest › core › braces" in md
-    # react is a runtime dependency with a fix and a direct one: no chain in Action
-    assert "| react · npm | 1.0.0 → 9.9 | 1 HIGH | Source only · not in images " in md
-    assert "| Upgrade in development — not in published images |" in md
+    # react is a runtime dependency: source only, but not marked as not in production
+    assert "| react | 1.0.0 → 9.9 |" in md
+    assert "| Source only · not in images |" in md
+    assert "## What to fix" not in md
 
 
-def test_what_to_fix_action_names_the_chain_of_a_fixable_indirect_package(
+def test_fixable_dev_dependency_is_marked_not_in_production(
     tmp_path: Path,
 ) -> None:
     ws = graph_source(tmp_path, SOURCE, DEV)
@@ -2109,12 +2070,8 @@ def test_what_to_fix_action_names_the_chain_of_a_fixable_indirect_package(
     )
     ws.run()
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert (
-        "| braces · npm, indirect | 3.0.3 → 3.0.4 | 1 HIGH "
-        "| Source only · dev dependency "
-        "| Upgrade in development via jest › core › braces "
-        "— dev dependency, not shipped |" in md
-    )
+    assert "| braces | 3.0.3 → 3.0.4 |" in md
+    assert "| not in production · dev dependency |" in md
     assert "No fix available" not in md
 
 
@@ -2136,7 +2093,6 @@ def test_watch_section_is_collapsed_without_high_or_critical(tmp_path: Path) -> 
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "<details>\n<summary>No fix available — watch (1)</summary>" in md
     assert "## No fix available — watch" not in md
-    assert "## What to fix" not in md  # nothing can be fixed by an upgrade
 
 
 def test_watch_section_is_open_with_high_or_critical(full: Workspace) -> None:
@@ -2161,41 +2117,29 @@ def test_release_line(tag: str, expected: str) -> None:
     assert mr.release_line(tag) == expected
 
 
-def test_action_texts() -> None:
-    both, only = "release_and_development", "release_only"
-    assert mr.action_text(both, None, ["1.1.14"]) == (
-        "Upgrade in development, backport to release-1.1"
-    )
-    assert mr.action_text(both, None, ["1.1.14", "1.0.3", "1.0.4"]) == (
-        "Upgrade in development, backport to release-1.1, release-1.0"
-    )
-    assert mr.action_text(only, None, ["0.12.0"]) == (
-        "Release a patch from release-0.12 (already fixed in development)"
-    )
-    assert mr.action_text("development_only", None, []) == (
-        "Upgrade in development before the next release"
-    )
-    assert mr.action_text("source_only", True, [], "jest › braces") == (
-        "Upgrade in development via jest › braces — dev dependency, not shipped"
-    )
-    assert mr.action_text("source_only", False, []) == (
-        "Upgrade in development — not in published images"
-    )
-    assert mr.action_text(both, None, ["1.0.0"], "a › b") == (
-        "Upgrade in development via a › b, backport to release-1.0"
-    )
-
-
 def test_exposure_labels() -> None:
     label = mr.exposure_label
-    assert label("release_and_development", None, ["1.1.14", "1.0.3"], True) == (
+    assert label("release_and_development", [], ["1.1.14", "1.0.3"], True) == (
         "Released 1.1.14, 1.0.3 + development"
     )
-    assert label("release_only", None, ["0.12.0"], True) == "Released 0.12.0 only"
-    assert label("development_only", None, [], True) == "development only"
-    assert label("development_only", None, [], False) == "development (source)"
-    assert label("source_only", True, [], True) == "Source only · dev dependency"
-    assert label("source_only", None, [], True) == "Source only · not in images"
+    assert label("release_only", [], ["0.12.0"], True) == "Released 0.12.0 only"
+    assert label("development_only", [], [], True) == "development only"
+    assert label("development_only", [], [], False) == "development (source)"
+    assert label("source_only", [], [], True) == "Source only · not in images"
+    # source only without a reason is not marked as not in production
+    assert label("source_only", [], [], False) == "Source only"
+    assert label("source_only", ["dev dependency"], [], True) == (
+        "not in production · dev dependency"
+    )
+    assert label("source_only", ["not shipped path"], [], False) == (
+        "not in production · not shipped path"
+    )
+    assert label("source_only", ["dev dependency", "not shipped path"], [], True) == (
+        "not in production · dev dependency · not shipped path"
+    )
+    assert label("development_only", ["dev dependency"], [], False) == (
+        "development (source) · not in production · dev dependency"
+    )
 
 
 def test_exposure_label_lists_the_release_tags_of_the_images_it_was_found_in() -> None:
@@ -2205,7 +2149,7 @@ def test_exposure_label_lists_the_release_tags_of_the_images_it_was_found_in() -
     assert mr.release_tags_of([record], targets) == ["1.0.0", "0.9.0"]
 
 
-def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
+def test_mixed_package_is_in_watch_for_its_unfixed_cve_only(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(DEV))
     ws.add_part("app-development", None)
     native = native_with(
@@ -2221,12 +2165,7 @@ def test_mixed_package_is_in_what_to_fix_and_in_watch(tmp_path: Path) -> None:
     assert recs["CVE-1"]["upgrade_to"] == recs["CVE-3"]["upgrade_to"] == "2.9.1"
     assert recs["CVE-2"]["upgrade_to"] is None
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    fix = md.split("## What to fix")[1].split("<details")[0]
-    assert (
-        "| 1 | urllib3 · python | 2.7.0 → 2.9.1 | 1 HIGH, 1 LOW "
-        "· 1 without fix (see watch) "
-        "| development only |" in fix
-    )
+    assert "## What to fix" not in md
     assert "No fix available — watch (1)" in md  # collapsed: only a MEDIUM
     assert "| 1 | urllib3 2.7.0 · python | 1 MEDIUM |" in md
 
@@ -2627,13 +2566,8 @@ def test_release_only_finding_gets_paths_and_the_lockfile_of_its_tag(
         in md
     )
     assert "> | 1.0.0 (released) | 0 | 1 | 0 | 0 | 1 | 0 |" in md
-    assert (
-        "| 1 | urllib3 · python, indirect | 2.7.0 → 2.8.0 | 1 HIGH "
-        "| Released 1.0.0 only "
-        "| Release a patch from release-1.0 (already fixed in development) "
-        "via pyjwt › urllib3 (+1 more path) "
-        "| image :1.0.0 · source @ 1.0.0 poetry.lock |" in md
-    )
+    assert "| urllib3 | 2.7.0 → 2.8.0 |" in md
+    assert "| Released 1.0.0 only |" in md
     assert "<summary>Dependency paths (1)</summary>" in md
 
 
@@ -2656,9 +2590,6 @@ def test_finding_only_in_release_sources_is_source_only_when_there_are_images(
         "— 1 only in build / test dependencies**" in md
     )
     assert "| Source only · not in images |" in md
-    assert "source @ 1.0.0 poetry.lock" in md
-    # the default branch is clear of it, so there is nothing to upgrade there
-    assert "| Already fixed in development — not in published images |" in md
     # and it is not a release or development finding either
     assert "(released)" not in md
     assert "> | Source only (build / test) | 0 | 1 | 0 | 0 | 1 | — |" in md
@@ -2701,8 +2632,6 @@ def test_run_without_images_is_classified_and_headlined_by_the_sources(
     assert "> | development | 0 | 1 | 0 | 0 | 0 | 0 |" in md
     assert "Released 1.0.0, 0.9.0 only" in md
     assert "release-1.0, release-0.9" in md
-    assert "source @ 1.0.0 poetry.lock, source @ 0.9.0 poetry.lock" not in md
-    assert "source @ 1.0.0 poetry.lock · source @ 0.9.0 poetry.lock" in md
 
 
 def test_run_without_images_finding_in_tag_and_development_is_open_in_both(
@@ -2717,11 +2646,6 @@ def test_run_without_images_finding_in_tag_and_development_is_open_in_both(
     assert "> | 1.0.0 (released) | 0 | 1 | 0 | 0 | 1 | 0 |" in md
     assert "> | development | 0 | 1 | 0 | 0 | 1 | 0 |" in md
     assert "| Released 1.0.0 + development |" in md
-    assert (
-        "| Upgrade in development via pyjwt › urllib3 (+1 more path), "
-        "backport to release-1.0 | source poetry.lock · source @ 1.0.0 poetry.lock |"
-        in md
-    )
 
 
 def test_release_source_has_its_own_coverage_label(tmp_path: Path) -> None:
@@ -2775,20 +2699,6 @@ def test_without_release_sources_the_report_is_as_before(full: Workspace) -> Non
     assert "source @ development" in md
     assert "source @ 1.0.0" not in md
     assert all(r["exposure"] != "release_source" for r in records_by_id(full).values())
-
-
-def test_source_only_action_when_the_default_branch_is_clear() -> None:
-    assert mr.action_text("source_only", True, [], "a › b", False) == (
-        "Already fixed in development — dev dependency, not shipped"
-    )
-    assert mr.action_text("source_only", None, [], "", False) == (
-        "Already fixed in development — not in published images"
-    )
-    other = {"scan_targets": ["source-1.0.0"]}
-    both = {"scan_targets": ["source-1.0.0", "source-development"]}
-    targets = [SOURCE, RELEASE_SOURCE, DEV]
-    assert not mr.found_in_default_source([other], targets)
-    assert mr.found_in_default_source([other, both], targets)
 
 
 # ------------------------------------------------------------------------- OSV
@@ -4235,7 +4145,7 @@ def test_osv_only_on_an_image_python_package(tmp_path: Path) -> None:
     assert "> **Fix 1 UNKNOWN in development before the next release**" in md
     assert "| UNKNOWN | Fixable | Base image |" in md
     assert "found only by OSV" in md
-    assert "| Mako · python | 1.3.0 → 1.3.1 |" in md
+    assert "| Mako | 1.3.0 → 1.3.1 |" in md
 
 
 def test_osv_only_on_a_poetry_package_has_the_dependency_paths(
@@ -4267,7 +4177,6 @@ def test_osv_only_on_a_poetry_package_has_the_dependency_paths(
     assert record["dependency_paths_total"] == 1
     assert record["dev"] is False
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert "Upgrade in development via web › http › Leaf_Pkg" in md
     assert "<summary>Dependency paths (1)</summary>" in md
     assert "  - web › http › Leaf_Pkg" in md
 
@@ -4391,8 +4300,6 @@ def test_a_package_in_two_lockfiles_is_one_osv_record_with_both_locations(
     ws = merge_scan(tmp_path, trivy, osv, SOURCE)
     (record,) = ws.json("_report/vulnerabilities.json")["records"]
     assert record["locations"] == ["app/gradle.lockfile", "core/gradle.lockfile"]
-    md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert "source app/gradle.lockfile, core/gradle.lockfile" in md
 
 
 def test_merge_records_without_osv_scans_is_the_trivy_merge() -> None:
@@ -4522,7 +4429,7 @@ def test_summary_marks_the_osv_only_vulnerability_and_counts_them(
     assert md.count("OSV only") == 3
     assert "> 4/4 targets scanned · 3 found only by OSV" in md
     # OSV-only findings take part in the sections of the Trivy ones
-    assert "| 3 | @scope/pkg · npm | 1.0.0 → 1.0.1 | 1 HIGH |" in md
+    assert "| @scope/pkg | 1.0.0 → 1.0.1 |" in md
     assert (
         "| 2 | lodash 4.17.0 · npm | 1 LOW | runtime, indirect | express › lodash |"
         in md
@@ -4777,8 +4684,6 @@ def test_osv_only_finding_in_a_release_source_is_source_only_with_images(
         "— 1 only in build / test dependencies**" in md
     )
     assert "OSV only" in md
-    assert "source @ 1.0.0 poetry.lock" in md
-    assert "| Already fixed in development — not in published images |" in md
     # the OSV twin of the release source is a row of its own in the coverage
     assert "source @ 1.0.0 0011223" in md
 
@@ -4815,8 +4720,6 @@ def test_osv_only_finding_without_images_is_classified_by_the_sources(
     assert record["exposure"] == exposure
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert md.split("\n")[2] == f"> **{verdict}**"
-    if "source-1.0.0" in osv_ids:
-        assert "source @ 1.0.0 poetry.lock" in md
 
 
 def test_osv_and_trivy_findings_of_a_release_source_are_one_record(
@@ -4889,16 +4792,7 @@ def leaf_lang_result() -> dict[str, Any]:
     return lang_result("poetry", "poetry.lock", [package], [finding])
 
 
-def test_image_os_is_the_family_and_release_trivy_detected() -> None:
-    assert mr.image_os({"Metadata": {"OS": {"Family": "ubuntu", "Name": "24.04"}}}) == (
-        "ubuntu 24.04"
-    )
-    assert mr.image_os({"Metadata": {"OS": {"Family": "alpine"}}}) == "alpine"
-    assert mr.image_os({"Metadata": {}}) is None
-    assert mr.image_os({}) is None
-
-
-def test_os_packages_are_one_base_image_row_with_the_packages_below(
+def test_os_packages_have_a_column_of_their_own_in_the_scope_table(
     tmp_path: Path,
 ) -> None:
     image = os_native(
@@ -4913,27 +4807,6 @@ def test_os_packages_are_one_base_image_row_with_the_packages_below(
     trivy = {"app-development": image, "app-1.0.0": image}
     ws = merge_scan(tmp_path, trivy, {}, DEV, REL)
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    fix = md.split("## What to fix")[1].split("## No fix available")[0]
-    # one row of the base image, after the dependency, naming no OS package
-    assert "| 1 | leaf · python | 1.0 → 1.1 | 1 HIGH |" in fix
-    assert (
-        "| 2 | Base image · ubuntu 24.04 (2 packages) "
-        "| rebuild on an updated base image | 1 HIGH, 1 MEDIUM, 1 LOW "
-        "| Released 1.0.0 + development "
-        "| Rebuild on an updated base image in development, backport to release-1.0 "
-        "| image :development, :1.0.0 |" in fix
-    )
-    table = fix.split("<details>")[0]
-    assert "openssl" not in table and "zlib" not in table
-    # the packages are collapsed below the table, nothing is dropped
-    assert "<summary>Base image packages (2)</summary>" in fix
-    assert (
-        "| 1 | openssl · ubuntu (base image) | 3.0.0 → 3.0.1 | 1 HIGH, 1 LOW "
-        "| Released 1.0.0 + development "
-        "| Rebuild on an updated base image in development, backport to release-1.0 "
-        "| image :development, :1.0.0 |" in fix
-    )
-    assert "| 2 | zlib · ubuntu (base image) | 1.2 → 1.3 | 1 MEDIUM |" in fix
     # the headline counts them, in a column of their own
     assert "> | 1.0.0 (released) | 0 | 2 | 1 | 2 | 4 | 4 |" in md
 
@@ -5005,56 +4878,13 @@ def test_findings_by_severity_keep_the_os_packages_in_one_collapsed_block(
     assert md.count("<summary>Base image (OS packages)") == 1
 
 
-def test_base_image_rows_are_one_per_exposure_and_image_line(tmp_path: Path) -> None:
-    development = os_native(
-        "ubuntu",
-        "24.04",
-        os_vuln("CVE-X", "pkgx", "1.0", "1.1"),
-        os_vuln("CVE-Z", "pkgz", "1.0", "1.1"),
-    )
-    release = os_native(
-        "ubuntu",
-        "22.04",
-        os_vuln("CVE-Y", "pkgy", "1.0", "1.1"),
-        os_vuln("CVE-Z", "pkgz", "1.0", "1.1"),
-    )
-    trivy = {"app-development": development, "app-1.0.0": release}
-    ws = merge_scan(tmp_path, trivy, {}, DEV, REL)
-    md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    fix = md.split("## What to fix")[1].split("<details>")[0]
-    assert "| Base image · ubuntu 22.04 / ubuntu 24.04 (1 package) " in fix
-    assert (
-        "| Base image · ubuntu 24.04 (1 package) "
-        "| rebuild on an updated base image | 1 MEDIUM | development only "
-        "| Rebuild on an updated base image in development before the next release "
-        "| image :development |" in fix
-    )
-    assert (
-        "| Base image · ubuntu 22.04 (1 package) "
-        "| rebuild on an updated base image | 1 MEDIUM | Released 1.0.0 only "
-        "| Release a patch from release-1.0 rebuilt on an updated base image "
-        "(already fixed in development) | image :1.0.0 |" in fix
-    )
-
-
-def test_base_image_label_falls_back_to_the_package_manager() -> None:
-    records = [
-        {"scan_targets": ["a"], "ecosystem": ["alpine"]},
-        {"scan_targets": ["b"], "ecosystem": ["alpine"]},
-    ]
-    assert mr.base_image_label(records, {"a": "alpine 3.20"}) == "alpine 3.20"
-    assert mr.base_image_label(records, {}) == "alpine"
-    assert mr.base_image_label([{"scan_targets": [], "ecosystem": []}], {}) == "unknown"
-
-
 def test_summary_without_os_packages_has_no_base_image_blocks(tmp_path: Path) -> None:
     lock = source_with(leaf_lang_result())["source-development"]
     ws = merge_scan(tmp_path, {"source-development": lock}, {}, SOURCE)
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
-    assert "## What to fix" in md
+    assert "## What to fix" not in md
     assert "Base image packages" not in md
     assert "Base image (OS packages)" not in md
-    assert "base image" not in md.split("## What to fix")[1].split("<summary>")[0]
 
 
 def test_base_image_findings_have_no_dependency_paths(tmp_path: Path) -> None:
@@ -5144,17 +4974,8 @@ def test_a_jar_listed_under_the_fixed_version_too_needs_no_upgrade(
     assert record["upgrade_to"] is None
     assert record["fixed_versions"] == ["10.2.4.jre11", "12.10.2.jre11", "13.2.1.jre11"]
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    # no wrong upgrade, and only the fixes that are above the installed version
-    assert (
-        f"| 1 | {MSSQL} · java | 12.10.2 → no upgrade computed "
-        "(fixed in 12.10.2.jre11, 13.2.1.jre11) |" in md
-    )
+    # no wrong upgrade
     assert "| 12.10.2 → 12.10.2.jre11 |" not in md
-    # the action is to look at it, not to upgrade
-    assert (
-        "| Verify — app.jar/lib/x.jar is already at 12.10.2.jre11; "
-        "the scanner reports it under two versions |" in md
-    )
     assert "Upgrade in development" not in md
     # the record still counts in the table, but makes no action of the verdict
     assert "> **No known vulnerabilities in development**" in md

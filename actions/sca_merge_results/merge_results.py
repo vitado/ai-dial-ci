@@ -129,7 +129,12 @@ SKIP_IGNORE = "ignore"
 SKIP_MODES = (SKIP_AS_NON_SHIPPED, SKIP_APPLY, SKIP_IGNORE)
 TRIVY_CONFIG_SUFFIX = ".trivy-config.json"  # <id>.trivy-config.json of an fs target
 TRIVY_CONFIG_SCHEMA_VERSION = 1
-NOT_SHIPPED_MARK = "(not shipped)"
+# A finding that is certainly not in production, and why: marked the same way in
+# every table of summary.md
+NOT_IN_PRODUCTION = "not in production"
+REASON_DEV_DEPENDENCY = "dev dependency"
+REASON_NOT_SHIPPED_PATH = "not shipped path"
+NOT_SHIPPED_MARK = f"({NOT_IN_PRODUCTION} · {REASON_NOT_SHIPPED_PATH})"
 MAX_LISTED_SKIPS = 5
 
 GRADLE_RESULT_TYPE = "gradle"
@@ -857,13 +862,6 @@ def count_packages(native: Mapping[str, Any]) -> dict[str, int]:
 def image_digest(native: Mapping[str, Any]) -> str | None:
     digests = (native.get("Metadata") or {}).get("RepoDigests") or []
     return digests[0] if digests else None
-
-
-def image_os(native: Mapping[str, Any]) -> str | None:
-    """``ubuntu 24.04``: the OS of an image, as Trivy detected it."""
-    detected = (native.get("Metadata") or {}).get("OS") or {}
-    parts = (detected.get("Family"), detected.get("Name"))
-    return " ".join(p for p in parts if p) or None
 
 
 def package_type(result: Mapping[str, Any]) -> str:
@@ -3175,7 +3173,7 @@ def render_headline(blocks: Sequence[Sequence[str]]) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# summary.md: "What to fix"
+# summary.md: shared helpers of the findings tables
 # --------------------------------------------------------------------------
 
 
@@ -3217,46 +3215,6 @@ def group_fixes(records: Iterable[Record]) -> list[list[Record]]:
             group, group[0]["pkg"] or "", group[0]["version"] or ""
         ),
     )
-
-
-def base_image_label(group: Iterable[Record], base_os: Mapping[str, str]) -> str:
-    """The base image line of OS records: ``ubuntu 24.04`` (the OS of the images they
-    were found in), ``alpine`` (the package manager) if no image reports its OS.
-    """
-    group = list(group)
-    labels = {
-        base_os[tid] for r in group for tid in r["scan_targets"] if tid in base_os
-    }
-    labels = labels or {e for r in group for e in r["ecosystem"]}
-    return " / ".join(sorted(labels)) or "unknown"
-
-
-def base_image_groups(
-    records: Iterable[Record], base_os: Mapping[str, str]
-) -> list[tuple[str, list[Record]]]:
-    """One group per (exposure, base image line), most urgent first."""
-    groups: dict[tuple[str, str], list[Record]] = {}
-    for record in records:
-        label = base_image_label([record], base_os)
-        groups.setdefault((record["exposure"], label), []).append(record)
-    ordered = sorted(
-        ((label, group) for (_, label), group in groups.items()),
-        key=lambda item: urgency_key(item[1], item[0], ""),
-    )
-    return ordered
-
-
-def package_cell(group: Sequence[Record]) -> str:
-    first = group[0]
-    text = str(first["pkg"])
-    families = package_families(group)
-    if families:
-        text += f" · {families}"
-    if group_relationship(group) == "indirect":
-        text += ", indirect"
-    if first["pkg_type"] == "os":
-        text += " (base image)"
-    return text
 
 
 def package_families(group: Iterable[Record]) -> str:
@@ -3326,26 +3284,6 @@ def fixed_versions_text(versions: Iterable[str], installed: str | None = None) -
     return f"{text} +{hidden} more" if hidden > 0 else text
 
 
-def upgrade_cell(fixable: Sequence[Record]) -> str:
-    version = fixable[0]["version"]
-    upgrade = fixable[0]["upgrade_to"]
-    if upgrade:
-        return f"{version} → {upgrade}"
-    fixed = fixed_versions_text(
-        (f for r in fixable for f in r["fixed_versions"]), version
-    )
-    return f"{version} → no upgrade computed (fixed in {fixed})"
-
-
-def resolves_cell(group: Sequence[Record]) -> str:
-    """Severities an upgrade resolves, and how many CVEs of the package it does not."""
-    fixable = [r for r in group if r["fix_available"]]
-    counts = count_by_severity(r["severity"] for r in fixable)
-    text = format_severity_counts(counts, ", ")
-    unfixed = len(group) - len(fixable)
-    return f"{text} · {unfixed} without fix (see watch)" if unfixed else text
-
-
 def release_tags_of(
     group: Iterable[Record], targets: Sequence[Mapping[str, Any]]
 ) -> list[str]:
@@ -3375,73 +3313,68 @@ def release_lines(tags: Iterable[str]) -> list[str]:
 
 
 def exposure_label(
-    exposure: str, dev: bool | None, tags: Sequence[str], has_images: bool
-) -> str:
-    """Where the finding lives (a state, not an action)."""
-    released = ", ".join(tags)
-    if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
-        return f"Released {released} + development"
-    if exposure == EXPOSURE_RELEASE_ONLY:
-        return f"Released {released} only"
-    if exposure == EXPOSURE_SOURCE_ONLY:
-        if dev:
-            return "Source only · dev dependency"
-        return (
-            "Source only · not in images" if has_images else "Source only · not shipped"
-        )
-    return "development only" if has_images else "development (source)"
-
-
-def found_in_default_source(
-    group: Iterable[Record], targets: Sequence[Mapping[str, Any]]
-) -> bool:
-    """Whether a group was found in the source of the default branch."""
-    found = {tid for r in group for tid in r["scan_targets"]}
-    return any(t["id"] in found and target_class(t) == CLASS_SOURCE for t in targets)
-
-
-def action_text(
     exposure: str,
-    dev: bool | None,
+    reasons: Sequence[str],
     tags: Sequence[str],
-    via: str = "",
-    open_in_development: bool = True,
-    base_image: bool = False,
-    has_images: bool = True,
+    has_images: bool,
 ) -> str:
-    """What to do, verb first; ``via`` is the dependency chain to upgrade through.
-
-    ``open_in_development`` is False for a finding that sits only in the source of
-    a release tag: the default branch is clear of it, so there is nothing to upgrade.
-    A ``base_image`` finding is fixed by rebuilding on an updated base image.
+    """Where the finding lives (a state, not an action). ``reasons`` are why it is
+    certainly not in production (see ``not_in_production_reasons``), if it is not:
+    ``not in production · dev dependency``.
     """
-    lines = ", ".join(release_lines(tags))
-    via_text = f" via {via}" if via else ""
-    if base_image:
-        if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
-            return (
-                f"Rebuild on an updated base image in development, backport to {lines}"
-            )
-        if exposure == EXPOSURE_RELEASE_ONLY:
-            return (
-                f"Release a patch from {lines} rebuilt on an updated base image "
-                "(already fixed in development)"
-            )
-        return "Rebuild on an updated base image in development before the next release"
-    if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
-        return f"Upgrade in development{via_text}, backport to {lines}"
-    if exposure == EXPOSURE_RELEASE_ONLY:
-        return f"Release a patch from {lines} (already fixed in development){via_text}"
+    released = ", ".join(tags)
+    mark = " · ".join([NOT_IN_PRODUCTION, *reasons]) if reasons else ""
     if exposure == EXPOSURE_SOURCE_ONLY:
-        note = (
-            "dev dependency, not shipped"
-            if dev
-            else ("not in published images" if has_images else "not shipped")
-        )
-        if not open_in_development:
-            return f"Already fixed in development — {note}"
-        return f"Upgrade in development{via_text} — {note}"
-    return f"Upgrade in development{via_text} before the next release"
+        if mark:
+            return mark
+        return "Source only · not in images" if has_images else "Source only"
+    if exposure == EXPOSURE_RELEASE_AND_DEVELOPMENT:
+        text = f"Released {released} + development"
+    elif exposure == EXPOSURE_RELEASE_ONLY:
+        text = f"Released {released} only"
+    else:
+        text = "development only" if has_images else "development (source)"
+    return f"{text} · {mark}" if mark else text
+
+
+def in_not_shipped_paths(
+    record: Record,
+    sightings: Sightings,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None,
+) -> bool:
+    """Whether every location the record was seen in is a not shipped one (in sources
+    only: a sighting in an image is never one).
+    """
+    if not not_shipped:
+        return False
+    kinds = {t["id"]: t.get("kind") for t in targets}
+    seen = sightings.get(record_identity(record), {})
+    return bool(seen) and all(
+        kinds.get(tid) == KIND_FS
+        and bool(locations)
+        and all(not_shipped.matches(tid, loc) for loc in locations)
+        for tid, locations in seen.items()
+    )
+
+
+def not_in_production_reasons(
+    group: Sequence[Record],
+    sightings: Sightings,
+    targets: Sequence[Mapping[str, Any]],
+    not_shipped: NotShipped | None,
+) -> list[str]:
+    """Why a group is certainly not in production: it is a dev dependency
+    (``dev``), and / or every location of it is in ``non_shipped_paths``. Empty if
+    neither is known (``Source only`` alone is not one: for a library the source is
+    the product).
+    """
+    reasons = []
+    if group_dev(group):
+        reasons.append(REASON_DEV_DEPENDENCY)
+    if all(in_not_shipped_paths(r, sightings, targets, not_shipped) for r in group):
+        reasons.append(REASON_NOT_SHIPPED_PATH)
+    return reasons
 
 
 def where_cell(
@@ -3488,157 +3421,18 @@ def where_cell(
 
 
 def group_exposure_label(
-    group: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+    group: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None,
 ) -> str:
     has_images = any(t.get("kind") == KIND_IMAGE for t in targets)
     return exposure_label(
         group[0]["exposure"],
-        group_dev(group),
+        not_in_production_reasons(group, sightings, targets, not_shipped),
         release_tags_of(group, targets),
         has_images,
     )
-
-
-WHAT_TO_FIX_HEADER = [
-    "#",
-    "Package",
-    "Upgrade",
-    "Resolves",
-    "Exposure",
-    "Action",
-    "Where",
-]
-BASE_IMAGE_UPGRADE = "rebuild on an updated base image"
-
-
-def verify_action(fixable: Sequence[Record]) -> str:
-    """The action for a package whose file already holds the fix (see
-    ``fixed_in_place``): look at it, there is nothing to upgrade.
-    """
-    first = fixable[0]
-    where = (first["pkg_paths"] or first["locations"] or ["the file"])[0]
-    fixed = minimal_fix(first["version"], first["fixed_versions"]) or "a fixed version"
-    return (
-        f"Verify — {where} is already at {fixed}; "
-        "the scanner reports it under two versions"
-    )
-
-
-def package_fix_row(
-    group: Sequence[Record],
-    sightings: Sightings,
-    targets: Sequence[Mapping[str, Any]],
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
-    not_shipped: NotShipped | None = None,
-) -> list[Any]:
-    """A package version with a fixable CVE: what resolves it, and what to do."""
-    fixable = [r for r in group if r["fix_available"]]
-    base_image = is_base_image(group[0])
-    if all(record_identity(r) in in_place for r in fixable):
-        action = verify_action(fixable)
-    else:
-        action = action_text(
-            group[0]["exposure"],
-            group_dev(group),
-            release_tags_of(group, targets),
-            shortest_path_text(group)
-            if group_relationship(group) == "indirect"
-            else "",
-            found_in_default_source(group, targets),
-            base_image,
-            any(t.get("kind") == KIND_IMAGE for t in targets),
-        )
-    return [
-        package_cell(group),
-        upgrade_cell(fixable),
-        resolves_cell(group),
-        group_exposure_label(group, targets),
-        action,
-        where_cell(fixable, sightings, targets, not_shipped),
-    ]
-
-
-def base_image_row(
-    label: str,
-    group: Sequence[Record],
-    sightings: Sightings,
-    targets: Sequence[Mapping[str, Any]],
-    not_shipped: NotShipped | None = None,
-) -> list[Any]:
-    """The OS packages of one exposure and base image line that a rebuild fixes."""
-    packages = len({(r["pkg"], r["version"]) for r in group})
-    noun = "package" if packages == 1 else "packages"
-    counts = count_by_severity(r["severity"] for r in group)
-    return [
-        f"Base image · {label} ({packages} {noun})",
-        BASE_IMAGE_UPGRADE,
-        format_severity_counts(counts, ", "),
-        group_exposure_label(group, targets),
-        action_text(
-            group[0]["exposure"],
-            None,
-            release_tags_of(group, targets),
-            base_image=True,
-        ),
-        where_cell(group, sightings, targets, not_shipped),
-    ]
-
-
-def render_what_to_fix(
-    records: Sequence[Record],
-    sightings: Sightings,
-    targets: Sequence[Mapping[str, Any]],
-    base_os: Mapping[str, str] | None = None,
-    in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
-    not_shipped: NotShipped | None = None,
-) -> list[str]:
-    """Packages with at least one CVE an upgrade resolves; empty if there are none.
-
-    The OS packages of a base image are one row per base image line (they are all
-    fixed by the same rebuild), with the packages themselves in a collapsed block
-    below the table.
-    """
-    base_os = base_os or {}
-    dependencies = [r for r in records if not is_base_image(r)]
-    os_records = [r for r in records if is_base_image(r) and r["fix_available"]]
-    rows: list[tuple[tuple[Any, ...], list[Any]]] = []
-    for group in group_fixes(dependencies):
-        if any(r["fix_available"] for r in group):
-            key = urgency_key(group, group[0]["pkg"] or "", group[0]["version"] or "")
-            rows.append(
-                (
-                    key,
-                    package_fix_row(group, sightings, targets, in_place, not_shipped),
-                )
-            )
-    for label, group in base_image_groups(os_records, base_os):
-        key = urgency_key(group, label, "")
-        rows.append(
-            (key, base_image_row(label, group, sightings, targets, not_shipped))
-        )
-    if not rows:
-        return []
-    rows.sort(key=lambda row: row[0])
-    table = md_table(
-        WHAT_TO_FIX_HEADER,
-        ([i, *row] for i, (_, row) in enumerate(rows, 1)),
-        right=(0,),
-    )
-    lines = ["## What to fix", "", *table]
-    packages = [
-        package_fix_row(group, sightings, targets, in_place, not_shipped)
-        for group in group_fixes(r for r in records if is_base_image(r))
-        if any(r["fix_available"] for r in group)
-    ]
-    if packages:
-        body = md_table(
-            WHAT_TO_FIX_HEADER,
-            ([i, *row] for i, row in enumerate(packages, 1)),
-            right=(0,),
-        )
-        summary = f"Base image packages ({len(packages)})"
-        lines += ["", *md_details(summary, body)]
-    return lines
 
 
 def render_dependency_paths(records: Sequence[Record]) -> list[str]:
@@ -3670,7 +3464,10 @@ def scope_cell(group: Sequence[Record]) -> str:
 
 
 def render_watch(
-    records: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+    records: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None = None,
 ) -> list[str]:
     """Findings without a fix: nothing to upgrade to, so watch, mitigate or replace.
 
@@ -3682,14 +3479,22 @@ def render_watch(
     os_records = [r for r in unfixed if is_base_image(r)]
     lines: list[str] = []
     if dependencies:
-        lines += render_watch_dependencies(dependencies, targets)
+        lines += render_watch_dependencies(
+            dependencies, targets, sightings, not_shipped
+        )
     if os_records:
-        lines += ["", *render_watch_base_image(os_records, targets)]
+        lines += [
+            "",
+            *render_watch_base_image(os_records, targets, sightings, not_shipped),
+        ]
     return lines
 
 
 def render_watch_dependencies(
-    unfixed: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+    unfixed: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None,
 ) -> list[str]:
     rows = []
     for group in group_fixes(unfixed):
@@ -3707,7 +3512,7 @@ def render_watch_dependencies(
                 format_severity_counts(counts, ", "),
                 scope_cell(group),
                 shortest_path_text(group),
-                group_exposure_label(group, targets),
+                group_exposure_label(group, targets, sightings, not_shipped),
                 suggested,
             ]
         )
@@ -3727,7 +3532,10 @@ def render_watch_dependencies(
 
 
 def render_watch_base_image(
-    unfixed: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+    unfixed: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None,
 ) -> list[str]:
     """OS packages without a fix: a new base image may bring one, and so may a wait."""
     rows = []
@@ -3737,7 +3545,7 @@ def render_watch_base_image(
             [
                 f"{group[0]['pkg']} {group[0]['version']}",
                 format_severity_counts(counts, ", "),
-                group_exposure_label(group, targets),
+                group_exposure_label(group, targets, sightings, not_shipped),
                 "Wait for a distribution fix or change the base image; "
                 "re-check on next scan",
             ]
@@ -3790,6 +3598,8 @@ def render_severity_section(
     severity: str,
     records: Sequence[Record],
     targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None,
 ) -> list[str]:
     rows = (
         [
@@ -3798,7 +3608,7 @@ def render_severity_section(
             installed_to_fixed_cell(r),
             cvss_cell(r),
             (r["published"] or "")[:10],
-            group_exposure_label([r], targets),
+            group_exposure_label([r], targets, sightings, not_shipped),
             short_title(r),
         ]
         for r in records
@@ -3818,7 +3628,10 @@ def render_severity_section(
 
 
 def render_severity_sections(
-    records: Sequence[Record], targets: Sequence[Mapping[str, Any]]
+    records: Sequence[Record],
+    targets: Sequence[Mapping[str, Any]],
+    sightings: Sightings,
+    not_shipped: NotShipped | None = None,
 ) -> list[str]:
     """The findings by severity: the dependencies, then the OS packages of the base
     image in one collapsed block (a base image is hundreds of lines of noise).
@@ -3826,7 +3639,7 @@ def render_severity_sections(
 
     def sections(group: Sequence[Record]) -> list[list[str]]:
         return [
-            render_severity_section(severity, selected, targets)
+            render_severity_section(severity, selected, targets, sightings, not_shipped)
             for severity in SEVERITIES
             if (selected := [r for r in group if r["severity"] == severity])
         ]
@@ -4054,7 +3867,7 @@ def early_warning_row(
         ", ".join(dates),
         " · ".join(ranges),
         ", ".join(matches),
-        group_exposure_label(group, targets),
+        group_exposure_label(group, targets, early_warning.sightings, not_shipped),
         where_cell(group, early_warning.sightings, targets, not_shipped),
     ]
 
@@ -4181,12 +3994,10 @@ def build_summary_md(
     report: Mapping[str, Any],
     vulns: Mapping[str, Any],
     sightings: Sightings,
-    base_os: Mapping[str, str] | None = None,
     in_place: Collection[tuple[Any, Any, Any]] = frozenset(),
     early_warning: EarlyWarning | None = None,
 ) -> str:
-    """``base_os`` is the OS of each scanned image (target id -> ``ubuntu 24.04``),
-    ``in_place`` the findings that are fixed in place (see ``fixed_in_place``),
+    """``in_place`` the findings that are fixed in place (see ``fixed_in_place``),
     ``early_warning`` the early warning of the run, if it has one.
     """
     records = vulns["records"]
@@ -4197,14 +4008,12 @@ def build_summary_md(
     lines = [f"# SCA · {md_cell(report['repo'])}", ""]
     lines += render_headline(headline_blocks(report, records, in_place, early_warning))
     if records:
-        fixes = render_what_to_fix(
-            records, sightings, record_targets, base_os, in_place, not_shipped
-        )
-        lines += ["", *fixes] if fixes else []
-        lines += render_watch(records, record_targets)
+        lines += render_watch(records, record_targets, sightings, not_shipped)
     lines += render_early_warning(early_warning, record_targets, not_shipped)
     if records:
-        lines += render_severity_sections(records, record_targets)
+        lines += render_severity_sections(
+            records, record_targets, sightings, not_shipped
+        )
         lines += render_dependency_paths(records)
     lines += render_coverage(targets)
     lines += render_footer(report, early_warning)
@@ -4365,19 +4174,9 @@ def run_merge(
                 "::warning title=Early warning unavailable::"
                 + escape_command_data(early_warning.report["reason"])
             )
-    base_os = {
-        t["id"]: label
-        for t, _, native in results
-        if native is not None
-        and t["scanner"] == SCANNER_TRIVY
-        and t.get("kind") == KIND_IMAGE
-        and (label := image_os(native))
-    }
     write_text(
         output_dir / "summary.md",
-        build_summary_md(
-            scan_report, vulns, sightings, base_os, in_place, early_warning
-        ),
+        build_summary_md(scan_report, vulns, sightings, in_place, early_warning),
     )
 
     failed = [t for t in scan_report["targets"] if t["status"] == STATUS_FAILED]

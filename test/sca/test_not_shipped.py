@@ -267,15 +267,45 @@ def test_summary_marks_not_shipped_locations_and_names_the_configuration(
     ws = workspace(tmp_path, ["app/", "core/"])
     ws.run()
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    assert "app/gradle.lockfile (not shipped)" in md
-    assert "core/gradle.lockfile (not shipped)" in md
-    assert "package-lock.json (not shipped)" not in md
     assert "Source only (build / test / not shipped)" in md
-    assert "Source only · not shipped" in md
+    # the finding of app/ and core/ is marked, the ones of package-lock.json are not
+    assert md.count("not in production · not shipped path") == 1
+    assert "Source only · not shipped" not in md
+    assert "(not shipped)" not in md
     assert (
         "<sub>Configuration: .github/sca.yml@bbbbbbb · not shipped: app/, core/</sub>"
         in md
     )
+
+
+def test_not_in_production_reasons() -> None:
+    targets = [SOURCE, DEV]
+    not_shipped = mr.NotShipped(["examples/"])
+
+    def reasons(
+        seen: dict[str, list[str]], dev: bool | None = None, shipped: bool = True
+    ) -> list[str]:
+        record = {"id": "CVE-1", "pkg": "p", "version": "1", "dev": dev}
+        sightings = {("CVE-1", "p", "1"): seen}
+        return mr.not_in_production_reasons(
+            [record], sightings, targets, not_shipped if shipped else None
+        )
+
+    source = "source-development"
+    assert reasons({source: ["examples/a.lock"]}) == ["not shipped path"]
+    assert reasons({source: ["examples/a.lock"]}, dev=True) == [
+        "dev dependency",
+        "not shipped path",
+    ]
+    assert reasons({source: ["p.lock"]}, dev=True) == ["dev dependency"]
+    # source only (a library's source is its product) is not a reason by itself
+    assert reasons({source: ["p.lock"]}) == []
+    assert reasons({source: ["p.lock"]}, dev=False) == []
+    # one shipped location, or an image, keeps the finding in production
+    assert reasons({source: ["examples/a.lock", "p.lock"]}) == []
+    assert reasons({source: ["examples/a.lock"], "app-development": ["x"]}) == []
+    assert reasons({source: ["examples/a.lock"]}, shipped=False) == []
+    assert reasons({}) == []
 
 
 def test_summary_without_not_shipped_paths_has_no_marks(tmp_path: Path) -> None:
@@ -323,7 +353,7 @@ def test_skip_paths_scanned_as_non_shipped_count_as_not_shipped(
     assert recs["CVE-2000-0003"]["exposure"] == "source_only"
     assert recs["CVE-2000-0001"]["exposure"] == "development_only"
     md = plain((ws.out / "summary.md").read_text(encoding="utf-8"))
-    assert "app/gradle.lockfile (not shipped)" in md
+    assert md.count("not in production · not shipped path") == 1
     assert (
         "trivy.yaml skip paths scanned, not shipped: app, core" in md
     )  # the coverage note

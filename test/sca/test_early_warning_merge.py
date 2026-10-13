@@ -318,7 +318,9 @@ def test_not_shipped_locations_do_not_count(tmp_path: Path) -> None:
         "CVE-2030-0001": "source_only",
         "CVE-2030-0002": "development_only",
     }
-    assert "examples/p.lock (not shipped)" in summary(workspace)
+    assert "examples/p.lock (not in production · not shipped path)" in summary(
+        workspace
+    )
 
 
 # -------------------------------------------------------------------- ordering
@@ -544,11 +546,14 @@ def test_severity_text_names_the_source_and_exploitation() -> None:
     )
 
 
-def test_section_comes_after_what_to_fix_and_the_watch_section(ws: Workspace) -> None:
+def test_section_comes_after_the_headline_and_before_the_coverage(
+    ws: Workspace,
+) -> None:
     write_part(ws, [candidate()])
     merge(ws)
     text = summary(ws)
-    assert text.index("## Early warning") > text.index("## What to fix")
+    assert "## What to fix" not in text
+    assert text.index("## Early warning") > text.index("> ")
     assert text.index("## Early warning") < text.index("Scan coverage")
 
 

@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""Check the language packages found by Trivy against OSV (https://osv.dev).
+"""Check the language packages found by Trivy against OSV with osv-scanner.
 
 Used by the SCA scheduled scan. Every Trivy target that was scanned successfully
-gets an OSV twin target (same id, scanner ``osv``): the packages of its
-``lang-pkgs`` Results are queried by their package URL (purl) from Trivy, with
-the version inside the purl. OS packages (``os-pkgs``) are not queried: Trivy and
-OSV take them from the same distribution feeds, and OSV needs its own
-distribution-to-ecosystem mapping for them, where a wrong mapping silently
-finds nothing.
-
-Per run: the purls of all targets are deduplicated and sent to
-``POST /v1/querybatch`` (in chunks, following ``next_page_token``), then every
-distinct vulnerability id is fetched once from ``GET /v1/vulns/{id}`` (the batch
-returns ids only; aliases, severity and affected ranges are in the record).
+gets an OSV twin target (same id, scanner ``osv``). The native Trivy JSON of the
+target is converted to a CycloneDX BOM (``trivy convert``), the components that
+Trivy covers with its own distribution feeds (OS packages: ``pkg:deb``,
+``pkg:apk``, ``pkg:rpm``) and the ones without a package URL are removed, and
+``osv-scanner scan source -L <id>.cdx.json --all-packages`` matches the rest
+with OSV (online, api.osv.dev).
 
 Inputs:
   * targets.json written by sca_resolve_targets (the OSV targets to process);
@@ -21,46 +16,32 @@ Inputs:
 
 Outputs (in the output directory, ``osv/``), per OSV target id:
   * ``<id>.status.json`` - ``{id, status, reason, packages_queried,
-    packages_skipped}``; status is ``ok``, ``failed`` or ``not_applicable``;
-  * ``<id>.json`` (``ok`` only) - the native result::
+    packages_skipped, queried_at, scanner_version}``; status is ``ok``,
+    ``failed`` or ``not_applicable``; ``packages_queried`` counts the packages in
+    the osv-scanner output (``--all-packages``, so the clean ones too),
+    ``packages_skipped`` the language packages without a package URL;
+  * ``<id>.json`` (``ok`` only) - the osv-scanner JSON output, unmodified.
 
-      {
-        "schema_version": 1,
-        "queried_at": "<UTC time of the run>",
-        "api_url": "<OSV API base URL>",
-        "packages": {"<purl>": ["<OSV id>", ...]},  # every queried purl
-        "vulnerabilities": {"<OSV id>": {<OSV record, unmodified>}}
-      }
-
-A broken OSV query never looks like a clean result: if any request of a target's
-packages cannot be completed (retries exhausted, a rejected purl, an unreadable
-answer), the target is ``failed`` with a reason. A target whose Trivy target was
-not scanned successfully is ``not_applicable`` and is not queried. The script
-exits 0 once the outputs are written (the merge step reports and the workflow
-decides about failing the run).
-
-The HTTP layer is injectable: every request goes through a ``Transport`` (a
-callable ``(method, url, headers, body) -> Response``), so the logic can be
-tested with a fake transport and no network. Python standard library only.
+osv-scanner exits 0 (nothing found) or 1 (vulnerabilities found); any other exit
+code, or an output that is not a result, is a failure, so a broken run never
+looks like a clean one: the target is ``failed`` with a reason (the end of
+stderr). A target whose Trivy target was not scanned successfully is
+``not_applicable`` and is not queried. The script exits 0 once the outputs are
+written (the merge step reports and the workflow decides about failing the run).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+import tempfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
-DEFAULT_API_URL = "https://api.osv.dev"
-USER_AGENT = "ai-dial-ci-sca-query-osv"
 
 SCANNER_TRIVY = "trivy"
 SCANNER_OSV = "osv"
@@ -70,269 +51,44 @@ STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_NOT_APPLICABLE = "not_applicable"
 
-CLASS_LANGUAGE_PACKAGES = "lang-pkgs"
-SCHEMA_VERSION = 1
+# Components Trivy covers with its distribution feeds
+OS_PURL_TYPES = frozenset({"deb", "apk", "rpm"})
+# osv-scanner: 0 nothing found, 1 vulnerabilities found
+EXIT_CODES_OK = (0, 1)
+EXIT_NOT_FOUND = 127
+REASON_LIMIT = 400
 
-# POST /v1/querybatch takes up to 1000 queries per request
-BATCH_SIZE = 1000
-# A query is paged while it returns a next_page_token; a sane API ends long before
-MAX_PAGES = 100
-REQUEST_TIMEOUT_SECONDS = 30.0
-MAX_ATTEMPTS = 4
-BACKOFF_BASE_SECONDS = 1.0
-MAX_RETRY_AFTER_SECONDS = 60.0
-RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-HTTP_OK = 200
-HTTP_BAD_REQUEST = 400
-HTTP_NOT_FOUND = 404
-ERROR_BODY_LIMIT = 200
+Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 
 class InputError(Exception):
     """The inputs are unusable, so no meaningful result can be produced."""
 
 
-class TransportError(Exception):
-    """A network-level failure (DNS, connection, timeout)."""
-
-
-class OsvError(Exception):
-    """An OSV request that cannot be completed; the packages it was for fail."""
-
-
-class RejectedQueryError(OsvError):
-    """OSV answered 400: some query of the request is invalid."""
-
-
-@dataclass(frozen=True)
-class Response:
-    status: int
-    headers: Mapping[str, str] = field(default_factory=dict)
-    body: bytes = b""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "headers", {k.lower(): v for k, v in self.headers.items()}
-        )
-
-    def header(self, name: str) -> str | None:
-        return self.headers.get(name.lower())
-
-
-Transport = Callable[[str, str, Mapping[str, str], bytes | None], Response]
-
-
-class UrllibTransport:
-    """Production transport: an HTTPS request through urllib with a timeout."""
-
-    def __init__(self, timeout: float = REQUEST_TIMEOUT_SECONDS) -> None:
-        self._timeout = timeout
-
-    def __call__(
-        self, method: str, url: str, headers: Mapping[str, str], body: bytes | None
-    ) -> Response:
-        if urllib.parse.urlsplit(url).scheme != "https":
-            raise TransportError(f"refusing non-HTTPS URL: {url}")
-        request = urllib.request.Request(
-            url, data=body, headers=dict(headers), method=method
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
-                return Response(resp.status, dict(resp.headers), resp.read())
-        except urllib.error.HTTPError as err:
-            return Response(err.code, dict(err.headers), err.read())
-        except (urllib.error.URLError, TimeoutError, OSError) as err:
-            raise TransportError(f"{url}: {err}") from err
-
-
-class HttpClient:
-    """Adds bounded retries with backoff (429/5xx, network errors) to a Transport."""
-
-    def __init__(
-        self,
-        transport: Transport,
-        sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = MAX_ATTEMPTS,
-    ) -> None:
-        self._transport = transport
-        self._sleep = sleep
-        self._max_attempts = max_attempts
-
-    def request(
-        self, method: str, url: str, headers: Mapping[str, str], body: bytes | None
-    ) -> Response:
-        for attempt in range(1, self._max_attempts + 1):
-            delay = BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
-            try:
-                response = self._transport(method, url, headers, body)
-            except TransportError:
-                if attempt == self._max_attempts:
-                    raise
-            else:
-                if (
-                    response.status not in RETRY_STATUSES
-                    or attempt == self._max_attempts
-                ):
-                    return response
-                delay = _retry_after(response) or delay
-            self._sleep(delay)
-        raise AssertionError("unreachable")  # pragma: no cover
-
-
-def _retry_after(response: Response) -> float | None:
-    value = response.header("Retry-After")
-    if value is None or not value.strip().isdigit():
-        return None
-    return min(float(value), MAX_RETRY_AFTER_SECONDS)
-
-
-def _describe_body(body: bytes) -> str:
-    text = body.decode("utf-8", errors="replace").strip()
-    return text[:ERROR_BODY_LIMIT] + ("..." if len(text) > ERROR_BODY_LIMIT else "")
-
-
-class OsvClient:
-    """The two OSV endpoints the scan needs."""
-
-    def __init__(self, http: HttpClient, api_url: str) -> None:
-        self._http = http
-        self._api_url = api_url.rstrip("/")
-        self._headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        }
-
-    def _call(self, method: str, path: str, payload: Any = None) -> Any:
-        """The decoded JSON answer; raises OsvError (400: RejectedQueryError)."""
-        url = f"{self._api_url}{path}"
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        try:
-            response = self._http.request(method, url, self._headers, body)
-        except TransportError as err:
-            raise OsvError(f"{method} {path}: {err}") from err
-        if response.status == HTTP_BAD_REQUEST:
-            raise RejectedQueryError(
-                f"{method} {path}: HTTP 400: {_describe_body(response.body)}"
-            )
-        if response.status != HTTP_OK:
-            raise OsvError(f"{method} {path}: HTTP {response.status}")
-        try:
-            return json.loads(response.body)
-        except ValueError as err:
-            raise OsvError(f"{method} {path}: answer is not valid JSON: {err}") from err
-
-    def query_batch(self, purls: Sequence[str]) -> dict[str, list[str]]:
-        """Vulnerability ids of each purl (one request, plus its further pages).
-
-        A query that returns a ``next_page_token`` is sent again with the token
-        (and only those queries are), until no query has one.
-        """
-        ids: dict[str, set[str]] = {purl: set() for purl in purls}
-        pending: list[tuple[str, str | None]] = [(purl, None) for purl in purls]
-        pages = 0
-        while pending:
-            if pages == MAX_PAGES:
-                raise OsvError(
-                    f"POST /v1/querybatch: results still paged after {MAX_PAGES} pages"
-                )
-            pages += 1
-            queries = [
-                {"package": {"purl": purl}, **({"page_token": token} if token else {})}
-                for purl, token in pending
-            ]
-            answer = self._call("POST", "/v1/querybatch", {"queries": queries})
-            results = answer.get("results") if isinstance(answer, dict) else None
-            if not isinstance(results, list) or len(results) != len(pending):
-                raise OsvError(
-                    "POST /v1/querybatch: the answer does not hold one result "
-                    f"per query ({len(pending)} queries)"
-                )
-            sent, pending = pending, []
-            for (purl, _), result in zip(sent, results, strict=True):
-                for vuln in (result or {}).get("vulns") or []:
-                    if not isinstance(vuln, dict) or not vuln.get("id"):
-                        raise OsvError("POST /v1/querybatch: a result has no id")
-                    ids[purl].add(vuln["id"])
-                if token := (result or {}).get("next_page_token"):
-                    pending.append((purl, token))
-        return {purl: sorted(found) for purl, found in ids.items()}
-
-    def get_vulnerability(self, vuln_id: str) -> dict[str, Any]:
-        """The full OSV record of one id."""
-        path = f"/v1/vulns/{urllib.parse.quote(vuln_id, safe='')}"
-        record = self._call("GET", path)
-        if not isinstance(record, dict) or record.get("id") != vuln_id:
-            raise OsvError(f"GET {path}: the answer is not the record of {vuln_id}")
-        return record
-
-
-# --------------------------------------------------------------------------
-# Querying
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class Answers:
-    """What OSV said about a set of purls: ids and records, or why it could not."""
-
-    ids: dict[str, list[str]] = field(default_factory=dict)
-    records: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # purl -> why its result is incomplete (a purl in here is not in ``ids``)
-    errors: dict[str, str] = field(default_factory=dict)
-
-
-def query_chunk(
-    client: OsvClient, purls: Sequence[str]
-) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """Ids and errors for one chunk of purls.
-
-    A rejected query (HTTP 400) fails the whole request, so the chunk is halved
-    until the rejected purl is alone: only its targets then fail, not all of the
-    run. Any other failure fails the whole chunk.
-    """
+def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run a command; a program that cannot start is exit code 127 (as in a shell)."""
     try:
-        return client.query_batch(purls), {}
-    except RejectedQueryError as err:
-        if len(purls) == 1:
-            return {}, {purls[0]: f"rejected by OSV: {err}"}
-        middle = len(purls) // 2
-        ids, errors = query_chunk(client, purls[:middle])
-        more_ids, more_errors = query_chunk(client, purls[middle:])
-        return {**ids, **more_ids}, {**errors, **more_errors}
-    except OsvError as err:
-        return {}, dict.fromkeys(purls, str(err))
+        return subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+    except OSError as err:
+        return subprocess.CompletedProcess(command, EXIT_NOT_FOUND, "", str(err))
 
 
-def query_osv(client: OsvClient, purls: Iterable[str]) -> Answers:
-    """Query the distinct purls and fetch the record of each distinct id."""
-    distinct = sorted(set(purls))
-    answers = Answers()
-    for start in range(0, len(distinct), BATCH_SIZE):
-        ids, errors = query_chunk(client, distinct[start : start + BATCH_SIZE])
-        answers.ids.update(ids)
-        answers.errors.update(errors)
-
-    for vuln_id in sorted({v for found in answers.ids.values() for v in found}):
-        try:
-            answers.records[vuln_id] = client.get_vulnerability(vuln_id)
-        except OsvError as err:
-            # Every package that has this vulnerability is incomplete
-            for purl, found in list(answers.ids.items()):
-                if vuln_id in found:
-                    del answers.ids[purl]
-                    answers.errors[purl] = str(err)
-    return answers
-
-
-# --------------------------------------------------------------------------
-# Reading the Trivy parts
-# --------------------------------------------------------------------------
+def tail(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= REASON_LIMIT else "..." + text[-REASON_LIMIT:]
 
 
 def read_json(path: Path) -> Any:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.write_text(
+        json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
 
 def load_targets_file(path: Path) -> list[dict[str, Any]]:
@@ -346,181 +102,162 @@ def load_targets_file(path: Path) -> list[dict[str, Any]]:
     return targets
 
 
-def trivy_target_result(
-    trivy_dir: Path, target_id: str
-) -> tuple[str, dict[str, Any] | None]:
-    """``(status, native)`` of a Trivy target; native only if it was scanned.
-
-    Anything short of a complete, valid result counts as ``failed``.
-    """
+def trivy_status(trivy_dir: Path, target_id: str) -> str:
+    """The status of a Trivy target; anything short of a complete result is failed."""
     try:
         status = read_json(trivy_dir / f"{target_id}.status.json")
     except (OSError, ValueError):
-        return STATUS_FAILED, None
+        return STATUS_FAILED
     if not isinstance(status, dict):
-        return STATUS_FAILED, None
-    if status.get("status") != STATUS_OK:
-        return str(status.get("status") or STATUS_FAILED), None
-    try:
-        native = read_json(trivy_dir / f"{target_id}.json")
-    except (OSError, ValueError):
-        return STATUS_FAILED, None
-    return (STATUS_OK, native) if isinstance(native, dict) else (STATUS_FAILED, None)
+        return STATUS_FAILED
+    if (
+        status.get("status") == STATUS_OK
+        and not (trivy_dir / f"{target_id}.json").is_file()
+    ):
+        return STATUS_FAILED
+    return str(status.get("status") or STATUS_FAILED)
 
 
-def has_version(purl: str) -> bool:
-    """Whether the purl names a version (``pkg:npm/b@1.0`` does, ``pkg:npm/b`` not).
+def purl_type(purl: str) -> str:
+    return purl.removeprefix("pkg:").split("/", 1)[0].lower()
 
-    OSV answers an unversioned purl with every vulnerability of the package ever,
-    which would be a finding for a version nobody uses.
+
+def with_full_name(component: dict[str, Any], kind: str) -> dict[str, Any]:
+    group = component.get("group")
+    if not group:
+        return component
+    separator = ":" if kind == "maven" else "/"
+    full = {**component, "name": f"{group}{separator}{component.get('name')}"}
+    del full["group"]
+    return full
+
+
+def filter_bom(bom: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """``(BOM of the language packages, library components without a purl)``.
+
+    Only the components stay: osv-scanner has no use for the dependency graph and
+    the Trivy findings of the BOM. Trivy keeps the namespace of a package in
+    ``group`` (a Maven group, an npm scope), but osv-scanner names the package it
+    reports after ``name`` alone, so the group is folded into the name as OSV
+    writes it (``group:artifact``, ``@scope/name``), or the result could not be
+    told from another package of the same name.
     """
-    path = purl.split("#", 1)[0].split("?", 1)[0]
-    return "@" in path.rsplit("/", 1)[-1]
-
-
-def collect_packages(native: Mapping[str, Any]) -> tuple[list[str], int]:
-    """``(distinct purls, packages skipped)`` of the language packages of a result.
-
-    OS packages are left out. A package without a (versioned) purl cannot be
-    queried; it is counted as skipped (distinct by name and version).
-    """
-    purls: set[str] = set()
-    skipped: set[tuple[Any, Any]] = set()
-    for result in native.get("Results") or []:
-        if result.get("Class") != CLASS_LANGUAGE_PACKAGES:
-            continue
-        for package in result.get("Packages") or []:
-            purl = (package.get("Identifier") or {}).get("PURL")
-            if isinstance(purl, str) and has_version(purl):
-                purls.add(purl)
-            else:
-                skipped.add((package.get("Name"), package.get("Version")))
-    return sorted(purls), len(skipped)
-
-
-# --------------------------------------------------------------------------
-# Results
-# --------------------------------------------------------------------------
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+    for component in bom.get("components") or []:
+        purl = component.get("purl")
+        if isinstance(purl, str) and purl.startswith("pkg:"):
+            if purl_type(purl) not in OS_PURL_TYPES:
+                kept.append(with_full_name(component, purl_type(purl)))
+        elif component.get("type") == "library":
+            skipped += 1
+    return {
+        **bom,
+        "components": kept,
+        "dependencies": [],
+        "vulnerabilities": [],
+    }, skipped
 
 
 @dataclass
-class TargetPlan:
-    """What is known about an OSV target before OSV is asked."""
-
-    target_id: str
-    trivy_status: str
-    purls: list[str] = field(default_factory=list)
-    skipped: int = 0
+class Outcome:
+    status: str
+    reason: str | None = None
+    packages_queried: int | None = None
+    packages_skipped: int | None = None
 
 
-def plan_targets(
-    targets: Sequence[Mapping[str, Any]], trivy_dir: Path
-) -> list[TargetPlan]:
-    """The pending OSV targets, with the packages of their Trivy twins."""
-    plans = []
-    for target in targets:
-        if target.get("scanner") != SCANNER_OSV or target.get("status") != (
-            STATUS_PENDING
-        ):
-            continue
-        target_id = target["id"]
-        status, native = trivy_target_result(trivy_dir, target_id)
-        plan = TargetPlan(target_id, status)
-        if native is not None:
-            plan.purls, plan.skipped = collect_packages(native)
-        plans.append(plan)
-    return plans
+def scan_target(
+    native: Path, bom_path: Path, output: Path, trivy: str, scanner: str, run: Runner
+) -> Outcome:
+    """Convert, filter and scan one target; the osv-scanner output is ``output``."""
+    convert = [trivy, "convert", "--format", "cyclonedx", "--output", str(bom_path)]
+    converted = run([*convert, str(native)])
+    if converted.returncode:
+        code = converted.returncode
+        reason = f"trivy convert failed (exit {code}): {tail(converted.stderr)}"
+        return Outcome(STATUS_FAILED, reason)
+    try:
+        bom, skipped = filter_bom(read_json(bom_path))
+    except (OSError, ValueError, AttributeError) as err:
+        return Outcome(STATUS_FAILED, f"trivy convert wrote no valid BOM: {err}")
+    write_json(bom_path, bom)
+    queried = len(bom["components"])
+    output.unlink(missing_ok=True)  # no stale result can pass for this run's
+    if queried:
+        scan = ["scan", "source", "-L", str(bom_path), "--all-packages"]
+        scan += ["--format", "json", "--output-file", str(output)]
+        scanned = run([scanner, *scan])
+        if scanned.returncode not in EXIT_CODES_OK:
+            code = scanned.returncode
+            reason = f"osv-scanner failed (exit {code}): {tail(scanned.stderr)}"
+            return Outcome(STATUS_FAILED, reason, queried, skipped)
+    else:
+        write_json(output, {"results": []})
+    try:
+        packages = {
+            (p["package"]["ecosystem"], p["package"]["name"], p["package"]["version"])
+            for result in read_json(output)["results"]
+            for p in result["packages"]
+        }
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        reason = f"osv-scanner wrote no valid result: {err!r}"
+        return Outcome(STATUS_FAILED, reason, queried, skipped)
+    return Outcome(STATUS_OK, None, len(packages), skipped)
 
 
-def status_document(
-    plan: TargetPlan, status: str, reason: str | None
-) -> dict[str, Any]:
-    applicable = status != STATUS_NOT_APPLICABLE
-    return {
-        "id": plan.target_id,
-        "status": status,
-        "reason": reason,
-        "packages_queried": len(plan.purls) if applicable else None,
-        "packages_skipped": plan.skipped if applicable else None,
-    }
-
-
-def build_result(
-    plan: TargetPlan, answers: Answers, queried_at: str, api_url: str
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """``(status document, native result)``; native only for an ``ok`` target."""
-    if plan.trivy_status != STATUS_OK:
-        reason = f"trivy target {plan.trivy_status}"
-        return status_document(plan, STATUS_NOT_APPLICABLE, reason), None
-    errors = {p: answers.errors[p] for p in plan.purls if p in answers.errors}
-    if errors:
-        first = errors[min(errors)]
-        reason = (
-            f"OSV query failed for {len(errors)} of {len(plan.purls)} package(s): "
-            f"{first}"
-        )
-        return status_document(plan, STATUS_FAILED, reason), None
-    packages = {purl: answers.ids[purl] for purl in plan.purls}
-    used = {vuln_id for found in packages.values() for vuln_id in found}
-    native = {
-        "schema_version": SCHEMA_VERSION,
-        "queried_at": queried_at,
-        "api_url": api_url,
-        "packages": packages,
-        "vulnerabilities": {i: answers.records[i] for i in sorted(used)},
-    }
-    return status_document(plan, STATUS_OK, None), native
-
-
-def write_json(path: Path, data: Any) -> None:
-    path.write_text(
-        json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-
-
-def run(
-    args: argparse.Namespace,
-    transport: Transport,
-    now: datetime,
-    sleep: Callable[[float], None] = time.sleep,
-) -> int:
+def run_all(args: argparse.Namespace, run: Runner, now: datetime) -> int:
     """Write all outputs; return the number of failed OSV targets."""
-    api_url = args.api_url.rstrip("/")
-    if urllib.parse.urlsplit(api_url).scheme != "https":
-        raise InputError(f"api-url must be an https URL, got {args.api_url!r}")
     queried_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    plans = plan_targets(
-        load_targets_file(args.targets_file), args.parts_dir / SCANNER_TRIVY
-    )
-    purls = [
-        purl for plan in plans if plan.trivy_status == STATUS_OK for purl in plan.purls
+    # "osv-scanner version: 2.6.0"
+    first = (run([args.osv_scanner, "--version"]).stdout.strip().splitlines() or [""])[
+        0
     ]
-    client = OsvClient(HttpClient(transport, sleep), api_url)
-    answers = query_osv(client, purls)
-    print(
-        f"OSV {api_url}: {len(set(purls))} distinct package(s) queried for "
-        f"{len(plans)} target(s), {len(answers.records)} vulnerabilit(ies) fetched"
-    )
-
+    version = first.rpartition(":")[2].strip() or None
     out_dir = args.output_dir / SCANNER_OSV
     out_dir.mkdir(parents=True, exist_ok=True)
     failed = 0
-    for plan in plans:
-        status, native = build_result(plan, answers, queried_at, api_url)
-        write_json(out_dir / f"{plan.target_id}.status.json", status)
-        if native is not None:
-            write_json(out_dir / f"{plan.target_id}.json", native)
-        failed += status["status"] == STATUS_FAILED
-        print(
-            f"{plan.target_id}: {status['status']}"
-            + (f" ({status['reason']})" if status["reason"] else "")
-        )
-        if status["packages_skipped"]:
-            print(
-                f"::notice title=OSV skipped packages::{plan.target_id}: "
-                f"{status['packages_skipped']} package(s) without a versioned purl"
+    with tempfile.TemporaryDirectory() as work:
+        for target in load_targets_file(args.targets_file):
+            if target.get("scanner") != SCANNER_OSV:
+                continue
+            if target.get("status") != STATUS_PENDING:
+                continue
+            tid = target["id"]
+            output = out_dir / f"{tid}.json"
+            status = trivy_status(args.parts_dir / SCANNER_TRIVY, tid)
+            if status != STATUS_OK:
+                outcome = Outcome(STATUS_NOT_APPLICABLE, f"trivy target {status}")
+            else:
+                native = args.parts_dir / SCANNER_TRIVY / f"{tid}.json"
+                # osv-scanner takes a CycloneDX file by its name
+                bom_path = Path(work) / f"{tid}.cdx.json"
+                outcome = scan_target(
+                    native, bom_path, output, args.trivy, args.osv_scanner, run
+                )
+            if outcome.status != STATUS_OK:
+                output.unlink(missing_ok=True)
+            applicable = outcome.status != STATUS_NOT_APPLICABLE
+            write_json(
+                out_dir / f"{tid}.status.json",
+                {
+                    "id": tid,
+                    "status": outcome.status,
+                    "reason": outcome.reason,
+                    "packages_queried": outcome.packages_queried,
+                    "packages_skipped": outcome.packages_skipped,
+                    "queried_at": queried_at if applicable else None,
+                    "scanner_version": version if applicable else None,
+                },
             )
+            failed += outcome.status == STATUS_FAILED
+            reason = f" ({outcome.reason})" if outcome.reason else ""
+            print(f"{tid}: {outcome.status}{reason}")
+            if outcome.packages_skipped:
+                print(
+                    f"::notice title=OSV skipped packages::{tid}: "
+                    f"{outcome.packages_skipped} package(s) without a package URL"
+                )
     return failed
 
 
@@ -542,9 +279,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="directory to write osv/<id>.json and osv/<id>.status.json into",
     )
     parser.add_argument(
-        "--api-url",
-        default=DEFAULT_API_URL,
-        help="OSV API base URL (default: %(default)s)",
+        "--trivy", default="trivy", help="trivy binary (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--osv-scanner",
+        default="osv-scanner",
+        help="osv-scanner binary (default: %(default)s)",
     )
     return parser.parse_args(argv)
 
@@ -552,7 +292,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        run(args, UrllibTransport(), datetime.now(UTC))
+        run_all(args, run_command, datetime.now(UTC))
     except InputError as err:
         print(f"::error title=Invalid OSV query input::{err}", file=sys.stderr)
         return 1

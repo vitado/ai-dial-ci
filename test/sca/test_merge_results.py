@@ -6,6 +6,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,8 @@ class Workspace:
             "reason": None,
             "packages_queried": 5,
             "packages_skipped": 0,
+            "queried_at": "2030-01-01T00:10:00Z",
+            "scanner_version": "2.6.0",
         }
         body.update(status)
         (self.osv_parts / f"{tid}.status.json").write_text(
@@ -2803,10 +2806,14 @@ def trivy_only_twin(tmp_path: Path) -> Workspace:
     return ws
 
 
-def osv_native(**changes: Any) -> dict[str, Any]:
-    native = json.loads((FIXTURES / "osv-source.json").read_text(encoding="utf-8"))
-    native.update(changes)
-    return native
+def package_entry(**fields: Any) -> dict[str, Any]:
+    """A package entry of an osv-scanner result, with the given fields on top."""
+    package = {"ecosystem": "npm", "name": "a", "version": "1.0.0"}
+    return {"package": package, **fields}
+
+
+def osv_native() -> dict[str, Any]:
+    return json.loads((FIXTURES / "osv-source.json").read_text(encoding="utf-8"))
 
 
 def write_osv_native(ws: Workspace, native: Any, tid: str = "source-development"):
@@ -2854,10 +2861,10 @@ def test_target_entries_of_both_scanners_have_the_same_keys(
     assert [t["queried_at"] for t in targets if t["scanner"] == "trivy"] == [None] * 3
 
 
-def test_osv_api_url_comes_from_the_native(with_osv: Workspace) -> None:
+def test_osv_scanner_version_comes_from_the_status(with_osv: Workspace) -> None:
     with_osv.run()
     assert with_osv.json("_report/scan_report.json")["osv"] == {
-        "api_url": "https://api.osv.dev"
+        "scanner_version": "2.6.0"
     }
 
 
@@ -2866,10 +2873,10 @@ def test_osv_metadata_is_null_without_osv_targets(full: Workspace) -> None:
     assert full.json("_report/scan_report.json")["osv"] is None
 
 
-def test_osv_metadata_with_unknown_api_url(tmp_path: Path) -> None:
+def test_osv_metadata_with_unknown_scanner_version(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
-    assert ws.run() == 1  # no part: failed, so no API URL either
-    assert ws.json("_report/scan_report.json")["osv"] == {"api_url": None}
+    assert ws.run() == 1  # no part: failed, so no version either
+    assert ws.json("_report/scan_report.json")["osv"] == {"scanner_version": None}
 
 
 def test_osv_findings_are_records_next_to_the_trivy_ones(
@@ -2944,7 +2951,7 @@ def test_trivy_output_is_unchanged_when_osv_finds_nothing(tmp_path: Path) -> Non
         if osv:
             write_osv_native(
                 ws,
-                osv_native(packages={"pkg:npm/lodash@4.17.0": []}, vulnerabilities={}),
+                osv_part({"pkg:npm/lodash@4.17.0": []}),
             )
         ws.run()
         return ws
@@ -3068,30 +3075,43 @@ def test_osv_target_not_applicable_in_targets_file_is_not_a_failure(
 
 
 @pytest.mark.parametrize(
-    ("changes", "reason"),
+    ("native", "reason"),
     [
+        ({}, "osv result has no results list"),
+        ({"results": None}, "osv result has no results list"),
+        ({"results": ["oops"]}, "osv result has a malformed result entry"),
+        ({"results": [{"packages": None}]}, "osv result has a malformed result entry"),
         (
-            {"schema_version": 2},
-            "osv result has an unsupported schema_version: 2",
+            {"results": [{"packages": [{"package": {"name": "a"}}]}]},
+            "osv result has a malformed package entry",
         ),
         (
-            {"schema_version": None},
-            "osv result has an unsupported schema_version: None",
+            {"results": [{"packages": [package_entry(vulnerabilities=["x"])]}]},
+            "osv result has a malformed vulnerability record",
         ),
-        ({"packages": []}, "osv result has no packages or vulnerabilities"),
-        ({"vulnerabilities": None}, "osv result has no packages or vulnerabilities"),
-        ({"packages": {"pkg:npm/a@1": "oops"}}, "osv result has a malformed package"),
         (
-            {"packages": {"pkg:npm/a@1": ["GHSA-unknown"]}},
-            "osv result has no record of GHSA-unknown",
+            {"results": [{"packages": [package_entry(groups=[{"ids": []}])]}]},
+            "osv result has a malformed group",
+        ),
+        (
+            {"results": [{"packages": [package_entry(groups=[{"ids": ["GHSA-x"]}])]}]},
+            "osv result has no record of GHSA-x",
+        ),
+        (
+            {
+                "results": [
+                    {"packages": [package_entry(vulnerabilities=[{"id": "GHSA-x"}])]}
+                ]
+            },
+            "osv result has no group of GHSA-x",
         ),
     ],
 )
 def test_osv_result_that_is_incomplete_is_failed(
-    tmp_path: Path, changes: dict[str, Any], reason: str
+    tmp_path: Path, native: dict[str, Any], reason: str
 ) -> None:
     ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
-    write_osv_native(ws, osv_native(**changes))
+    write_osv_native(ws, native)
     assert ws.run() == 1
     assert ws.osv_targets["source-development"]["reason"].startswith(reason)
 
@@ -3108,9 +3128,7 @@ def test_osv_status_ok_with_invalid_json_is_failed(tmp_path: Path) -> None:
 
 def test_osv_clean_result_is_ok_with_zero_findings(tmp_path: Path) -> None:
     ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
-    write_osv_native(
-        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
-    )
+    write_osv_native(ws, osv_part({"pkg:npm/a@1.0.0": []}))
     assert ws.run() == 0
     entry = ws.osv_targets["source-development"]
     assert entry["status"] == "ok"
@@ -3122,7 +3140,7 @@ def test_osv_target_with_no_queried_packages_warns(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     ws = Workspace(tmp_path, make_targets_doc(OSV_SOURCE))
-    write_osv_native(ws, osv_native(packages={}, vulnerabilities={}))
+    write_osv_native(ws, osv_part({}))
     assert ws.run() == 0
     assert ws.osv_targets["source-development"]["packages_scanned"] == 0
     assert "::warning title=No packages in scan result::source-development (osv)" in (
@@ -3197,9 +3215,7 @@ def test_summary_headline_without_trivy_scan_but_with_an_osv_one(
     tmp_path: Path,
 ) -> None:
     ws = Workspace(tmp_path, make_targets_doc(SOURCE, OSV_SOURCE))
-    write_osv_native(
-        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
-    )
+    write_osv_native(ws, osv_part({"pkg:npm/a@1.0.0": []}))
     assert ws.run() == 1  # the Trivy part is missing
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "> No Trivy target was scanned" in md
@@ -3218,9 +3234,7 @@ def test_osv_target_does_not_change_the_no_findings_headline(tmp_path: Path) -> 
     (ws.trivy_parts / "source-development.json").write_text(
         json.dumps({"Results": []}), encoding="utf-8"
     )
-    write_osv_native(
-        ws, osv_native(packages={"pkg:npm/a@1.0.0": []}, vulnerabilities={})
-    )
+    write_osv_native(ws, osv_part({"pkg:npm/a@1.0.0": []}))
     assert ws.run() == 0
     md = (ws.out / "summary.md").read_text(encoding="utf-8")
     assert "> **No known vulnerabilities in development**" in md
@@ -3252,105 +3266,64 @@ def test_targets_file_needs_a_known_scanner(
 # ---- OSV: severity, fixes, findings
 
 
-def test_osv_severity_prefers_the_database_rating_and_maps_moderate() -> None:
-    def severity(rating: str) -> str:
-        return mr.osv_severity({"database_specific": {"severity": rating}})
+def vulnerability(*records: dict[str, Any], max_severity: float | None = None) -> Any:
+    """The vulnerability (a group) of the given records."""
+    ordered = sorted(records, key=mr.osv_record_order)
+    ids = tuple(sorted(r["id"] for r in records))
+    return mr.OsvVulnerability(ids, frozenset(ids), tuple(ordered), max_severity)
+
+
+def test_osv_database_rating_maps_moderate_to_medium() -> None:
+    def rating(value: Any) -> str | None:
+        return mr.osv_database_rating({"database_specific": {"severity": value}})
 
     assert [
-        severity(v)
-        for v in ("MODERATE", "moderate", "MEDIUM", "HIGH", "CRITICAL", "LOW")
+        rating(v) for v in ("MODERATE", "moderate", "MEDIUM", "HIGH", "CRITICAL", "LOW")
     ] == ["MEDIUM", "MEDIUM", "MEDIUM", "HIGH", "CRITICAL", "LOW"]
-    # the database rating wins over the vectors
-    record = {
-        "database_specific": {"severity": "LOW"},
-        "severity": [
-            {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}
-        ],
-    }
-    assert mr.osv_severity(record) == "LOW"
-
-
-def test_osv_severity_falls_back_to_the_highest_cvss3_vector() -> None:
-    record = {
-        "severity": [
-            {
-                "type": "CVSS_V3",
-                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L",
-            },
-            {
-                "type": "CVSS_V3",
-                "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-            },
-        ]
-    }
-    assert mr.osv_severity(record) == "CRITICAL"
+    assert [rating(v) for v in ("BOGUS", 7, None, "UNKNOWN")] == [None] * 4
+    assert mr.osv_database_rating({"database_specific": None}) is None
+    assert mr.osv_database_rating({}) is None
 
 
 @pytest.mark.parametrize(
-    "record",
+    ("score", "rating"),
     [
-        {},
-        {"database_specific": {"severity": "BOGUS"}},
-        {"database_specific": {"severity": 7}},
-        {"database_specific": None},
-        {"severity": []},
-        {"severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N"}]},
-        {"severity": [{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"}]},
-        {"severity": [{"type": "CVSS_V3", "score": "not a vector"}]},
-        {"severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N"}]},
-        {"severity": [{"type": "CVSS_V3", "score": 9.8}]},
-        {
-            "severity": [
-                {
-                    "type": "CVSS_V3",
-                    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
-                }
-            ]
-        },
+        (10.0, "CRITICAL"),
+        (9.0, "CRITICAL"),
+        (8.9, "HIGH"),
+        (7.0, "HIGH"),
+        (6.9, "MEDIUM"),
+        (4.0, "MEDIUM"),
+        (3.9, "LOW"),
+        (0.1, "LOW"),
+        (0.0, "UNKNOWN"),
+        (None, "UNKNOWN"),
     ],
 )
-def test_osv_severity_is_unknown_without_a_usable_rating(record: dict) -> None:
-    assert mr.osv_severity(record) == "UNKNOWN"
+def test_score_rating(score: float | None, rating: str) -> None:
+    assert mr.score_rating(score) == rating
+
+
+def test_osv_group_severity_takes_the_database_rating_before_the_score() -> None:
+    ghsa = osv_record("GHSA-a", database_specific={"severity": "LOW"})
+    pysec = osv_record("PYSEC-1")
+    # the database rating wins over the score of the group
+    assert mr.osv_group_severity(vulnerability(ghsa, max_severity=9.8)) == "LOW"
+    assert mr.osv_group_severity(vulnerability(ghsa, pysec, max_severity=9.8)) == "LOW"
+    other = osv_record("GHSA-b", database_specific={"severity": "HIGH"})
+    assert mr.osv_group_severity(vulnerability(ghsa, other)) == "HIGH"
+    # no rating of the database: the rating of the score (v3 and v4 alike)
+    assert mr.osv_group_severity(vulnerability(pysec, max_severity=9.8)) == "CRITICAL"
+    assert mr.osv_group_severity(vulnerability(pysec, max_severity=5.3)) == "MEDIUM"
+    assert mr.osv_group_severity(vulnerability(pysec)) == "UNKNOWN"
 
 
 @pytest.mark.parametrize(
-    ("vector", "score", "rating"),
-    [
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8, "CRITICAL"),
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0, "CRITICAL"),
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", 7.5, "HIGH"),
-        ("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H", 9.9, "CRITICAL"),
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1, "MEDIUM"),
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", 4.3, "MEDIUM"),
-        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", 5.3, "MEDIUM"),
-        ("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N", 1.8, "LOW"),
-        ("CVSS:3.0/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N", 5.5, "MEDIUM"),
-        ("CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 6.8, "MEDIUM"),
-    ],
+    ("value", "score"),
+    [("8.7", 8.7), (7, 7.0), ("", None), (None, None), ("x", None), ("0", None)],
 )
-def test_cvss3_base_score_and_rating(vector: str, score: float, rating: str) -> None:
-    assert mr.cvss3_base_score(vector) == score
-    assert mr.cvss3_rating(score) == rating
-
-
-@pytest.mark.parametrize(
-    "vector",
-    [
-        "",
-        "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
-        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H",
-        "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-    ],
-)
-def test_cvss3_base_score_rejects_other_or_malformed_vectors(vector: str) -> None:
-    assert mr.cvss3_base_score(vector) is None
-
-
-def test_cvss3_score_zero_has_no_rating() -> None:
-    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N"
-    assert mr.cvss3_base_score(vector) == 0.0
-    assert mr.cvss3_rating(0.0) == "UNKNOWN"
+def test_osv_score_reads_max_severity(value: Any, score: float | None) -> None:
+    assert mr.osv_score(value) == score
 
 
 @pytest.mark.parametrize(
@@ -3391,30 +3364,30 @@ def test_purl_identity_is_the_osv_package(
     assert mr.purl_identity(purl) == identity
 
 
-def test_osv_has_fix_needs_a_fixed_event_of_this_package() -> None:
+def test_osv_fixed_versions_need_a_fixed_event_of_this_package() -> None:
     record = {
         "affected": [
             affected_range("PyPI", "requests", {"fixed": "2.31.0"}),
             affected_range("PyPI", "other", {"last_affected": "1.0"}),
         ]
     }
-    assert mr.osv_has_fix(record, "pkg:pypi/Requests@2.0.0")
-    assert not mr.osv_has_fix(record, "pkg:pypi/other@1.0")
-    assert not mr.osv_has_fix(record, "pkg:pypi/unlisted@1.0")
+    assert mr.osv_fixed_versions(record, ("PyPI", "requests")) == ["2.31.0"]
+    assert mr.osv_fixed_versions(record, ("PyPI", "other")) == []
+    assert mr.osv_fixed_versions(record, ("PyPI", "unlisted")) == []
 
 
-def test_osv_has_fix_ignores_git_ranges_and_unknown_purls() -> None:
+def test_osv_fixed_versions_ignore_git_ranges() -> None:
     record = {"affected": [affected_range("npm", "a", {"fixed": "abc123"}, kind="GIT")]}
-    assert not mr.osv_has_fix(record, "pkg:npm/a@1")
+    assert mr.osv_fixed_versions(record, ("npm", "a")) == []
     record = {
         "affected": [affected_range("npm", "a", {"fixed": "1.2.3"}, kind="SEMVER")]
     }
-    assert mr.osv_has_fix(record, "pkg:npm/a@1")
-    assert not mr.osv_has_fix(record, "pkg:apk/alpine/a@1")
-    assert not mr.osv_has_fix({}, "pkg:npm/a@1")
+    assert mr.osv_fixed_versions(record, ("npm", "a")) == ["1.2.3"]
+    assert mr.osv_fixed_versions({}, ("npm", "a")) == []
 
 
-def test_osv_has_fix_matches_by_purl_or_by_ecosystem_with_a_suffix() -> None:
+def test_osv_fixed_versions_match_by_purl_or_by_ecosystem_with_a_suffix() -> None:
+    identity = ("Maven", "org.example:lib")
     by_purl = {
         "affected": [
             {
@@ -3423,43 +3396,70 @@ def test_osv_has_fix_matches_by_purl_or_by_ecosystem_with_a_suffix() -> None:
             }
         ]
     }
-    assert mr.osv_has_fix(by_purl, "pkg:maven/org.example/lib@1.0")
+    assert mr.osv_fixed_versions(by_purl, identity) == ["2.0"]
     suffixed = {
         "affected": [
             affected_range("Maven:https://repo", "org.example:lib", {"fixed": "2"})
         ]
     }
-    assert mr.osv_has_fix(suffixed, "pkg:maven/org.example/lib@1.0")
+    assert mr.osv_fixed_versions(suffixed, identity) == ["2"]
     broken = {"affected": [{"package": {"ecosystem": "npm"}}, {"ranges": []}]}
-    assert not mr.osv_has_fix(broken, "pkg:npm/a@1")
+    assert mr.osv_fixed_versions(broken, ("npm", "a")) == []
 
 
-def test_osv_findings_are_distinct_by_purl_and_vulnerability() -> None:
-    found = mr.osv_findings(osv_native())
-    assert sorted(found) == [
-        ("pkg:maven/org.example/lib@1.0", "GHSA-dddd-dddd-0001"),
-        ("pkg:npm/%40scope/pkg@1.0.0", "GHSA-bbbb-bbbb-0001"),
-        ("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0001"),
-        ("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0002"),
-        ("pkg:pypi/Requests@2.0.0", "PYSEC-2030-1"),
-    ]
-    assert found[("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0001")] == ("CRITICAL", True)
-    assert found[("pkg:npm/lodash@4.17.0", "GHSA-aaaa-aaaa-0002")] == ("LOW", False)
-    assert found[("pkg:npm/%40scope/pkg@1.0.0", "GHSA-bbbb-bbbb-0001")] == (
-        "HIGH",
-        True,
-    )
-    assert found[("pkg:pypi/Requests@2.0.0", "PYSEC-2030-1")] == ("UNKNOWN", True)
-    assert found[("pkg:maven/org.example/lib@1.0", "GHSA-dddd-dddd-0001")] == (
-        "MEDIUM",
-        False,
-    )
-
-
-def test_osv_findings_count_a_repeated_id_once() -> None:
+def test_osv_packages_are_distinct_by_ecosystem_name_and_version() -> None:
     native = osv_native()
-    native["packages"]["pkg:npm/lodash@4.17.0"] = ["GHSA-aaaa-aaaa-0001"] * 2
-    assert len(mr.osv_findings(native)) == 4
+    entry = native["results"][0]["packages"][0]
+    native["results"].append({"packages": [entry]})
+    packages = mr.osv_packages(native)
+    assert [(p.identity, p.version) for p in packages.values()] == [
+        (("npm", "lodash"), "4.17.0"),
+        (("npm", "@scope/pkg"), "1.0.0"),
+        (("PyPI", "requests"), "2.0.0"),
+        (("Maven", "org.example:lib"), "1.0"),
+        (("npm", "clean"), "1.0.0"),
+    ]
+    assert [len(p.vulnerabilities) for p in packages.values()] == [2, 1, 1, 1, 0]
+
+
+def test_osv_packages_read_the_groups_of_osv_scanner() -> None:
+    native = osv_part(
+        {"pkg:npm/lib@1.0": ["PYSEC-1", "GHSA-b", "GHSA-c", "RUSTSEC-d"]},
+        osv_record("PYSEC-1", aliases=["CVE-1"]),
+        osv_record("GHSA-b", aliases=["CVE-1", "OTHER-9"]),
+        osv_record("GHSA-c"),
+        osv_record("RUSTSEC-d", aliases=["GHSA-c"]),
+        scores={"GHSA-b": "8.7"},
+    )
+    groups = mr.osv_packages(native)[(("npm", "lib"), "1.0")].vulnerabilities
+    assert [(v.ids, sorted(v.names), v.max_severity) for v in groups] == [
+        (("GHSA-b", "PYSEC-1"), ["CVE-1", "GHSA-b", "OTHER-9", "PYSEC-1"], 8.7),
+        (("GHSA-c", "RUSTSEC-d"), ["GHSA-c", "RUSTSEC-d"], None),
+    ]
+    # GHSA records come first, then by id
+    assert [r["id"] for r in groups[0].records] == ["GHSA-b", "PYSEC-1"]
+    assert [r["id"] for r in groups[1].records] == ["GHSA-c", "RUSTSEC-d"]
+
+
+def test_osv_findings_are_distinct_by_package_and_group() -> None:
+    found = mr.osv_findings(osv_native())
+    lodash = (("npm", "lodash"), "4.17.0")
+    assert sorted(found) == [
+        ((("Maven", "org.example:lib"), "1.0"), ("GHSA-dddd-dddd-0001",)),
+        ((("PyPI", "requests"), "2.0.0"), ("PYSEC-2030-1",)),
+        ((("npm", "@scope/pkg"), "1.0.0"), ("GHSA-bbbb-bbbb-0001",)),
+        (lodash, ("GHSA-aaaa-aaaa-0001",)),
+        (lodash, ("GHSA-aaaa-aaaa-0002",)),
+    ]
+    assert found[(lodash, ("GHSA-aaaa-aaaa-0001",))] == ("CRITICAL", True)
+    assert found[(lodash, ("GHSA-aaaa-aaaa-0002",))] == ("LOW", False)
+    # no database rating: the max_severity of the group (7.5)
+    scoped = (("npm", "@scope/pkg"), "1.0.0")
+    assert found[(scoped, ("GHSA-bbbb-bbbb-0001",))] == ("HIGH", True)
+    requests = (("PyPI", "requests"), "2.0.0")
+    assert found[(requests, ("PYSEC-2030-1",))] == ("UNKNOWN", True)
+    library = (("Maven", "org.example:lib"), "1.0")
+    assert found[(library, ("GHSA-dddd-dddd-0001",))] == ("MEDIUM", False)
 
 
 # ---- OSV: findings as records
@@ -3538,16 +3538,58 @@ def osv_record(vuln_id: str, **fields: Any) -> dict[str, Any]:
     return {"id": vuln_id, **fields}
 
 
+def purl_version(purl: str) -> str:
+    return urllib.parse.unquote(purl.split("?")[0].rsplit("@", 1)[1])
+
+
+def alias_groups(records: dict[str, dict[str, Any]], ids: list[str]) -> list[Any]:
+    """Ids that alias each other, as the groups of osv-scanner (smallest id first)."""
+    groups: list[tuple[list[str], set[str]]] = []
+    for vuln_id in sorted(set(ids)):
+        names = {vuln_id, *records[vuln_id].get("aliases", [])}
+        linked = [g for g in groups if g[1] & names]
+        merged = ([vuln_id], names)
+        for group in linked:
+            groups.remove(group)
+            merged = (merged[0] + group[0], merged[1] | group[1])
+        groups.append((sorted(merged[0]), merged[1]))
+    return sorted(groups)
+
+
 def osv_part(
-    packages: dict[str, list[str]], *records: dict[str, Any]
+    packages: dict[str, list[str]],
+    *records: dict[str, Any],
+    scores: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "queried_at": "2030-01-01T00:10:00Z",
-        "api_url": "https://api.osv.dev",
-        "packages": packages,
-        "vulnerabilities": {r["id"]: r for r in records},
-    }
+    """An osv-scanner result (``--format json --all-packages``) of one BOM.
+
+    ``packages``: purl -> ids found for it (ids that alias each other are one
+    group); ``scores``: the ``max_severity`` of the group of an id.
+    """
+    by_id = {r["id"]: r for r in records}
+    entries = []
+    for purl, ids in packages.items():
+        ecosystem, name = mr.purl_identity(purl)
+        entry: dict[str, Any] = {
+            "package": {
+                "name": name,
+                "version": purl_version(purl),
+                "ecosystem": ecosystem,
+            }
+        }
+        if ids:
+            entry["vulnerabilities"] = [by_id[i] for i in sorted(set(ids))]
+            entry["groups"] = [
+                {
+                    "ids": members,
+                    "aliases": sorted(names),
+                    "max_severity": (scores or {}).get(members[0], ""),
+                }
+                for members, names in alias_groups(by_id, ids)
+            ]
+        entries.append(entry)
+    source = {"path": "source-development.cdx.json", "type": "sbom"}
+    return {"results": [{"source": source, "packages": entries}]}
 
 
 def merge_scan(
@@ -3756,27 +3798,8 @@ def test_osv_related_does_not_join_vulnerabilities(tmp_path: Path) -> None:
 
 
 def vulnerabilities(*records: dict[str, Any]) -> list[Any]:
-    return mr.osv_vulnerabilities(
-        {r["id"]: r for r in records}, [r["id"] for r in records]
-    )
-
-
-def test_osv_vulnerabilities_group_ids_linked_by_aliases() -> None:
-    groups = vulnerabilities(
-        osv_record("PYSEC-1", aliases=["CVE-1"]),
-        osv_record("GHSA-b", aliases=["CVE-1", "OTHER-9"]),
-        osv_record("GHSA-c"),
-        osv_record("RUSTSEC-d", aliases=["GHSA-c"]),
-        osv_record("GHSA-e", aliases=[7, None]),
-    )
-    assert [(g.ids, sorted(g.names)) for g in groups] == [
-        (("GHSA-b", "PYSEC-1"), ["CVE-1", "GHSA-b", "OTHER-9", "PYSEC-1"]),
-        (("GHSA-c", "RUSTSEC-d"), ["GHSA-c", "RUSTSEC-d"]),
-        (("GHSA-e",), ["GHSA-e"]),
-    ]
-    # GHSA records come first, then by id
-    assert [r["id"] for r in groups[0].records] == ["GHSA-b", "PYSEC-1"]
-    assert [r["id"] for r in groups[1].records] == ["GHSA-c", "RUSTSEC-d"]
+    native = osv_part({"pkg:npm/p@1": [r["id"] for r in records]}, *records)
+    return list(mr.osv_packages(native)[(("npm", "p"), "1")].vulnerabilities)
 
 
 @pytest.mark.parametrize(
@@ -3839,6 +3862,7 @@ def test_osv_only_record_fields_from_the_osv_records(tmp_path: Path) -> None:
                 ],
                 affected=[affected_range("PyPI", "foo-bar", {"fixed": "1.1"})],
             ),
+            scores={"GHSA-aaaa-aaaa-aaaa": "9.8"},
         )
     }
     ws = merge_scan(tmp_path, trivy, osv, SOURCE)
@@ -3859,7 +3883,7 @@ def test_osv_only_record_fields_from_the_osv_records(tmp_path: Path) -> None:
     assert record["ecosystem"] == ["poetry"]
     assert record["pkg_type"] == "library"
     assert record["relationship"] == ["direct"]
-    # GHSA first: its database rating (MODERATE is MEDIUM) wins over the vector
+    # GHSA first: its database rating (MODERATE is MEDIUM) wins over the score
     assert (record["severity"], record["severity_source"]) == ("MEDIUM", "osv")
     assert record["cvss"] == {
         "score": 9.8,
@@ -3970,7 +3994,9 @@ def test_osv_only_record_has_the_keys_of_a_trivy_record(tmp_path: Path) -> None:
     assert len({tuple(r) for r in records}) == 1
 
 
-def severity_of(tmp_path: Path, **fields: Any) -> dict[str, Any]:
+def severity_of(
+    tmp_path: Path, max_severity: str = "", **fields: Any
+) -> dict[str, Any]:
     trivy = source_with(
         lang_result(
             "npm",
@@ -3982,6 +4008,7 @@ def severity_of(tmp_path: Path, **fields: Any) -> dict[str, Any]:
         "source-development": osv_part(
             {"pkg:npm/lib@1.0": ["GHSA-aaaa-aaaa-aaaa"]},
             osv_record("GHSA-aaaa-aaaa-aaaa", **fields),
+            scores={"GHSA-aaaa-aaaa-aaaa": max_severity},
         )
     }
     (record,) = merge_scan(tmp_path, trivy, osv, SOURCE).json(
@@ -3993,6 +4020,7 @@ def severity_of(tmp_path: Path, **fields: Any) -> dict[str, Any]:
 def test_osv_only_severity_from_the_ghsa_database_rating(tmp_path: Path) -> None:
     record = severity_of(
         tmp_path,
+        "9.8",
         database_specific=GHSA_DB,
         severity=[{"type": "CVSS_V3", "score": VECTOR_CRITICAL}],
     )
@@ -4001,32 +4029,63 @@ def test_osv_only_severity_from_the_ghsa_database_rating(tmp_path: Path) -> None
     assert record["cvss"]["score"] == 9.8
 
 
-def test_osv_only_severity_from_the_cvss3_vector(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("score", "severity"),
+    [("9.8", "CRITICAL"), ("8.7", "HIGH"), ("5.3", "MEDIUM"), ("2.1", "LOW")],
+)
+def test_osv_only_severity_from_the_max_severity_of_the_group(
+    tmp_path: Path, score: str, severity: str
+) -> None:
     record = severity_of(
-        tmp_path,
-        severity=[
-            {"type": "CVSS_V3", "score": VECTOR_HIGH},
-            {"type": "CVSS_V3", "score": VECTOR_CRITICAL},
-        ],
+        tmp_path, score, severity=[{"type": "CVSS_V3", "score": VECTOR_HIGH}]
     )
-    assert (record["severity"], record["severity_source"]) == ("CRITICAL", "osv")
+    assert (record["severity"], record["severity_source"]) == (severity, "osv")
     assert record["cvss"] == {
-        "score": 9.8,
-        "vector": VECTOR_CRITICAL,
+        "score": float(score),
+        "vector": VECTOR_HIGH,
         "version": "3.1",
         "source": "osv",
     }
 
 
-def test_osv_only_cvss4_vector_alone_is_unknown_and_kept_without_a_score(
+def test_osv_only_cvss4_vector_alone_is_rated_by_the_max_severity(
     tmp_path: Path,
 ) -> None:
     record = severity_of(
         tmp_path,
+        "8.7",
         severity=[
             {"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"},
             {"type": "CVSS_V4", "score": VECTOR_V4},
         ],
+    )
+    assert (record["severity"], record["severity_source"]) == ("HIGH", "osv")
+    assert record["cvss"] == {
+        "score": 8.7,
+        "vector": VECTOR_V4,
+        "version": "4.0",
+        "source": "osv",
+    }
+
+
+def test_osv_only_cvss4_vector_is_shown_before_a_cvss3_one(tmp_path: Path) -> None:
+    record = severity_of(
+        tmp_path,
+        "8.7",
+        severity=[
+            {"type": "CVSS_V3", "score": VECTOR_HIGH},
+            {"type": "CVSS_V4", "score": VECTOR_V4},
+        ],
+    )
+    # the score is the group's maximum over its vectors, the vector the latest one
+    assert (record["cvss"]["score"], record["cvss"]["vector"]) == (8.7, VECTOR_V4)
+
+
+def test_osv_only_without_a_score_is_unknown_and_keeps_the_vector(
+    tmp_path: Path,
+) -> None:
+    record = severity_of(
+        tmp_path, "", severity=[{"type": "CVSS_V4", "score": VECTOR_V4}]
     )
     assert (record["severity"], record["severity_source"]) == ("UNKNOWN", None)
     assert record["cvss"] == {
@@ -4037,36 +4096,14 @@ def test_osv_only_cvss4_vector_alone_is_unknown_and_kept_without_a_score(
     }
 
 
-def test_osv_only_cvss3_vector_is_preferred_to_a_cvss4_one(tmp_path: Path) -> None:
+def test_osv_only_cvss2_vector_alone_gives_no_cvss(tmp_path: Path) -> None:
     record = severity_of(
         tmp_path,
-        severity=[
-            {"type": "CVSS_V4", "score": VECTOR_V4},
-            {"type": "CVSS_V3", "score": VECTOR_HIGH},
-        ],
+        "6.8",
+        severity=[{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"}],
     )
-    assert (record["severity"], record["cvss"]["score"]) == ("HIGH", 7.5)
-
-
-def test_osv_only_cvss2_vector_alone_gives_no_severity_and_no_cvss(
-    tmp_path: Path,
-) -> None:
-    record = severity_of(
-        tmp_path, severity=[{"type": "CVSS_V2", "score": "AV:N/AC:L/Au:N/C:P/I:P/A:P"}]
-    )
-    assert (record["severity"], record["cvss"]) == ("UNKNOWN", None)
-
-
-def test_osv_group_severity_takes_the_database_rating_before_the_vectors() -> None:
-    ghsa = osv_record("GHSA-a", database_specific={"severity": "LOW"})
-    pysec = osv_record(
-        "PYSEC-1", severity=[{"type": "CVSS_V3", "score": VECTOR_CRITICAL}]
-    )
-    assert mr.osv_group_severity([ghsa, pysec]) == "LOW"
-    assert mr.osv_group_severity([pysec]) == "CRITICAL"
-    assert mr.osv_group_severity([]) == "UNKNOWN"
-    other = osv_record("GHSA-b", database_specific={"severity": "HIGH"})
-    assert mr.osv_group_severity([ghsa, other]) == "HIGH"
+    # osv-scanner rated it, nothing is shown without a CVSS 3 / 4 vector
+    assert (record["severity"], record["cvss"]) == ("MEDIUM", None)
 
 
 def fix_of(tmp_path: Path, version: str, *affected: dict[str, Any]) -> dict[str, Any]:
@@ -4139,8 +4176,8 @@ def test_osv_group_fixes_keeps_incomparable_versions() -> None:
     record = osv_record(
         "GHSA-a", affected=[affected_range("npm", "lib", {"fixed": "next"})]
     )
-    assert mr.osv_group_fixes([record], "pkg:npm/lib@1.0", "1.0") == ["next"]
-    assert mr.osv_group_fixes([record], "pkg:npm/lib@1.0", None) == ["next"]
+    assert mr.osv_group_fixes([record], ("npm", "lib"), "1.0") == ["next"]
+    assert mr.osv_group_fixes([record], ("npm", "lib"), None) == ["next"]
 
 
 # ---- OSV-only records: package context
@@ -4392,7 +4429,7 @@ def test_osv_package_missing_in_the_trivy_result_fails_the_osv_target(
     assert entry["status"] == "failed"
     assert entry["reason"] == (
         "osv result does not fit trivy's: 1 package(s) with findings are not in the "
-        "trivy result of this target, first: pkg:npm/gone@2.0"
+        "trivy result of this target, first: npm gone@2.0"
     )
     assert entry["findings"] is None
     # nothing of the broken result is merged, the native stays for audit
@@ -4587,20 +4624,6 @@ def test_osv_title_prefers_the_summary_to_the_details() -> None:
     assert mr.osv_title(record) == "Short"
 
 
-@pytest.mark.parametrize(
-    ("purl", "version"),
-    [
-        ("pkg:npm/lodash@4.17.0", "4.17.0"),
-        ("pkg:npm/%40scope/pkg@1.0.0?x=y#sub", "1.0.0"),
-        ("pkg:maven/org.example/lib@1.0%2Bbuild", "1.0+build"),
-        ("pkg:npm/lodash", None),
-        ("pkg:npm/%40scope/pkg", None),
-    ],
-)
-def test_purl_version(purl: str, version: str | None) -> None:
-    assert mr.purl_version(purl) == version
-
-
 def test_target_count_and_record_agree_on_what_a_fix_is(tmp_path: Path) -> None:
     # fixed in 0.9 (another branch, below the installed 1.2) and nowhere else
     record = osv_record(
@@ -4608,14 +4631,12 @@ def test_target_count_and_record_agree_on_what_a_fix_is(tmp_path: Path) -> None:
         affected=[affected_range("npm", "lib", {"fixed": "0.9"})],
     )
     native = osv_part({"pkg:npm/lib@1.2": ["GHSA-aaaa-aaaa-aaaa"]}, record)
-    assert (
-        mr.osv_findings(native)[("pkg:npm/lib@1.2", "GHSA-aaaa-aaaa-aaaa")][1] is False
-    )
+    key = (("npm", "lib"), "1.2")
+    assert mr.osv_findings(native)[(key, ("GHSA-aaaa-aaaa-aaaa",))][1] is False
     # the same record at 0.5 has that fix above it
     native = osv_part({"pkg:npm/lib@0.5": ["GHSA-aaaa-aaaa-aaaa"]}, record)
-    assert (
-        mr.osv_findings(native)[("pkg:npm/lib@0.5", "GHSA-aaaa-aaaa-aaaa")][1] is True
-    )
+    key = (("npm", "lib"), "0.5")
+    assert mr.osv_findings(native)[(key, ("GHSA-aaaa-aaaa-aaaa",))][1] is True
 
     trivy = source_with(
         lang_result(

@@ -325,17 +325,17 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # OSV is asked about the language packages Trivy found (OS packages are not queried), so it runs after the Trivy
-  # matrix. A broken query is a failed target like a failed Trivy scan; its findings are merged into the records by
-  # sca_merge_results. Nothing to query, and so no job, if no Trivy target was scanned
+  # OSV is asked (by osv-scanner, over a BOM that Trivy converts from its result) about the language packages Trivy
+  # found (OS packages are not queried), so it runs after the Trivy matrix. A broken query is a failed target like a
+  # failed Trivy scan; its findings are merged into the records by sca_merge_results. Nothing to query, and so no job,
+  # if no Trivy target was scanned
   osv:
     needs: [targets, trivy]
     if: ${{ !cancelled() && needs.targets.result == 'success' && inputs.osv-enabled && needs.targets.outputs.matrix != '[]' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
-    # Normally a few requests per 1000 packages and one per distinct vulnerability, i.e. a few minutes. A request is
-    # bounded by 4 attempts of 30 s each plus backoff, so the job bound only stops an API that is up but crawling
+    # Normally a few minutes (osv-scanner queries OSV in batches); the job bound only stops an API that is up but crawling
     timeout-minutes: 30
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -353,6 +353,7 @@ jobs:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca-out
+          trivy-version: ${{ inputs.trivy-version }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

@@ -376,6 +376,12 @@ def load_target_result(
         return failed(problem)
 
     state.update(status=STATUS_OK, reason=None)
+    if scanner == SCANNER_OSV:
+        # What osv-scanner does not say about its own run
+        state.update(
+            queried_at=status.get("queried_at"),
+            scanner_version=status.get("scanner_version"),
+        )
     return state, native
 
 
@@ -1259,26 +1265,26 @@ class RecordSet:
     def add_osv(self, scan: OsvScan) -> None:
         """Merge the findings of one OSV target into the records.
 
-        Per package, the OSV ids that alias each other are one vulnerability
-        (``osv_vulnerabilities``). It joins every record of the same package
-        version that it shares an id with (the record's ``id`` or an alias): the
-        record gains the ``osv`` scanner, the ids and where OSV saw it, and keeps
-        everything Trivy said. A vulnerability no record has becomes a record of
-        its own, whose package context comes from the Trivy package of the purl.
+        Per package, the ids osv-scanner grouped by their aliases are one
+        vulnerability (``OsvVulnerability``). It joins every record of the same
+        package version that it shares an id with (the record's ``id`` or an
+        alias): the record gains the ``osv`` scanner, the ids and where OSV saw
+        it, and keeps everything Trivy said. A vulnerability no record has
+        becomes a record of its own, whose package context comes from the Trivy
+        package OSV looked at.
         """
         self._position(scan.tid)
-        records = scan.native["vulnerabilities"]
-        for purl, vuln_ids in sorted(scan.native["packages"].items()):
-            if not vuln_ids:
-                continue
-            for vulnerability in osv_vulnerabilities(records, vuln_ids):
-                for found in scan.packages[purl]:
-                    self._add_osv_finding(scan.tid, purl, vulnerability, found)
+        for package in sorted(scan.packages, key=lambda p: p.key):
+            for vulnerability in package.vulnerabilities:
+                for found in scan.sightings[package.key]:
+                    self._add_osv_finding(
+                        scan.tid, package.identity, vulnerability, found
+                    )
 
     def _add_osv_finding(
         self,
         tid: str,
-        purl: str,
+        identity: tuple[str, str],
         vulnerability: OsvVulnerability,
         found: PackageSighting,
     ) -> None:
@@ -1293,7 +1299,7 @@ class RecordSet:
         if not matched:
             key = (osv_primary_id(vulnerability), name, version)
             self._add_record(
-                key, new_osv_record(self.repo, key, purl, vulnerability, found)
+                key, new_osv_record(self.repo, key, identity, vulnerability, found)
             )
             matched = [key]
         # Ids of the vulnerability that are the id of one of the matched records
@@ -1369,21 +1375,10 @@ def merge_records(
 
 # ---- OSV: reported per target and merged into the records
 
-OSV_NATIVE_SCHEMA_VERSION = 1
 OSV_FOOTER = "OSV: language packages only"
 OSV_VULNERABILITY_URL = "https://osv.dev/vulnerability/"
-# CVSS 3.x qualitative rating: lower bound of the base score -> severity
-CVSS3_RATINGS = ((9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM"), (0.1, "LOW"))
-CVSS3_WEIGHTS = {
-    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
-    "AC": {"L": 0.77, "H": 0.44},
-    "UI": {"N": 0.85, "R": 0.62},
-    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
-    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
-    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
-}
-# Privileges required depend on the scope: (unchanged, changed)
-CVSS3_PRIVILEGES = {"N": (0.85, 0.85), "L": (0.62, 0.68), "H": (0.27, 0.5)}
+# Qualitative rating of a CVSS base score (v3 and v4 alike): lower bound -> severity
+SCORE_RATINGS = ((9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM"), (0.1, "LOW"))
 # purl type -> (OSV ecosystem, separator of namespace and name in the OSV name)
 PURL_ECOSYSTEMS = {
     "npm": ("npm", "/"),
@@ -1401,21 +1396,16 @@ CASE_INSENSITIVE_ECOSYSTEMS = ("PyPI", "NuGet")
 OSV_VERSION_RANGE_TYPES = ("ECOSYSTEM", "SEMVER")
 
 
+class OsvResultError(Exception):
+    """The osv-scanner output does not have the shape this merge reads."""
+
+
 def osv_result_problem(native: Mapping[str, Any]) -> str | None:
     """Why an OSV result cannot be counted (it is incomplete), else None."""
-    if native.get("schema_version") != OSV_NATIVE_SCHEMA_VERSION:
-        version = native.get("schema_version")
-        return f"osv result has an unsupported schema_version: {version!r}"
-    packages = native.get("packages")
-    records = native.get("vulnerabilities")
-    if not isinstance(packages, dict) or not isinstance(records, dict):
-        return "osv result has no packages or vulnerabilities"
-    for vuln_ids in packages.values():
-        if not isinstance(vuln_ids, list):
-            return "osv result has a malformed package entry"
-        for vuln_id in vuln_ids:
-            if not isinstance(records.get(vuln_id), dict):
-                return f"osv result has no record of {vuln_id}"
+    try:
+        osv_packages(native)
+    except OsvResultError as e:
+        return f"osv result {e}"
     return None
 
 
@@ -1429,13 +1419,6 @@ def parse_purl(purl: str) -> tuple[str, str, str] | None:
         return None
     namespace = "/".join(urllib.parse.unquote(part) for part in parts[1:-1])
     return parts[0].lower(), namespace, urllib.parse.unquote(parts[-1])
-
-
-def purl_version(purl: str) -> str | None:
-    """The version inside a purl (percent-decoded); None if it has none."""
-    path = purl.split("#", 1)[0].split("?", 1)[0]
-    _, at, version = path.rpartition("@")
-    return urllib.parse.unquote(version) if at and "/" not in version else None
 
 
 def osv_identity(ecosystem: str, name: str) -> tuple[str, str]:
@@ -1470,9 +1453,11 @@ def affected_identity(affected: Mapping[str, Any]) -> tuple[str, str] | None:
 
 
 def osv_fixed_versions(
-    record: Mapping[str, Any], purl: str, installed: str | None = None
+    record: Mapping[str, Any],
+    identity: tuple[str, str],
+    installed: str | None = None,
 ) -> list[str]:
-    """The versions the advisory names as the fix of the package of ``purl``.
+    """The versions the advisory names as the fix of the package ``identity``.
 
     Only entries of this very package count (an advisory often covers several
     packages) and only version ranges (``GIT`` ranges name commits). A range
@@ -1481,9 +1466,6 @@ def osv_fixed_versions(
     another branch of the package), so it is left out; an incomparable one is
     kept. This is the one definition of a fix, for records and target counts.
     """
-    identity = purl_identity(purl)
-    if identity is None:
-        return []
     fixed: list[str] = []
     for affected in record.get("affected") or []:
         if affected_identity(affected) != identity:
@@ -1503,50 +1485,12 @@ def osv_fixed_versions(
     return fixed
 
 
-def osv_has_fix(
-    record: Mapping[str, Any], purl: str, installed: str | None = None
-) -> bool:
-    """Whether the advisory names a fixed version of the package of ``purl``."""
-    return bool(osv_fixed_versions(record, purl, installed))
-
-
-def cvss3_roundup(value: float) -> float:
-    """Round up to one decimal as CVSS 3.1 specifies (immune to float noise)."""
-    scaled = round(value * 100_000)
-    if scaled % 10_000 == 0:
-        return scaled / 100_000
-    return (scaled // 10_000 + 1) / 10.0
-
-
-def cvss3_base_score(vector: str) -> float | None:
-    """The base score of a CVSS 3.x vector string; None if it is not a valid one."""
-    version, *parts = vector.split("/")
-    if version not in ("CVSS:3.0", "CVSS:3.1"):
-        return None
-    metrics = dict(part.split(":", 1) for part in parts if ":" in part)
-    try:
-        changed = {"U": False, "C": True}[metrics["S"]]
-        privileges = CVSS3_PRIVILEGES[metrics["PR"]][changed]
-        exploitability_weights = [
-            CVSS3_WEIGHTS[k][metrics[k]] for k in ("AV", "AC", "UI")
-        ]
-        impact_weights = [CVSS3_WEIGHTS[k][metrics[k]] for k in ("C", "I", "A")]
-    except KeyError:
-        return None
-    iss = 1 - math.prod(1 - weight for weight in impact_weights)
-    if changed:
-        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
-    else:
-        impact = 6.42 * iss
-    if impact <= 0:
-        return 0.0
-    exploitability = 8.22 * math.prod(exploitability_weights) * privileges
-    return cvss3_roundup(min((1.08 if changed else 1) * (impact + exploitability), 10))
-
-
-def cvss3_rating(score: float) -> str:
+def score_rating(score: float | None) -> str:
+    """The qualitative rating of a CVSS base score; UNKNOWN without a positive one."""
+    if score is None:
+        return UNKNOWN_SEVERITY
     return next(
-        (rating for bound, rating in CVSS3_RATINGS if score >= bound), UNKNOWN_SEVERITY
+        (rating for bound, rating in SCORE_RATINGS if score >= bound), UNKNOWN_SEVERITY
     )
 
 
@@ -1566,39 +1510,140 @@ def osv_database_rating(record: Mapping[str, Any]) -> str | None:
     return own if own in SEV_ORDER and own != UNKNOWN_SEVERITY else None
 
 
-def osv_cvss3_vectors(record: Mapping[str, Any]) -> list[tuple[float, str]]:
-    """``(base score, vector)`` of the valid CVSS 3.x vectors of ``severity[]``."""
-    vectors = []
-    for entry in record.get("severity") or []:
-        vector = entry.get("score")
-        score = cvss3_base_score(vector) if isinstance(vector, str) else None
-        if score is not None:
-            vectors.append((score, vector))
-    return vectors
+@dataclass(frozen=True)
+class OsvVulnerability:
+    """One vulnerability of a package: an osv-scanner group of aliasing ids.
 
-
-def osv_severity(record: Mapping[str, Any]) -> str:
-    """The severity of an OSV record as one of the Trivy levels.
-
-    The database's own rating wins; otherwise the highest rating of the CVSS 3.x
-    vectors in ``severity[]``. CVSS 2 and 4 vectors are not rated, so a record that
-    has nothing else is UNKNOWN.
+    ``ids`` are the ids of the group, ``names`` those and all their aliases;
+    ``records`` are the OSV records of the ids, GHSA first, then by id;
+    ``max_severity`` is the highest CVSS base score osv-scanner found in them.
     """
-    return osv_database_rating(record) or worst_severity(
-        cvss3_rating(score) for score, _ in osv_cvss3_vectors(record)
+
+    ids: tuple[str, ...]
+    names: frozenset[str]
+    records: tuple[Mapping[str, Any], ...]
+    max_severity: float | None
+
+
+# (OSV package identity, version)
+OsvKey = tuple[tuple[str, str], str]
+
+
+class OsvPackage(NamedTuple):
+    """A package osv-scanner looked at, with the vulnerabilities it found."""
+
+    identity: tuple[str, str]
+    version: str
+    vulnerabilities: tuple[OsvVulnerability, ...]
+
+    @property
+    def key(self) -> OsvKey:
+        return self.identity, self.version
+
+
+def osv_record_order(record: Mapping[str, Any]) -> tuple[bool, str]:
+    """GHSA records first (they carry the summary, severity and CWE), then by id."""
+    return not record["id"].startswith("GHSA-"), record["id"]
+
+
+def osv_score(value: Any) -> float | None:
+    """The ``max_severity`` of a group (a number as a string, empty without one)."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) and score > 0 else None
+
+
+def osv_vulnerability(
+    group: Any, records: Mapping[str, Mapping[str, Any]]
+) -> OsvVulnerability:
+    ids = group.get("ids") if isinstance(group, dict) else None
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+        raise OsvResultError("has a malformed group")
+    for vuln_id in ids:
+        if vuln_id not in records:
+            raise OsvResultError(f"has no record of {vuln_id}")
+    aliases = [a for a in group.get("aliases") or [] if isinstance(a, str)]
+    return OsvVulnerability(
+        tuple(sorted(ids)),
+        frozenset(ids) | frozenset(aliases),
+        tuple(sorted((records[i] for i in ids), key=osv_record_order)),
+        osv_score(group.get("max_severity")),
     )
 
 
-def osv_findings(native: Mapping[str, Any]) -> dict[tuple[str, str], tuple[str, bool]]:
-    """Unique findings of one OSV target: (purl, OSV id) -> (severity, fixable)."""
-    records = native["vulnerabilities"]
+def osv_package(entry: Any) -> OsvPackage:
+    info = entry.get("package") if isinstance(entry, dict) else None
+    fields = [info.get(k) for k in ("ecosystem", "name", "version")] if info else []
+    if len(fields) != 3 or not all(isinstance(f, str) and f for f in fields):
+        raise OsvResultError("has a malformed package entry")
+    ecosystem, name, version = fields
+    found = entry.get("vulnerabilities") or []
+    groups = entry.get("groups") or []
+    if not isinstance(found, list) or not isinstance(groups, list):
+        raise OsvResultError("has a malformed package entry")
+    if not all(isinstance(v, dict) and isinstance(v.get("id"), str) for v in found):
+        raise OsvResultError("has a malformed vulnerability record")
+    records = {v["id"]: v for v in found}
+    vulnerabilities = tuple(osv_vulnerability(group, records) for group in groups)
+    covered = {i for v in vulnerabilities for i in v.ids}
+    if missing := sorted(records.keys() - covered):
+        raise OsvResultError(f"has no group of {missing[0]}")
+    return OsvPackage(osv_identity(ecosystem, name), version, vulnerabilities)
+
+
+def osv_packages(native: Mapping[str, Any]) -> dict[OsvKey, OsvPackage]:
+    """The packages of an osv-scanner result (``--format json --all-packages``),
+    distinct by ecosystem, name and version, in the order of the result.
+    """
+    results = native.get("results")
+    if not isinstance(results, list):
+        raise OsvResultError("has no results list")
+    packages: dict[OsvKey, OsvPackage] = {}
+    for result in results:
+        entries = result.get("packages") if isinstance(result, dict) else None
+        if not isinstance(entries, list):
+            raise OsvResultError("has a malformed result entry")
+        for package in map(osv_package, entries):
+            known = packages.get(package.key)
+            if known is not None:
+                seen = {v.ids for v in known.vulnerabilities}
+                package = known._replace(
+                    vulnerabilities=known.vulnerabilities
+                    + tuple(v for v in package.vulnerabilities if v.ids not in seen)
+                )
+            packages[package.key] = package
+    return packages
+
+
+def osv_group_severity(vulnerability: OsvVulnerability) -> str:
+    """The severity of a vulnerability: the database rating of its records (the
+    most severe if several), else the rating of the ``max_severity`` of the group,
+    else UNKNOWN.
+    """
+    if own := [r for r in map(osv_database_rating, vulnerability.records) if r]:
+        return worst_severity(own)
+    return score_rating(vulnerability.max_severity)
+
+
+def osv_findings(
+    native: Mapping[str, Any],
+) -> dict[tuple[OsvKey, tuple[str, ...]], tuple[str, bool]]:
+    """Unique findings of one OSV target: (package, ids of the group) ->
+    (severity, fixable).
+    """
     return {
-        (purl, vuln_id): (
-            osv_severity(records[vuln_id]),
-            osv_has_fix(records[vuln_id], purl, purl_version(purl)),
+        (package.key, vulnerability.ids): (
+            osv_group_severity(vulnerability),
+            bool(
+                osv_group_fixes(
+                    vulnerability.records, package.identity, package.version
+                )
+            ),
         )
-        for purl, vuln_ids in native["packages"].items()
-        for vuln_id in set(vuln_ids)
+        for package in osv_packages(native).values()
+        for vulnerability in package.vulnerabilities
     }
 
 
@@ -1614,11 +1659,11 @@ class PackageSighting(NamedTuple):
 
 
 class OsvScan(NamedTuple):
-    """The native result of an OSV target with the Trivy packages of its purls."""
+    """The packages of an OSV target that have findings, with their Trivy packages."""
 
     tid: str
-    native: Mapping[str, Any]
-    packages: Mapping[str, list[PackageSighting]]
+    packages: tuple[OsvPackage, ...]
+    sightings: Mapping[OsvKey, list[PackageSighting]]
 
 
 class OsvResolutionError(Exception):
@@ -1628,100 +1673,42 @@ class OsvResolutionError(Exception):
 def resolve_osv_scan(
     tid: str, native: Mapping[str, Any], trivy_native: Mapping[str, Any] | None
 ) -> OsvScan:
-    """Find the Trivy package of every purl of the OSV result that has findings.
+    """Find the Trivy package of every package of the OSV result that has findings.
 
-    OSV was asked about the purls of the language packages of the twin Trivy
-    target (the same id), so every purl with a finding must be a package there
-    (``Identifier.PURL``, in any of its lockfiles): that package gives the
-    findings their name, version, relationship, dev flag and dependency chains.
-    A result that does not fit means the two parts are not of the same scan, so
-    the OSV target is failed rather than guessed at.
+    osv-scanner read the language packages of the twin Trivy target (the same id)
+    as a BOM, so every package with a finding must be a package there: the one
+    whose ``Identifier.PURL`` is the OSV package (ecosystem and name) and whose
+    version is the OSV one, in any of its lockfiles. That package gives the
+    findings their name, version, relationship, dev flag and dependency chains. A
+    result that does not fit means the two parts are not of the same scan, so the
+    OSV target is failed rather than guessed at.
     """
-    needed = {purl for purl, vuln_ids in native["packages"].items() if vuln_ids}
-    if not needed:
-        return OsvScan(tid, native, {})
+    packages = tuple(p for p in osv_packages(native).values() if p.vulnerabilities)
+    if not packages:
+        return OsvScan(tid, (), {})
     if trivy_native is None:
         raise OsvResolutionError("there is no trivy result of this target to join with")
-    found: dict[str, list[PackageSighting]] = {}
+    needed = {package.key for package in packages}
+    found: dict[OsvKey, list[PackageSighting]] = {}
     for result in trivy_native.get("Results") or []:
         if result.get("Class") != CLASS_LANGUAGE_PACKAGES:
             continue
-        packages = result.get("Packages") or []
-        index = PackageIndex(packages, result.get("Type"))
-        for package in packages:
+        trivy_packages = result.get("Packages") or []
+        index = PackageIndex(trivy_packages, result.get("Type"))
+        for package in trivy_packages:
             purl = (package.get("Identifier") or {}).get("PURL")
-            if purl in needed:
-                found.setdefault(purl, []).append(
+            identity = purl_identity(purl) if isinstance(purl, str) else None
+            if identity and (identity, package.get("Version")) in needed:
+                found.setdefault((identity, package["Version"]), []).append(
                     PackageSighting(result, package, index)
                 )
     if missing := sorted(needed - found.keys()):
+        (ecosystem, name), version = missing[0]
         raise OsvResolutionError(
             f"{len(missing)} package(s) with findings are not in the trivy result "
-            f"of this target, first: {missing[0]}"
+            f"of this target, first: {ecosystem} {name}@{version}"
         )
-    return OsvScan(tid, native, found)
-
-
-@dataclass(frozen=True)
-class OsvVulnerability:
-    """The OSV ids reported for one package that are one vulnerability.
-
-    ``ids`` are the ids OSV reported, ``names`` those and all their aliases;
-    ``records`` are the OSV records of the ids, GHSA first, then by id.
-    """
-
-    ids: tuple[str, ...]
-    names: frozenset[str]
-    records: tuple[Mapping[str, Any], ...]
-
-
-def osv_aliases(record: Mapping[str, Any]) -> list[str]:
-    return [a for a in record.get("aliases") or [] if isinstance(a, str)]
-
-
-def osv_record_order(record: Mapping[str, Any]) -> tuple[bool, str]:
-    """GHSA records first (they carry the summary, severity and CWE), then by id."""
-    return not record["id"].startswith("GHSA-"), record["id"]
-
-
-def osv_vulnerabilities(
-    records: Mapping[str, Mapping[str, Any]], vuln_ids: Iterable[str]
-) -> list[OsvVulnerability]:
-    """Group the ids reported for a package into vulnerabilities by their aliases.
-
-    Two ids are one vulnerability if they are linked through ``aliases`` (``PYSEC-x``
-    and ``GHSA-y`` that both alias ``CVE-z``, or one that lists the other). The
-    ``related`` field is not used: it links advisories that are similar, not the
-    same. Groups come in the order of their smallest id.
-    """
-    parent: dict[str, str] = {}
-
-    def find(name: str) -> str:
-        parent.setdefault(name, name)
-        while parent[name] != name:
-            parent[name] = parent[parent[name]]
-            name = parent[name]
-        return name
-
-    ids = sorted(set(vuln_ids))
-    for vuln_id in ids:
-        for alias in osv_aliases(records[vuln_id]):
-            parent[find(alias)] = find(vuln_id)
-    groups: dict[str, list[str]] = {}
-    for vuln_id in ids:
-        groups.setdefault(find(vuln_id), []).append(vuln_id)
-    vulnerabilities = []
-    for members in groups.values():
-        names = {
-            name
-            for member in members
-            for name in (member, *osv_aliases(records[member]))
-        }
-        ordered = sorted((records[m] for m in members), key=osv_record_order)
-        vulnerabilities.append(
-            OsvVulnerability(tuple(members), frozenset(names), tuple(ordered))
-        )
-    return vulnerabilities
+    return OsvScan(tid, packages, found)
 
 
 def osv_primary_id(vulnerability: OsvVulnerability) -> str:
@@ -1736,46 +1723,27 @@ def osv_primary_id(vulnerability: OsvVulnerability) -> str:
     return vulnerability.ids[0]
 
 
-def osv_group_severity(records: Iterable[Mapping[str, Any]]) -> str:
-    """The severity of a vulnerability: the database rating of its records (the
-    most severe if several), else the highest rating of their CVSS 3.x vectors,
-    else UNKNOWN.
+def osv_group_cvss(vulnerability: OsvVulnerability) -> Record | None:
+    """The CVSS of a vulnerability, in the shape of the Trivy ``cvss``.
+
+    The vector is the first one of the latest CVSS version in the ``severity[]``
+    of its records (4.0 over 3.x, as for Trivy; CVSS 2 vectors are ignored), the
+    score is the ``max_severity`` of the group: osv-scanner computed it, so
+    nothing is calculated here. It is the highest score over all the vectors of
+    the group, so with both a 3.x and a 4.0 vector it may belong to the other one.
+    Without a vector there is no ``cvss``.
     """
-    records = list(records)
-    if own := [r for r in map(osv_database_rating, records) if r]:
-        return worst_severity(own)
-    return worst_severity(
-        cvss3_rating(score) for r in records for score, _ in osv_cvss3_vectors(r)
-    )
-
-
-def osv_group_cvss(records: Iterable[Mapping[str, Any]]) -> Record | None:
-    """The best CVSS vector of a vulnerability, in the shape of the Trivy ``cvss``.
-
-    The highest-scoring CVSS 3.x vector (its score is computed from the vector).
-    Without one, the first CVSS 4.0 vector, kept with ``score: null`` because a
-    4.0 score is not computed here. CVSS 2 vectors are ignored.
-    """
-    records = list(records)
-    vectors = [v for r in records for v in osv_cvss3_vectors(r)]
-    if vectors:
-        score, vector = max(vectors, key=lambda v: v[0])
-    else:
-        score = None
-        vector = next(
-            (
-                entry["score"]
-                for r in records
-                for entry in r.get("severity") or []
-                if isinstance(entry.get("score"), str)
-                and cvss_vector_version(entry["score"]) == "4.0"
-            ),
-            None,
-        )
-        if vector is None:
-            return None
+    vectors = [
+        entry["score"]
+        for record in vulnerability.records
+        for entry in record.get("severity") or []
+        if isinstance(entry.get("score"), str) and cvss_vector_version(entry["score"])
+    ]
+    if not vectors:
+        return None
+    vector = max(vectors, key=lambda v: float(cvss_vector_version(v) or 0))
     return {
-        "score": score,
+        "score": vulnerability.max_severity,
         "vector": vector,
         "version": cvss_vector_version(vector),
         "source": SCANNER_OSV,
@@ -1783,14 +1751,16 @@ def osv_group_cvss(records: Iterable[Mapping[str, Any]]) -> Record | None:
 
 
 def osv_group_fixes(
-    records: Iterable[Mapping[str, Any]], purl: str, installed: str | None
+    records: Iterable[Mapping[str, Any]],
+    identity: tuple[str, str],
+    installed: str | None,
 ) -> list[str]:
     """The fixed versions of the package in a vulnerability, in the order of the
     records and their events (see ``osv_fixed_versions``).
     """
     fixed: list[str] = []
     for record in records:
-        for version in osv_fixed_versions(record, purl, installed):
+        for version in osv_fixed_versions(record, identity, installed):
             _append_unique(fixed, version)
     return fixed
 
@@ -1827,27 +1797,27 @@ def osv_primary_url(records: Sequence[Mapping[str, Any]]) -> str:
 def new_osv_record(
     repo: str | None,
     key: FindingKey,
-    purl: str,
+    identity: tuple[str, str],
     vulnerability: OsvVulnerability,
     found: PackageSighting,
 ) -> Record:
     """A record for a vulnerability only OSV reports, from the OSV records of its
-    ids and the Trivy package of the purl.
+    ids and the Trivy package it was found in.
     """
     vuln_id, _, version = key
     records = vulnerability.records
     record = blank_record(
         repo, vuln_id, found.package.get("Name"), version, package_type(found.result)
     )
-    severity = osv_group_severity(records)
-    fixed = osv_group_fixes(records, purl, version)
+    severity = osv_group_severity(vulnerability)
+    fixed = osv_group_fixes(records, identity, version)
     titles = [osv_title(r) for r in records]
     published = [r["published"] for r in records if isinstance(r.get("published"), str)]
     cwe = {cwe_id for r in records for cwe_id in osv_cwe_ids(r)}
     record.update(
         severity=severity,
         severity_source=None if severity == UNKNOWN_SEVERITY else SCANNER_OSV,
-        cvss=osv_group_cvss(records),
+        cvss=osv_group_cvss(vulnerability),
         status="fixed" if fixed else "affected",
         fixed_versions=fixed,
         fix_available=bool(fixed),
@@ -2563,9 +2533,9 @@ def build_target_entry(
     if native is None:
         return entry
     if target["scanner"] == SCANNER_OSV:
-        entry["packages_scanned"] = len(native["packages"])
+        entry["packages_scanned"] = len(osv_packages(native))
         entry["findings"] = finding_stats(osv_findings(native).values())
-        entry["queried_at"] = native.get("queried_at")
+        entry["queried_at"] = state.get("queried_at")
     else:
         entry.update(count_packages(native))
         entry["findings"] = finding_stats(target_findings(native).values())
@@ -2605,7 +2575,7 @@ def build_scan_report(
     early_warning: EarlyWarning | None = None,
 ) -> dict[str, Any]:
     trivy_version = None
-    osv_api_url = None
+    osv_scanner_version = None
     targets: list[dict[str, Any]] = []
     for target, state, native in results:
         entry = build_target_entry(target, state, native)
@@ -2621,7 +2591,9 @@ def build_scan_report(
                     "an unsupported ecosystem or a missing package list)"
                 )
             if target["scanner"] == SCANNER_OSV:
-                osv_api_url = osv_api_url or native.get("api_url")
+                osv_scanner_version = osv_scanner_version or state.get(
+                    "scanner_version"
+                )
             else:
                 trivy_version = trivy_version or (native.get("Trivy") or {}).get(
                     "Version"
@@ -2639,7 +2611,7 @@ def build_scan_report(
         "generated_utc": generated_utc,
         "trivy_version": trivy_version,
         "trivy_db": {key: (trivy_db or {}).get(key) for key in TRIVY_DB_KEYS},
-        "osv": {"api_url": osv_api_url} if has_osv else None,
+        "osv": {"scanner_version": osv_scanner_version} if has_osv else None,
         "early_warning": early_warning.report if early_warning else None,
         "run_kind": targets_doc["run_kind"],
         "run_kind_reasons": targets_doc["run_kind_reasons"],

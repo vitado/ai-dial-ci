@@ -1,5 +1,5 @@
 name: Query OSV for SCA scan packages
-description: Check the language packages found by Trivy in the targets of an SCA scheduled scan against OSV (osv.dev); OS packages are not queried
+description: Check the language packages found by Trivy in the targets of an SCA scheduled scan against OSV (osv.dev) with osv-scanner; OS packages are not queried
 
 inputs:
   targets-file:
@@ -11,9 +11,9 @@ inputs:
   output-dir:
     description: Directory to write the OSV parts into (osv/<id>.json and osv/<id>.status.json of every OSV target)
     required: true
-  api-url:
-    description: Base URL of the OSV API
-    default: https://api.osv.dev
+  trivy-version:
+    description: Trivy version to use for converting the Trivy results to a BOM (release tag, e.g. v0.75.0)
+    required: true
 
 runs:
   using: "composite"
@@ -22,6 +22,31 @@ runs:
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.12"
+    - name: Set up Trivy
+      uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+      with:
+        version: ${{ inputs.trivy-version }}
+        cache: true # hits the binary cache saved by the trivy-db job
+    # The checksums are pinned here, not read from the release: a replaced release must not pass
+    - name: Install osv-scanner
+      shell: bash
+      env:
+        OSV_SCANNER_VERSION: v2.6.0
+        SHA256_AMD64: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+        SHA256_ARM64: 2c71403eb443d05891c4f268c3ad771cf4f16e5443463fd7851ef8f454d3c7e4
+      run: |
+        case "$(uname -m)" in
+          x86_64) arch=amd64; sha256="$SHA256_AMD64" ;;
+          aarch64 | arm64) arch=arm64; sha256="$SHA256_ARM64" ;;
+          *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+        esac
+        mkdir -p "$RUNNER_TEMP/osv-scanner"
+        curl --fail --silent --show-error --location --retry 3 \
+          --output "$RUNNER_TEMP/osv-scanner/osv-scanner" \
+          "https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION/osv-scanner_linux_$arch"
+        echo "$sha256  $RUNNER_TEMP/osv-scanner/osv-scanner" | sha256sum --check -
+        chmod +x "$RUNNER_TEMP/osv-scanner/osv-scanner"
+        echo "$RUNNER_TEMP/osv-scanner" >> "$GITHUB_PATH"
     - name: Query OSV
       shell: bash
       env:
@@ -29,10 +54,8 @@ runs:
         TARGETS_FILE: ${{ inputs.targets-file }}
         PARTS_DIR: ${{ inputs.parts-dir }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
-        API_URL: ${{ inputs.api-url }}
       run: >-
         python "$ACTION_PATH/query_osv.py"
         --targets-file "$TARGETS_FILE"
         --parts-dir "$PARTS_DIR"
         --output-dir "$OUTPUT_DIR"
-        --api-url "$API_URL"

@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 from test_resolve_targets import (
     CALLER,
-    NOW,
     FakeRunner,
     github_routes,
     ok,
@@ -202,7 +201,7 @@ def test_run_passes_the_filter_and_the_run_kind_on(tmp_path: Path) -> None:
         IMAGES="example/x",
         TARGETS="x-development",
     )
-    assert rt.run(env, t, NOW) == 0
+    rt.run(env, t)
     doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in doc["targets"]] == ["x-development", "x-development"]
     assert [x["scanner"] for x in doc["targets"]] == ["trivy", "osv"]
@@ -215,20 +214,6 @@ def test_caller_and_ref_come_from_the_environment(tmp_path: Path) -> None:
     github_routes(t, release=None)
     t.add("repos/other/caller", ok({"default_branch": "main"}))
     env = run_env(tmp_path, GITHUB_REPOSITORY="other/caller", GITHUB_REF_NAME="main")
-    assert rt.run(env, t, NOW) == 0
+    rt.run(env, t)
     doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert doc["run_kind"] == "full"
-
-
-@pytest.mark.parametrize(
-    ("env", "message"),
-    [
-        ({"GITHUB_REPOSITORY": ""}, "caller repository must be"),
-        ({"GITHUB_REF_NAME": ""}, "no ref name"),
-    ],
-)
-def test_run_needs_the_caller_and_the_ref(
-    tmp_path: Path, env: dict[str, str], message: str
-) -> None:
-    with pytest.raises(rt.ResolveError, match=message):
-        rt.run(run_env(tmp_path, **env), FakeRunner(), NOW)

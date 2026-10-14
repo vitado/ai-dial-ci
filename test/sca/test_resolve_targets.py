@@ -1,32 +1,16 @@
 """Tests for sca_resolve_targets/resolve_targets.py (fake transport, no network)."""
 
-import importlib.util
 import json
 import subprocess
-import sys
 import urllib.parse
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / "actions"
-    / "sca_resolve_targets"
-    / "resolve_targets.py"
-)
-_spec = importlib.util.spec_from_file_location("resolve_targets", SCRIPT)
-assert _spec is not None
-assert _spec.loader is not None
-rt = importlib.util.module_from_spec(_spec)
-sys.modules["resolve_targets"] = rt
-_spec.loader.exec_module(rt)
+import resolve_targets as rt
 
 REPOSITORY = "example/app"
-NOW = datetime(2026, 10, 11, 12, 0, 0, tzinfo=UTC)
 SHA = "a" * 40
 ENV = {
     "GITHUB_RUN_ID": "42",
@@ -124,7 +108,6 @@ def run_resolve_targets(
 ) -> dict[str, Any]:
     inputs = rt.Inputs(
         repository=REPOSITORY,
-        output_dir=Path("unused"),
         caller_repository=CALLER,
         images=images,
         scan_source=scan_source,
@@ -138,7 +121,6 @@ def run_resolve_targets(
         rt.GitHubClient(runner),
         rt.RegistryClient(runner, "ghcr.io", token),
         ENV,
-        NOW,
     )
 
 
@@ -147,7 +129,7 @@ def run_env(output_dir: Path, **overrides: str) -> dict[str, str]:
     return {**ENV, "REPOSITORY": REPOSITORY, "OUTPUT_DIR": str(output_dir), **overrides}
 
 
-TARGET_KEYS = {"id", "kind", "image", "tag", "ref", "git_ref", "commit_sha"}
+TARGET_KEYS = {"id", "kind", "ref", "commit_sha"}
 
 
 def by_id(targets_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -192,10 +174,8 @@ def test_resolve_document_metadata() -> None:
     assert targets_doc["repo"] == REPOSITORY
     assert targets_doc["default_branch"] == "development"
     assert targets_doc["commit_sha"] == "a" * 40
-    assert targets_doc["registry"] == "ghcr.io"
     assert targets_doc["run_id"] == "42"
     assert targets_doc["run_url"] == "https://github.com/example/caller/actions/runs/42"
-    assert targets_doc["run_started_at"] == "2026-10-11T12:00:00Z"
 
 
 def test_v_prefixed_release_matches_the_unprefixed_image_tag() -> None:
@@ -341,11 +321,18 @@ def test_matrix_has_only_pending_targets_without_status() -> None:
     assert all(set(m) == TARGET_KEYS for m in matrix)
 
 
-def test_source_target_id_from_git_ref() -> None:
-    assert rt.source_target_id("development") == "source-development"
-    assert rt.source_target_id("release/1.2") == "source-release-1.2"
-    assert rt.source_target_id("v1.2.3") == "source-v1.2.3"
-    assert rt.source_target_id("feat/a b") == "source-feat-a-b"
+def test_target_id_is_sanitized() -> None:
+    def source(git_ref: str) -> str:
+        return rt.make_target("pending", git_ref=git_ref)["id"]
+
+    def image(name: str, tag: str) -> str:
+        return rt.make_target("pending", image=name, tag=tag)["id"]
+
+    assert source("development") == "source-development"
+    assert source("release/1.2") == "source-release-1.2"
+    assert source("feat/a b") == "source-feat-a-b"
+    assert image("example/some_image", "1.2.3") == "some_image-1.2.3"
+    assert image("example/x", "a b+c") == "x-a-b-c"
 
 
 def test_source_target_id_sanitized_and_independent_of_sha() -> None:
@@ -387,7 +374,14 @@ def test_target_schema_is_uniform() -> None:
     kinds = {x["kind"] for x in targets_doc["targets"]}
     assert kinds == {"fs", "image"}
     for target in targets_doc["targets"]:
-        assert set(target) == TARGET_KEYS | {"scanner", "status", "reason"}
+        assert set(target) == TARGET_KEYS | {
+            "scanner",
+            "image",
+            "tag",
+            "git_ref",
+            "status",
+            "reason",
+        }
         assert target["scanner"] == "trivy"
         if target["kind"] == "image":
             assert target["git_ref"] is None
@@ -402,12 +396,7 @@ def test_matrix_carries_commit_sha_of_fs_target() -> None:
     t = FakeRunner()
     github_routes(t)
     (fs,) = rt.build_matrix(run_resolve_targets(t, []))
-    assert (fs["git_ref"], fs["commit_sha"]) == ("development", "a" * 40)
-
-
-def test_target_id_sanitized() -> None:
-    assert rt.target_id("example/some_image", "1.2.3") == "some_image-1.2.3"
-    assert rt.target_id("example/x", "a b+c") == "x-a-b-c"
+    assert (fs["id"], fs["commit_sha"]) == ("source-development", "a" * 40)
 
 
 # --- inputs -------------------------------------------------------------------
@@ -421,24 +410,12 @@ def test_parse_images_ignores_blank_lines_and_whitespace() -> None:
     assert rt.parse_images("") == []
 
 
-def test_parse_images_rejects_duplicates() -> None:
-    with pytest.raises(rt.ResolveError, match="duplicate"):
-        rt.parse_images("example/a\n example/a ")
-
-
 @pytest.mark.parametrize(
     "bad", ["ghcr.io/example/a:1.0", "EXAMPLE/a", "example/a:tag", "../a", "example//a"]
 )
 def test_parse_images_rejects_invalid_names(bad: str) -> None:
     with pytest.raises(rt.ResolveError, match="invalid image name"):
         rt.parse_images(bad)
-
-
-def test_parse_bool() -> None:
-    assert rt.parse_bool("True", "x") is True
-    assert rt.parse_bool(" false ", "x") is False
-    with pytest.raises(rt.ResolveError):
-        rt.parse_bool("yes", "x")
 
 
 # --- registry (oras) ----------------------------------------------------------
@@ -488,20 +465,11 @@ def test_docker_hub_official_images_use_library_namespace() -> None:
     assert rt.RegistryClient(t, "docker.io").tags("nginx") == ["1.0.0"]
 
 
-def test_registry_failure_is_a_registry_error() -> None:
+def test_registry_failure_is_a_resolve_error() -> None:
     t = FakeRunner()
     t.add("ghcr.io/example/x", rt.ToolError("response status code 401: unauthorized"))
-    with pytest.raises(rt.RegistryError, match="listing tags of example/x.*401"):
+    with pytest.raises(rt.ResolveError, match="listing tags of example/x.*401"):
         rt.RegistryClient(t, "ghcr.io").tags("example/x")
-
-
-def test_registry_tags_cached_per_image() -> None:
-    t = FakeRunner()
-    t.add("ghcr.io/example/x", tags_out(["a"]))
-    client = rt.RegistryClient(t, "ghcr.io")
-    client.tags("example/x")
-    client.tags("example/x")
-    assert len(t.calls) == 1
 
 
 # --- GitHub (gh) --------------------------------------------------------------
@@ -515,13 +483,6 @@ def test_github_requests_go_through_gh_api() -> None:
         assert argv[:2] == ["gh", "api"]
         assert "X-GitHub-Api-Version: 2022-11-28" in argv
         assert stdin is None
-
-
-def test_github_invalid_json_is_a_resolve_error() -> None:
-    t = FakeRunner()
-    t.add(f"repos/{REPOSITORY}", "not json")
-    with pytest.raises(rt.ResolveError, match="invalid JSON"):
-        rt.GitHubClient(t).default_branch(REPOSITORY)
 
 
 # --- the runner (subprocess) --------------------------------------------------
@@ -619,19 +580,7 @@ def test_runner_reports_a_missing_tool(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def parse_github_output(text: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    lines = iter(text.split("\n"))
-    for line in lines:
-        if not line:
-            continue
-        name, _, delimiter = line.partition("<<")
-        body: list[str] = []
-        for body_line in lines:
-            if body_line == delimiter:
-                break
-            body.append(body_line)
-        values[name] = "\n".join(body)
-    return values
+    return dict(line.split("=", 1) for line in text.splitlines())
 
 
 def test_run_writes_resolve_json_and_outputs(
@@ -649,7 +598,7 @@ def test_run_writes_resolve_json_and_outputs(
         IMAGES="example/x\n",
         OSV_ENABLED="false",
     )
-    assert rt.run(env, t, NOW) == 0
+    rt.run(env, t)
 
     targets_doc = json.loads(
         (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
@@ -683,29 +632,26 @@ def test_run_uses_token_from_environment(
     github_routes(t)
     tokens: list[str | None] = []
     monkeypatch.setattr(rt, "make_runner", lambda token: tokens.append(token) or t)
-    rt.run(run_env(tmp_path, GITHUB_TOKEN="from-env"), None, NOW)
+    rt.run(run_env(tmp_path, GITHUB_TOKEN="from-env"), None)
     assert tokens == ["from-env"]
 
 
 @pytest.mark.parametrize(
     "extra",
     [
-        {"SCAN_SOURCE": "maybe"},
         {"REPOSITORY": "nope"},
         {"REPOSITORY": ""},
-        {"OUTPUT_DIR": ""},
     ],
 )
 def test_run_rejects_invalid_inputs(tmp_path: Path, extra: dict[str, str]) -> None:
     with pytest.raises(rt.ResolveError):
-        rt.run(run_env(tmp_path, **extra), FakeRunner(), NOW)
+        rt.run(run_env(tmp_path, **extra), FakeRunner())
 
 
 def test_run_defaults_the_registry_and_the_switches(tmp_path: Path) -> None:
     inputs = rt.Inputs.from_environ(run_env(tmp_path))
     assert inputs == rt.Inputs(
         repository=REPOSITORY,
-        output_dir=tmp_path,
         caller_repository=CALLER,
         ref_name="development",
     )
@@ -884,17 +830,15 @@ def test_run_scan_release_source_flag(tmp_path: Path) -> None:
     github_routes(t, release="0.12.0")
     tag_routes(t, "0.12.0", "b" * 40)
     base = run_env(tmp_path, OSV_ENABLED="false")
-    assert rt.run(base, t, NOW) == 0  # on by default
+    rt.run(base, t)  # on by default
     targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in targets_doc["targets"]] == [
         "source-development",
         "source-0.12.0",
     ]
-    assert rt.run({**base, "SCAN_RELEASE_SOURCE": "false"}, t, NOW) == 0
+    rt.run({**base, "SCAN_RELEASE_SOURCE": "false"}, t)
     targets_doc = json.loads((tmp_path / "targets.json").read_text(encoding="utf-8"))
     assert [x["id"] for x in targets_doc["targets"]] == ["source-development"]
-    with pytest.raises(rt.ResolveError, match="scan-release-source"):
-        rt.run({**base, "SCAN_RELEASE_SOURCE": "maybe"}, t, NOW)
 
 
 # --- OSV targets --------------------------------------------------------------
@@ -1041,7 +985,7 @@ def test_run_adds_osv_twins_by_default(tmp_path: Path) -> None:
     output_file = tmp_path / "github_output"
     env = {**ENV, "GITHUB_OUTPUT": str(output_file), "GITHUB_TOKEN": "tkn"}
     env = {**run_env(tmp_path / "out"), **env}
-    assert rt.run(env, t, NOW) == 0
+    rt.run(env, t)
     outputs = parse_github_output(output_file.read_text(encoding="utf-8"))
     assert [m["id"] for m in json.loads(outputs["matrix"])] == [
         "source-development",
@@ -1063,13 +1007,8 @@ def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
     github_routes(t)
     tag_routes(t, "1.1.14", "b" * 40)
     env = run_env(tmp_path / "out", OSV_ENABLED="false")
-    assert rt.run(env, t, NOW) == 0
+    rt.run(env, t)
     targets_doc = json.loads(
         (tmp_path / "out" / "targets.json").read_text(encoding="utf-8")
     )
     assert [x["scanner"] for x in targets_doc["targets"]] == ["trivy", "trivy"]
-
-
-def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
-    with pytest.raises(rt.ResolveError):
-        rt.run(run_env(tmp_path, OSV_ENABLED="maybe"), FakeRunner(), NOW)

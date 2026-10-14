@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from normalize import norm
+from normalize import SEVERITIES, norm
 
-SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 SEPARATOR = "&emsp;"
 # GitHub rejects a step summary over 1 MiB; the rest of the limit is left for the
 # parts of the job summary that are not this one
@@ -199,7 +198,7 @@ def header(report: Mapping[str, Any]) -> list[str]:
         f"Java DB {short_time(tools['trivy_java_db'])})",
         f"osv-scanner {tools['osv_scanner']} (queried {tools['osv_queried_at'] or 'n/a'})",
     ]
-    if report.get("run_url"):
+    if report["run_url"]:
         parts.append(f"[run {report['run_id']}]({report['run_url']})")
     return [f"# SCA · {report['repo']}", "", " · ".join(parts), ""]
 

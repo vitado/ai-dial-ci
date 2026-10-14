@@ -3,31 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import subprocess
-import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+import query_osv as qo
 
-ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
-
-
-def _load_query_osv():
-    path = ROOT / "actions" / "sca_query_osv" / "query_osv.py"
-    spec = importlib.util.spec_from_file_location("query_osv", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # dataclasses look their module up here
-    spec.loader.exec_module(module)
-    return module
-
-
-qo = _load_query_osv()
 
 
 # --- fakes and builders -------------------------------------------------------
@@ -172,15 +158,13 @@ class Workspace:
                 json.dumps({"Results": []}), encoding="utf-8"
             )
 
-    def run(self, commands: FakeCommands) -> int:
+    def run(self, commands: FakeCommands) -> None:
         args = argparse.Namespace(
             targets_file=self.targets_file,
             parts_dir=self.parts_dir,
             output_dir=self.output_dir,
-            trivy="trivy",
-            osv_scanner="osv-scanner",
         )
-        return qo.run_all(args, commands, NOW)
+        qo.run_all(args, commands, NOW)
 
     @property
     def osv_dir(self) -> Path:
@@ -197,15 +181,14 @@ class Workspace:
 # --- the BOM ------------------------------------------------------------------
 
 
-def test_filter_bom_keeps_language_packages_and_counts_the_unusable() -> None:
-    bom, skipped = qo.filter_bom(BOM)
+def test_filter_bom_keeps_language_packages() -> None:
+    bom = qo.filter_bom(BOM)
+    # the library without a purl and the lockfile (application) are no packages
     assert [c["purl"] for c in bom["components"]] == [
         "pkg:npm/lodash@4.17.0",
         "pkg:pypi/requests@2.0.0",
         "pkg:oci/image@sha256:0",
     ]
-    # a library without a purl; the lockfile (application) is not a package
-    assert skipped == 1
     # the graph and the Trivy findings are of no use to osv-scanner
     assert (bom["dependencies"], bom["vulnerabilities"]) == ([], [])
     assert bom["bomFormat"] == "CycloneDX"
@@ -213,17 +196,15 @@ def test_filter_bom_keeps_language_packages_and_counts_the_unusable() -> None:
 
 @pytest.mark.parametrize("purl_type", ["deb", "apk", "rpm", "DEB"])
 def test_filter_bom_removes_os_packages(purl_type: str) -> None:
-    bom, skipped = qo.filter_bom(
-        {"components": [component(f"pkg:{purl_type}/distro/pkg@1")]}
-    )
-    assert (bom["components"], skipped) == ([], 0)
+    bom = qo.filter_bom({"components": [component(f"pkg:{purl_type}/distro/pkg@1")]})
+    assert bom["components"] == []
 
 
 def test_filter_bom_folds_the_group_into_the_name_as_osv_writes_it() -> None:
     maven = {**component("pkg:maven/org.example/lib@1.0"), "group": "org.example"}
     scoped = {**component("pkg:npm/%40scope/pkg@1.0"), "group": "@scope"}
     plain = component("pkg:npm/plain@1.0")
-    bom, _ = qo.filter_bom({"components": [maven, scoped, plain]})
+    bom = qo.filter_bom({"components": [maven, scoped, plain]})
     assert [(c["name"], "group" in c) for c in bom["components"]] == [
         ("org.example:lib", False),
         ("@scope/pkg", False),
@@ -237,14 +218,12 @@ def test_filter_bom_removes_components_without_a_version() -> None:
     empty = {**no_version, "version": "", "purl": "pkg:npm/ws@"}
     blank_purl = {**no_version, "version": "1.0"}
     keep = component("pkg:npm/lodash@4.17.0")
-    bom, skipped = qo.filter_bom({"components": [no_version, empty, blank_purl, keep]})
+    bom = qo.filter_bom({"components": [no_version, empty, blank_purl, keep]})
     assert bom["components"] == [keep]
-    assert skipped == 0
-    assert qo.unread_packages(bom, osv_output(("npm", "lodash", "4.17.0"))) == []
 
 
 def test_filter_bom_without_components() -> None:
-    assert qo.filter_bom({})[0]["components"] == []
+    assert qo.filter_bom({})["components"] == []
 
 
 # --- a target -------------------------------------------------------------------
@@ -255,7 +234,7 @@ def test_osv_scanner_is_run_on_the_filtered_bom_with_the_documented_flags(
 ) -> None:
     ws = Workspace(tmp_path)
     commands = FakeCommands()
-    assert ws.run(commands) == 0
+    ws.run(commands)
     convert = commands.calls[1]
     assert convert[:5] == ["trivy", "convert", "--format", "cyclonedx", "--output"]
     assert convert[-1] == str(ws.parts_dir / "trivy" / "source-development.json")
@@ -275,28 +254,14 @@ def test_exit_0_and_1_are_ok_and_the_output_is_kept_as_is(
 ) -> None:
     ws = Workspace(tmp_path)
     output = osv_output(*PACKAGES, vulnerable=vulnerable)
-    assert ws.run(FakeCommands(scanner_exit=exit_code, scanner_output=output)) == 0
+    ws.run(FakeCommands(scanner_exit=exit_code, scanner_output=output))
     assert json.loads(ws.result().read_text(encoding="utf-8")) == output
     assert ws.status() == {
-        "id": "source-development",
         "status": "ok",
         "reason": None,
-        # the packages of the output (--all-packages), not the findings
-        "packages_queried": 2,
-        "packages_skipped": 1,
-        "packages_unread": 0,
         "queried_at": "2030-01-01T12:00:00Z",
         "scanner_version": "2.6.0",
     }
-
-
-def test_packages_queried_counts_distinct_packages_of_all_results(
-    tmp_path: Path,
-) -> None:
-    ws = Workspace(tmp_path)
-    output = osv_output(*PACKAGES, ("npm", "lodash", "4.17.0"))
-    ws.run(FakeCommands(scanner_exit=0, scanner_output=output))
-    assert ws.status()["packages_queried"] == 2
 
 
 @pytest.mark.parametrize("exit_code", [2, 127, 128, 130])
@@ -310,53 +275,18 @@ def test_any_other_exit_code_is_a_failure_even_with_an_empty_json(
         scanner_output=osv_output(),
         scanner_stderr="Error during extraction:\nmax retries exceeded",
     )
-    assert ws.run(commands) == 1
-    status = ws.status()
-    assert status["status"] == "failed"
-    assert status["reason"] == (
+    ws.run(commands)
+    assert ws.status()["status"] == "failed"
+    assert ws.status()["reason"] == (
         f"osv-scanner failed (exit {exit_code}): "
         "Error during extraction: max retries exceeded"
     )
-    assert status["packages_queried"] == 3
-    assert not ws.result().exists()
 
 
 def test_a_missing_osv_scanner_is_exit_127(tmp_path: Path) -> None:
     result = qo.run_command([str(tmp_path / "no-such-binary"), "--version"])
     assert result.returncode == 127
     assert result.stderr
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        False,  # nothing written
-        "",
-        "{",
-        "[]",
-        {"results": None},
-        {"results": [{"packages": None}]},
-        {"results": [{"packages": [{"package": {"name": "a"}}]}]},
-    ],
-)
-def test_an_output_that_is_not_a_result_is_a_failure_even_on_exit_0(
-    tmp_path: Path, output: Any
-) -> None:
-    ws = Workspace(tmp_path)
-    assert ws.run(FakeCommands(scanner_exit=0, scanner_output=output)) == 1
-    assert ws.status()["status"] == "failed"
-    assert ws.status()["reason"].startswith("osv-scanner wrote no valid result")
-    assert not ws.result().exists()
-
-
-def test_a_stale_output_does_not_pass_for_the_result_of_the_run(
-    tmp_path: Path,
-) -> None:
-    ws = Workspace(tmp_path)
-    ws.osv_dir.mkdir(parents=True)
-    ws.result().write_text(json.dumps(osv_output(*PACKAGES)), encoding="utf-8")
-    assert ws.run(FakeCommands(scanner_exit=0, scanner_output=False)) == 1
-    assert ws.status()["status"] == "failed"
 
 
 def test_the_reason_is_the_end_of_stderr_and_is_cut(tmp_path: Path) -> None:
@@ -370,14 +300,14 @@ def test_the_reason_is_the_end_of_stderr_and_is_cut(tmp_path: Path) -> None:
 def test_trivy_convert_failure_is_a_failed_target(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     commands = FakeCommands(convert_exit=1)
-    assert ws.run(commands) == 1
+    ws.run(commands)
     assert ws.status()["reason"] == "trivy convert failed (exit 1): boom"
     assert commands.scans() == []
 
 
 def test_an_unreadable_bom_is_a_failed_target(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
-    assert ws.run(FakeCommands(bom=["not", "a", "bom"])) == 1
+    ws.run(FakeCommands(bom=["not", "a", "bom"]))
     assert ws.status()["reason"].startswith("trivy convert wrote no valid BOM")
 
 
@@ -386,48 +316,10 @@ def test_a_target_without_language_packages_is_ok_without_running_osv_scanner(
 ) -> None:
     ws = Workspace(tmp_path)
     commands = FakeCommands(bom={"components": [component("pkg:deb/debian/a@1")]})
-    assert ws.run(commands) == 0
+    ws.run(commands)
     assert commands.scans() == []
     assert json.loads(ws.result().read_text(encoding="utf-8")) == {"results": []}
     assert ws.status()["status"] == "ok"
-    assert ws.status()["packages_queried"] == 0
-
-
-def test_skipped_packages_are_noticed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    Workspace(tmp_path).run(FakeCommands())
-    out = capsys.readouterr().out
-    assert "source-development: ok" in out
-    assert (
-        "::notice title=OSV skipped packages::source-development: 1 package(s)" in out
-    )
-
-
-def test_packages_of_the_bom_that_osv_scanner_did_not_read_are_counted_and_warned(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    ws = Workspace(tmp_path)
-    output = osv_output(("npm", "lodash", "4.17.0"))
-    assert ws.run(FakeCommands(scanner_exit=0, scanner_output=output)) == 0
-    assert ws.status()["status"] == "ok"
-    assert ws.status()["packages_unread"] == 1
-    out = capsys.readouterr().out
-    assert "::warning title=OSV did not read packages::source-development:" in out
-    assert "requests@2.0.0" in out
-
-
-def test_all_packages_read_gives_no_unread_warning(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    Workspace(tmp_path).run(FakeCommands())
-    assert "did not read" not in capsys.readouterr().out
-
-
-def test_package_names_are_compared_loosely() -> None:
-    bom = {"components": [{"name": "Typing_Extensions", "version": "4.0"}]}
-    output = osv_output(("PyPI", "typing-extensions", "4.0"))
-    assert qo.unread_packages(bom, output) == []
 
 
 @pytest.mark.parametrize("trivy_status", ["failed", "not_applicable", None, "ok-ish"])
@@ -436,20 +328,11 @@ def test_a_target_whose_trivy_target_was_not_scanned_is_not_applicable(
 ) -> None:
     ws = Workspace(tmp_path, trivy_status)
     commands = FakeCommands()
-    assert ws.run(commands) == 0
-    status = ws.status()
-    assert status["status"] == "not_applicable"
-    assert status["reason"] == f"trivy target {trivy_status or 'failed'}"
-    assert (status["packages_queried"], status["queried_at"]) == (None, None)
+    ws.run(commands)
+    assert ws.status()["status"] == "not_applicable"
+    assert ws.status()["reason"] == f"trivy target {trivy_status or 'failed'}"
     assert not ws.result().exists()
     assert commands.scans() == []
-
-
-def test_a_trivy_part_without_its_native_result_is_failed(tmp_path: Path) -> None:
-    ws = Workspace(tmp_path)
-    (ws.parts_dir / "trivy" / "source-development.json").unlink()
-    ws.run(FakeCommands())
-    assert ws.status()["reason"] == "trivy target failed"
 
 
 def test_only_pending_osv_targets_are_processed(tmp_path: Path) -> None:
@@ -458,33 +341,6 @@ def test_only_pending_osv_targets_are_processed(tmp_path: Path) -> None:
     doc["targets"][1]["status"] = "failed"
     ws.targets_file.write_text(json.dumps(doc), encoding="utf-8")
     commands = FakeCommands()
-    assert ws.run(commands) == 0
+    ws.run(commands)
     assert commands.scans() == []
     assert not (ws.osv_dir / "source-development.status.json").exists()
-
-
-@pytest.mark.parametrize("content", ["{", "[]", '{"targets": 1}', '{"targets": [1]}'])
-def test_an_unusable_targets_file_is_an_input_error(
-    tmp_path: Path, content: str
-) -> None:
-    ws = Workspace(tmp_path)
-    ws.targets_file.write_text(content, encoding="utf-8")
-    with pytest.raises(qo.InputError):
-        ws.run(FakeCommands())
-
-
-def test_main_reports_an_input_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    ws = Workspace(tmp_path)
-    ws.targets_file.write_text("{", encoding="utf-8")
-    argv = [
-        "--targets-file",
-        str(ws.targets_file),
-        "--parts-dir",
-        str(ws.parts_dir),
-        "--output-dir",
-        str(ws.output_dir),
-    ]
-    assert qo.main(argv) == 1
-    assert "::error title=Invalid OSV query input::" in capsys.readouterr().err

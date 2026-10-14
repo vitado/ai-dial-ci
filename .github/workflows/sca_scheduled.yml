@@ -309,7 +309,7 @@ jobs:
 
   # OSV is asked (by osv-scanner, over a BOM that Trivy converts from its result) about the language packages Trivy
   # found (OS packages are not queried), so it runs after the Trivy matrix. A broken query is a failed target like a
-  # failed Trivy scan; its findings are merged into the records by sca_merge_results. Nothing to query, and so no job,
+  # failed Trivy scan; its findings are merged into the report by sca_merge_results. Nothing to query, and so no job,
   # if no Trivy target was scanned
   osv:
     needs: [targets, trivy]

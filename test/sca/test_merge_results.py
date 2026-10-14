@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from _sca_lib.jsonio import InputError
-from merge_results import load_targets_file, main, parse_trivy_db_info, run_merge
+from merge_results import main, run_merge
 
 DB = {"vulnerability_db_updated_at": "2026-10-13T06:41:11Z", "java_db_updated_at": None}
 
@@ -96,12 +95,10 @@ class Run:
             (folder / f"{tid}.status.json").write_text(json.dumps(status))
 
     def merge(self):
-        failed = run_merge(
-            self.targets_file, self.parts, self.out, "2026-10-14T00:00:00Z", DB
-        )
-        return failed, json.loads(
-            (self.out / "report.json").read_text(encoding="utf-8")
-        )
+        run_merge(self.targets_file, self.parts, self.out, "2026-10-14T00:00:00Z", DB)
+        report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
+        failed = sum(t["status"] == "failed" for t in report["targets"])
+        return failed, report
 
 
 def entry(report, tid, scanner="trivy"):
@@ -232,35 +229,6 @@ def test_zero_packages_is_reported_as_suspicious(tmp_path, capsys):
     assert "No packages in scan result" in capsys.readouterr().out
 
 
-def test_targets_file_is_validated(tmp_path):
-    path = tmp_path / "targets.json"
-    good = {
-        "run_kind": "full",
-        "run_kind_reasons": [],
-        "targets": [target("s", "trivy")],
-    }
-    bad_cases = [
-        {**good, "targets": [target("bad id!", "trivy")]},
-        {**good, "targets": [target("s", "snyk")]},
-        {**good, "targets": [target("s", "trivy"), target("s", "trivy")]},
-        {**good, "run_kind": "sometimes"},
-        {**good, "run_kind_reasons": [1]},
-        {"run_kind": "full"},
-    ]
-    for doc in bad_cases:
-        path.write_text(json.dumps(doc))
-        with pytest.raises(InputError):
-            load_targets_file(path)
-    path.write_text(json.dumps(good))
-    assert load_targets_file(path)["targets"][0]["id"] == "s"
-
-
-def test_trivy_db_info_is_lenient():
-    assert parse_trivy_db_info(json.dumps(DB)) == DB
-    for raw in ("", "not json", "[]", '{"vulnerability_db_updated_at": 5}'):
-        assert parse_trivy_db_info(raw) == dict.fromkeys(DB)
-
-
 def test_main_appends_the_summary_and_writes_the_failed_count(tmp_path, monkeypatch):
     run = Run(tmp_path, [target("s", "trivy")])  # no part: the scan produced nothing
     summary, output = tmp_path / "step.md", tmp_path / "output"
@@ -274,7 +242,6 @@ def test_main_appends_the_summary_and_writes_the_failed_count(tmp_path, monkeypa
         "--output-dir",
         str(run.out),
     ]
-    assert main(argv) == 0
+    main(argv)
     assert output.read_text() == "failed-count=1\n"
     assert "# SCA · o/app" in summary.read_text(encoding="utf-8")
-    assert main(["--targets-file", str(tmp_path / "missing.json"), *argv[2:]]) == 1

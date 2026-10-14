@@ -2,8 +2,8 @@
 """Resolve the scan targets (source snapshot + container images) of one repository.
 
 Used by the SCA scheduled scan. Asks the GitHub REST API through ``gh api`` and the
-image registry through ``oras repo tags`` (both are on the runner). Standard
-library only.
+image registry through ``oras repo tags`` (both are on the runner). Standard library
+only.
 
 Every call of an external tool goes through a ``Runner`` (a callable
 ``(argv, stdin) -> stdout``), so the logic can be tested with a fake runner and no
@@ -22,31 +22,16 @@ import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from _sca_lib.gha import append_text, escape_command_data, format_output
-from _sca_lib.times import format_time
+from _sca_lib import append_text, dump_json, escape_command_data
 
 GITHUB_API_VERSION = "2022-11-28"
-DOCKER_HUB_REGISTRY_HOST = "registry-1.docker.io"
-DOCKER_HUB_ALIASES = {
-    "docker.io": DOCKER_HUB_REGISTRY_HOST,
-    "index.docker.io": DOCKER_HUB_REGISTRY_HOST,
-}
 GHCR_HOST = "ghcr.io"
-GHCR_USERNAME = "github-actions"  # any username works with a token
-
-SCANNER_TRIVY = "trivy"
-SCANNER_OSV = "osv"
-
-KIND_FS = "fs"
-KIND_IMAGE = "image"
-
-STATUS_PENDING = "pending"
-STATUS_NOT_APPLICABLE = "not_applicable"
-STATUS_FAILED = "failed"
+DOCKER_HUB_HOST = "registry-1.docker.io"
+# Docker Hub answers the registry API on another host than the one it goes by
+HOST_ALIASES = {"docker.io": DOCKER_HUB_HOST, "index.docker.io": DOCKER_HUB_HOST}
 
 TOOL_TIMEOUT_SECONDS = 120.0
 MAX_ATTEMPTS = 4
@@ -62,28 +47,18 @@ NOT_FOUND = re.compile(r"(?:HTTP|status code:?) 404", re.IGNORECASE)
 
 
 class ResolveError(Exception):
-    """A condition that makes the whole resolution impossible."""
-
-
-class RegistryError(Exception):
-    """A registry problem affecting a single image."""
+    """A GitHub or registry request that failed, or an input that is unusable."""
 
 
 class ToolError(Exception):
     """An external tool (``gh``, ``oras``) failed; the message is its stderr."""
-
-    @property
-    def not_found(self) -> bool:
-        return NOT_FOUND.search(str(self)) is not None
 
 
 Runner = Callable[[Sequence[str], str | None], str]
 
 
 def make_runner(
-    token: str | None,
-    sleep: Callable[[float], None] = time.sleep,
-    max_attempts: int = MAX_ATTEMPTS,
+    token: str | None, sleep: Callable[[float], None] = time.sleep
 ) -> Runner:
     """The production runner: ``subprocess.run`` with a timeout and bounded retries.
 
@@ -93,7 +68,7 @@ def make_runner(
     env = {**os.environ, **({"GH_TOKEN": token} if token else {})}
 
     def run_tool(argv: Sequence[str], stdin: str | None = None) -> str:
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 done = subprocess.run(
                     list(argv),
@@ -102,7 +77,6 @@ def make_runner(
                     capture_output=True,
                     text=True,
                     timeout=TOOL_TIMEOUT_SECONDS,
-                    check=False,
                 )
                 if done.returncode == 0:
                     return done.stdout
@@ -111,10 +85,9 @@ def make_runner(
                 message = f"{argv[0]} timed out after {TOOL_TIMEOUT_SECONDS:.0f}s"
             except OSError as err:
                 raise ToolError(f"cannot run {argv[0]}: {err}") from err
-            if attempt == max_attempts or PERMANENT_ERROR.search(message):
+            if attempt == MAX_ATTEMPTS or PERMANENT_ERROR.search(message):
                 raise ToolError(message)
             sleep(BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
-        raise AssertionError("unreachable")  # pragma: no cover
 
     return run_tool
 
@@ -125,34 +98,32 @@ class GitHubClient:
     def __init__(self, run: Runner) -> None:
         self._run = run
 
-    def _api(self, path: str, *flags: str, missing_ok: bool = False) -> Any:
+    def _get(self, path: str, missing_ok: bool = False) -> Any:
         """The JSON response of GET ``path``; None for HTTP 404 if ``missing_ok``."""
-        argv = ["gh", "api", "-H", f"X-GitHub-Api-Version: {GITHUB_API_VERSION}"]
+        argv = ["gh", "api", "-H", f"X-GitHub-Api-Version: {GITHUB_API_VERSION}", path]
         try:
-            return json.loads(self._run([*argv, *flags, path], None))
+            return json.loads(self._run(argv, None))
         except ToolError as err:
-            if missing_ok and err.not_found:
+            if missing_ok and NOT_FOUND.search(str(err)):
                 return None
             raise ResolveError(f"GitHub API GET {path} failed: {err}") from err
-        except ValueError as err:
-            raise ResolveError(f"GitHub API GET {path}: invalid JSON: {err}") from err
 
     def default_branch(self, repo: str) -> str:
-        return str(self._api(f"repos/{repo}")["default_branch"])
+        return self._get(f"repos/{repo}")["default_branch"]
 
     def commit_sha(self, repo: str, ref: str) -> str:
         quoted = urllib.parse.quote(ref, safe="")
-        return str(self._api(f"repos/{repo}/commits/{quoted}")["sha"])
+        return self._get(f"repos/{repo}/commits/{quoted}")["sha"]
 
     def latest_release_tag(self, repo: str) -> str | None:
-        """Tag of the latest GitHub release, or None if the repo has none (HTTP 404)."""
-        release = self._api(f"repos/{repo}/releases/latest", missing_ok=True)
-        return None if release is None else str(release["tag_name"])
+        """Tag of the latest GitHub release, or None if the repo has none."""
+        release = self._get(f"repos/{repo}/releases/latest", missing_ok=True)
+        return None if release is None else release["tag_name"]
 
     def tag_commit_sha(self, repo: str, tag: str) -> str:
         """Commit a git tag points to (the API peels an annotated tag to its commit)."""
         quoted = urllib.parse.quote(tag, safe="/")
-        return str(self._api(f"repos/{repo}/commits/refs/tags/{quoted}")["sha"])
+        return self._get(f"repos/{repo}/commits/refs/tags/{quoted}")["sha"]
 
 
 class RegistryClient:
@@ -162,59 +133,30 @@ class RegistryClient:
         self, run: Runner, registry: str, github_token: str | None = None
     ) -> None:
         self.registry = registry
-        self._host = DOCKER_HUB_ALIASES.get(registry, registry)
         self._run = run
         self._github_token = github_token
-        self._tags_cache: dict[str, list[str]] = {}
 
     def tags(self, image: str) -> list[str]:
-        """All tags of an image (cached). Raises RegistryError on any failure."""
-        if image not in self._tags_cache:
-            self._tags_cache[image] = self._list_tags(image)
-        return self._tags_cache[image]
-
-    def _list_tags(self, image: str) -> list[str]:
+        """All tags of an image; raises ResolveError on any failure."""
+        host = HOST_ALIASES.get(self.registry, self.registry)
         repository = image
-        if self._host == DOCKER_HUB_REGISTRY_HOST and "/" not in image:
+        if host == DOCKER_HUB_HOST and "/" not in image:
             repository = f"library/{image}"
         argv = ["oras", "repo", "tags"]
         stdin = None
         # Credentials go to ghcr.io only; every other registry is asked anonymously.
-        if self._github_token and self._host == GHCR_HOST:
-            argv += ["--username", GHCR_USERNAME, "--password-stdin"]
+        if self._github_token and host == GHCR_HOST:
+            argv += ["--username", "github-actions", "--password-stdin"]
             stdin = self._github_token
-        argv.append(f"{self._host}/{repository}")
         try:
-            return self._run(argv, stdin).split()
+            return self._run([*argv, f"{host}/{repository}"], stdin).split()
         except ToolError as err:
-            raise RegistryError(
+            raise ResolveError(
                 f"{self.registry}: listing tags of {image} failed: {err}"
             ) from err
 
 
-def find_release_tag(release_tag: str, tags: Sequence[str]) -> str | None:
-    """Match a release tag against registry tags: exact, then without leading ``v``."""
-    for candidate in (release_tag, release_tag.removeprefix("v")):
-        if candidate in tags:
-            return candidate
-    return None
-
-
-def sanitize_id(raw: str) -> str:
-    return UNSAFE_ID_CHARS.sub("-", raw)
-
-
-def target_id(image: str, tag: str) -> str:
-    return sanitize_id(f"{image.rsplit('/', 1)[-1]}-{tag}")
-
-
-def source_target_id(git_ref: str) -> str:
-    """Id of a filesystem target; stable across runs, so it never contains the SHA."""
-    return sanitize_id(f"source-{git_ref}")
-
-
 def make_target(
-    kind: str,
     status: str,
     reason: str | None = None,
     *,
@@ -224,19 +166,17 @@ def make_target(
     git_ref: str | None = None,
     commit_sha: str | None = None,
 ) -> dict[str, Any]:
-    """A Trivy target: an image, or a filesystem target (``git_ref`` pinned to
-    ``commit_sha``; a release source has a ``tag``, the development one has none).
+    """A Trivy target: an image (``ref`` is its reference), or the source at
+    ``git_ref`` pinned to ``commit_sha`` (a release source has a ``tag`` too).
 
-    Without a known tag the id is ``<image>-release`` or ``source-release``.
+    The id names the subject and is stable across runs, so it never contains the
+    SHA; without a known tag it ends with ``release``.
     """
-    if kind == KIND_IMAGE:
-        ident = target_id(str(image), tag or "release")
-    else:
-        ident = source_target_id(git_ref or "release")
+    stem = image.rsplit("/", 1)[-1] if image else "source"
     return {
-        "id": ident,
-        "scanner": SCANNER_TRIVY,
-        "kind": kind,
+        "id": UNSAFE_ID_CHARS.sub("-", f"{stem}-{tag or git_ref or 'release'}"),
+        "scanner": "trivy",
+        "kind": "image" if image else "fs",
         "image": image,
         "tag": tag,
         "ref": ref,
@@ -248,42 +188,25 @@ def make_target(
 
 
 def make_osv_target(trivy_target: Mapping[str, Any]) -> dict[str, Any]:
-    """The OSV twin of a Trivy target: same subject, another scanner.
-
-    OSV queries the packages Trivy found, so the twin has something to do only if
-    the Trivy target is scanned; otherwise there is nothing to query.
+    """The OSV twin of a Trivy target: OSV queries the packages Trivy found, so the
+    twin has something to do only if the Trivy target is scanned.
     """
-    twin = {**trivy_target, "scanner": SCANNER_OSV}
-    if trivy_target["status"] != STATUS_PENDING:
-        twin.update(
-            status=STATUS_NOT_APPLICABLE,
-            reason=f"trivy target {trivy_target['status']}",
-        )
+    twin = {**trivy_target, "scanner": "osv"}
+    if trivy_target["status"] != "pending":
+        twin["status"] = "not_applicable"
+        twin["reason"] = f"trivy target {trivy_target['status']}"
     return twin
 
 
 def parse_images(raw: str) -> list[str]:
-    images: list[str] = []
-    for line in raw.splitlines():
-        image = line.strip()
-        if not image:
-            continue
+    images = [line.strip() for line in raw.splitlines() if line.strip()]
+    for image in images:
         if not IMAGE_NAME.fullmatch(image):
             raise ResolveError(
                 f"invalid image name {image!r}: "
                 "expected a lowercase name without registry or tag"
             )
-        if image in images:
-            raise ResolveError(f"duplicate image {image!r}")
-        images.append(image)
     return images
-
-
-def parse_bool(value: str, name: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    raise ResolveError(f"{name} must be 'true' or 'false', got {value!r}")
 
 
 class Release(NamedTuple):
@@ -297,10 +220,9 @@ class Release(NamedTuple):
 def resolve_release(github: GitHubClient, repository: str) -> Release:
     """The release to scan: the latest GitHub release, as it is."""
     try:
-        tag = github.latest_release_tag(repository)
+        return Release(github.latest_release_tag(repository))
     except ResolveError as err:
         return Release(None, str(err))
-    return Release(tag)
 
 
 def resolve_image_targets(
@@ -310,33 +232,34 @@ def resolve_image_targets(
 
     def image_target(tag: str | None, status: str, reason: str | None = None):
         ref = f"{registry.registry}/{image}:{tag}" if tag else None
-        return make_target(KIND_IMAGE, status, reason, image=image, tag=tag, ref=ref)
+        return make_target(status, reason, image=image, tag=tag, ref=ref)
 
     try:
         tags = registry.tags(image)
-    except RegistryError as err:
-        reason = str(err)
+    except ResolveError as err:
         return [
-            image_target("development", STATUS_FAILED, reason),
-            image_target(release.tag, STATUS_FAILED, reason),
+            image_target("development", "failed", str(err)),
+            image_target(release.tag, "failed", str(err)),
         ]
 
     if "development" in tags:
-        targets = [image_target("development", STATUS_PENDING)]
+        targets = [image_target("development", "pending")]
     else:
         reason = "tag development not published for this image"
-        targets = [image_target("development", STATUS_NOT_APPLICABLE, reason)]
+        targets = [image_target("development", "not_applicable", reason)]
 
     if release.error is not None:
-        targets.append(image_target(None, STATUS_FAILED, release.error))
+        targets.append(image_target(None, "failed", release.error))
     elif release.tag is None:
-        reason = "no GitHub release"
-        targets.append(image_target(None, STATUS_NOT_APPLICABLE, reason))
-    elif (found := find_release_tag(release.tag, tags)) is None:
-        reason = f"release {release.tag} not published for this image"
-        targets.append(image_target(release.tag, STATUS_NOT_APPLICABLE, reason))
+        targets.append(image_target(None, "not_applicable", "no GitHub release"))
     else:
-        targets.append(image_target(found, STATUS_PENDING))
+        # the registry tag may lack the ``v`` of the git tag
+        candidates = (release.tag, release.tag.removeprefix("v"))
+        if found := next((t for t in candidates if t in tags), None):
+            targets.append(image_target(found, "pending"))
+        else:
+            reason = f"release {release.tag} not published for this image"
+            targets.append(image_target(release.tag, "not_applicable", reason))
     return targets
 
 
@@ -348,24 +271,19 @@ def resolve_release_source_target(
 
     def source_target(status: str, reason: str | None = None, sha: str | None = None):
         return make_target(
-            KIND_FS,
-            status,
-            reason,
-            tag=release.tag,
-            git_ref=release.tag,
-            commit_sha=sha,
+            status, reason, tag=release.tag, git_ref=release.tag, commit_sha=sha
         )
 
     if release.error is not None:
-        return source_target(STATUS_FAILED, release.error)
+        return source_target("failed", release.error)
     if release.tag is None:
-        return source_target(STATUS_NOT_APPLICABLE, "no GitHub release")
+        return source_target("not_applicable", "no GitHub release")
     try:
         sha = github.tag_commit_sha(repository, release.tag)
     except ResolveError as err:
         reason = f"cannot resolve release tag {release.tag}: {err}"
-        return source_target(STATUS_FAILED, reason)
-    return source_target(STATUS_PENDING, sha=sha)
+        return source_target("failed", reason)
+    return source_target("pending", sha=sha)
 
 
 def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
@@ -378,12 +296,6 @@ def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
         seen.add(identity)
 
 
-def parse_target_patterns(raw: str) -> list[str]:
-    """The patterns of the ``targets`` input: separated by commas or newlines."""
-    parts = (part.strip() for part in re.split(r"[,\n]", raw))
-    return [part for part in parts if part]
-
-
 def filter_targets(
     targets: Sequence[dict[str, Any]], patterns: Sequence[str]
 ) -> list[dict[str, Any]]:
@@ -393,59 +305,25 @@ def filter_targets(
     """
     if not patterns:
         return list(targets)
-    unmatched = [
-        pattern
-        for pattern in patterns
-        if not any(fnmatch.fnmatchcase(t["id"], pattern) for t in targets)
-    ]
+
+    def matches(target: Mapping[str, Any], pattern: str) -> bool:
+        return fnmatch.fnmatchcase(target["id"], pattern)
+
+    unmatched = [p for p in patterns if not any(matches(t, p) for t in targets)]
     if unmatched:
         raise ResolveError(
             f"targets: no target matches {', '.join(repr(p) for p in unmatched)}; "
             f"the targets of this repository are: "
             f"{', '.join(t['id'] for t in targets) or 'none'}"
         )
-    return [
-        t for t in targets if any(fnmatch.fnmatchcase(t["id"], p) for p in patterns)
-    ]
-
-
-def run_kind(
-    *,
-    patterns: Sequence[str],
-    scan_source: bool,
-    scan_images: bool,
-    scan_release_source: bool,
-    osv_enabled: bool,
-    ref_name: str,
-    default_branch: str,
-) -> tuple[str, list[str]]:
-    """``(kind, reasons)``: ``full`` unless something narrows the scan.
-
-    A run is ``partial`` if the ``targets`` filter is set, if a part of the scan is
-    switched off, or if it does not run on the default branch of the calling
-    repository.
-    """
-    narrowing = [
-        (bool(patterns), f"targets filter: {', '.join(patterns)}"),
-        (not scan_source, "scan-source is off"),
-        (not scan_images, "scan-images is off"),
-        (not scan_release_source, "scan-release-source is off"),
-        (not osv_enabled, "osv-enabled is off"),
-        (
-            ref_name != default_branch,
-            f"not the default branch ({ref_name}, the default is {default_branch})",
-        ),
-    ]
-    reasons = [reason for narrows, reason in narrowing if narrows]
-    return ("partial" if reasons else "full"), reasons
+    return [t for t in targets if any(matches(t, p) for p in patterns)]
 
 
 @dataclass(frozen=True)
 class Inputs:
-    """The inputs of the action (see ``action.yml``)."""
+    """The inputs of the action (see ``action.yml``) and the calling workflow run."""
 
     repository: str
-    output_dir: Path
     caller_repository: str
     ref_name: str
     registry: str = GHCR_HOST
@@ -459,30 +337,19 @@ class Inputs:
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> Inputs:
-        """Read and validate the inputs, which the action passes as environment
-        variables (``REPOSITORY``, ``SCAN_SOURCE``, ...)."""
-
-        def flag(name: str) -> bool:
-            return parse_bool(environ.get(name, "true"), name.lower().replace("_", "-"))
-
-        repository = environ.get("REPOSITORY", "")
+        """Read the inputs, which the action passes as environment variables
+        (``REPOSITORY``, ``SCAN_SOURCE``, ...)."""
+        repository = environ["REPOSITORY"]
         if not REPOSITORY_NAME.fullmatch(repository):
             raise ResolveError(f"repository must be 'owner/name', got {repository!r}")
-        caller_repository = environ.get("GITHUB_REPOSITORY", "")
-        if not REPOSITORY_NAME.fullmatch(caller_repository):
-            raise ResolveError(
-                f"caller repository must be 'owner/name', got {caller_repository!r}"
-            )
-        ref_name = environ.get("GITHUB_REF_NAME", "")
-        if not ref_name:
-            raise ResolveError("the branch or tag of the run is unknown (no ref name)")
-        if not environ.get("OUTPUT_DIR"):
-            raise ResolveError("OUTPUT_DIR is not set")
+
+        def flag(name: str) -> bool:
+            return environ.get(name, "true") == "true"
+
         return cls(
             repository=repository,
-            output_dir=Path(environ["OUTPUT_DIR"]),
-            caller_repository=caller_repository,
-            ref_name=ref_name,
+            caller_repository=environ["GITHUB_REPOSITORY"],
+            ref_name=environ["GITHUB_REF_NAME"],
             registry=environ.get("REGISTRY") or GHCR_HOST,
             images=tuple(parse_images(environ.get("IMAGES", ""))),
             scan_source=flag("SCAN_SOURCE"),
@@ -499,19 +366,18 @@ def resolve_targets(
     github: GitHubClient,
     registry: RegistryClient,
     environ: Mapping[str, str],
-    now: datetime,
 ) -> dict[str, Any]:
     """Build the targets.json document. Raises ResolveError without a snapshot (or
     for a ``targets_filter`` pattern that matches no target).
 
     One release is scanned (``resolve_release``): its source and, in every image, its
-    tag. ``targets_filter`` keeps only the targets whose id matches one of its
-    patterns; the OSV twins follow their Trivy targets. The run is ``partial``
-    (``run_kind``) if the filter or a switch narrows the scan, or if the run is not on
-    the default branch of the calling repository.
+    tag. ``targets_filter`` (patterns separated by commas or newlines) keeps only the
+    targets whose id matches one of them; the OSV twins follow their Trivy targets.
+    The run is ``partial`` (``run_kind``) if the filter or a switch narrows the scan,
+    or if the run is not on the default branch of the calling repository.
 
-    Order: the development source, the release source, then the images of each image
-    in ``images`` order.
+    Order: the development source, the release source, then the targets of each
+    image in ``images`` order.
     """
     repository = inputs.repository
     default_branch = github.default_branch(repository)
@@ -526,59 +392,57 @@ def resolve_targets(
     targets: list[dict[str, Any]] = []
     if inputs.scan_source:
         targets.append(
-            make_target(
-                KIND_FS,
-                STATUS_PENDING,
-                git_ref=default_branch,
-                commit_sha=commit_sha,
-            )
+            make_target("pending", git_ref=default_branch, commit_sha=commit_sha)
         )
     if with_release_source:
         targets.append(resolve_release_source_target(github, repository, release))
     if with_images:
         for image in inputs.images:
             targets.extend(resolve_image_targets(registry, image, release))
-    patterns = parse_target_patterns(inputs.targets_filter)
+    patterns = [p.strip() for p in re.split(r"[,\n]", inputs.targets_filter)]
+    patterns = [p for p in patterns if p]
     targets = filter_targets(targets, patterns)
-    kind, kind_reasons = run_kind(
-        patterns=patterns,
-        scan_source=inputs.scan_source,
-        scan_images=inputs.scan_images,
-        scan_release_source=inputs.scan_release_source,
-        osv_enabled=inputs.osv_enabled,
-        ref_name=inputs.ref_name,
-        default_branch=github.default_branch(inputs.caller_repository),
-    )
+    default_branch_of_caller = github.default_branch(inputs.caller_repository)
+    narrowing = [
+        (bool(patterns), f"targets filter: {', '.join(patterns)}"),
+        (not inputs.scan_source, "scan-source is off"),
+        (not inputs.scan_images, "scan-images is off"),
+        (not inputs.scan_release_source, "scan-release-source is off"),
+        (not inputs.osv_enabled, "osv-enabled is off"),
+        (
+            inputs.ref_name != default_branch_of_caller,
+            f"not the default branch ({inputs.ref_name}, "
+            f"the default is {default_branch_of_caller})",
+        ),
+    ]
+    kind_reasons = [reason for narrows, reason in narrowing if narrows]
     if inputs.osv_enabled:
         # After all trivy targets, in the same order
         targets.extend([make_osv_target(t) for t in targets])
     check_unique_ids(targets)
 
-    server = environ.get("GITHUB_SERVER_URL", "https://github.com")
-    run_id = environ.get("GITHUB_RUN_ID", "")
+    run_id = environ["GITHUB_RUN_ID"]
+    run_url = f"{environ['GITHUB_SERVER_URL']}/{inputs.caller_repository}"
     return {
         "repo": repository,
         "default_branch": default_branch,
         "commit_sha": commit_sha,
-        "registry": inputs.registry,
-        "run_kind": kind,
+        "run_kind": "partial" if kind_reasons else "full",
         "run_kind_reasons": kind_reasons,
         "run_id": run_id,
-        "run_url": f"{server}/{inputs.caller_repository}/actions/runs/{run_id}"
-        if run_id
-        else "",
-        "run_started_at": format_time(now),
+        "run_url": f"{run_url}/actions/runs/{run_id}",
         "targets": targets,
     }
 
 
 def build_matrix(targets_doc: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The pending Trivy targets (the matrix of the trivy job)."""
-    keys = ("id", "kind", "image", "tag", "ref", "git_ref", "commit_sha")
+    """The pending Trivy targets (the matrix of the trivy job), with the fields the
+    job uses."""
+    keys = ("id", "kind", "ref", "commit_sha")
     return [
         {k: t[k] for k in keys}
         for t in targets_doc["targets"]
-        if t["status"] == STATUS_PENDING and t["scanner"] == SCANNER_TRIVY
+        if t["status"] == "pending" and t["scanner"] == "trivy"
     ]
 
 
@@ -588,39 +452,33 @@ def render_table(targets: Sequence[Mapping[str, Any]]) -> str:
         (t["id"], t["scanner"], t["ref"] or t["kind"], t["status"], t["reason"] or "")
         for t in targets
     ]
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
-    lines = [
-        "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:4]))
-        + f"  {row[4]}"
+    widths = [max(len(row[i]) for row in rows) for i in range(4)] + [0]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip()
         for row in rows
-    ]
-    return "\n".join(line.rstrip() for line in lines)
+    )
 
 
 def annotations(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     """Annotations of the Trivy targets; an OSV twin only mirrors its Trivy target."""
     lines = []
     for target in targets:
-        if target["scanner"] != SCANNER_TRIVY:
+        if target["scanner"] != "trivy":
             continue
         if target["status"] == "not_applicable":
-            lines.append(
-                f"::notice title=Scan target {target['id']} skipped"
-                f"::{escape_command_data(target['reason'])}"
-            )
+            level, what = "notice", "skipped"
         elif target["status"] == "failed":
-            lines.append(
-                f"::warning title=Scan target {target['id']} failed to resolve"
-                f"::{escape_command_data(target['reason'])}"
-            )
+            level, what = "warning", "failed to resolve"
+        else:
+            continue
+        lines.append(
+            f"::{level} title=Scan target {target['id']} {what}"
+            f"::{escape_command_data(target['reason'])}"
+        )
     return lines
 
 
-def run(
-    environ: Mapping[str, str],
-    runner: Runner | None = None,
-    now: datetime | None = None,
-) -> int:
+def run(environ: Mapping[str, str], runner: Runner | None = None) -> None:
     inputs = Inputs.from_environ(environ)
     run_tool = runner or make_runner(inputs.token)
     targets_doc = resolve_targets(
@@ -628,12 +486,12 @@ def run(
         GitHubClient(run_tool),
         RegistryClient(run_tool, inputs.registry, inputs.token),
         environ,
-        now or datetime.now(UTC),
     )
 
-    inputs.output_dir.mkdir(parents=True, exist_ok=True)
-    targets_file = inputs.output_dir / "targets.json"
-    targets_file.write_text(json.dumps(targets_doc, indent=2) + "\n", encoding="utf-8")
+    output_dir = Path(environ["OUTPUT_DIR"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    targets_file = output_dir / "targets.json"
+    dump_json(targets_file, targets_doc)
 
     print(
         f"Repository {targets_doc['repo']} @ {targets_doc['default_branch']} "
@@ -645,26 +503,20 @@ def run(
     for line in annotations(targets_doc["targets"]):
         print(line)
 
-    output_path = environ.get("GITHUB_OUTPUT")
-    if output_path:
-        outputs = {
-            "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
-            "targets-file": str(targets_file),
-        }
-        append_text(
-            output_path, "".join(format_output(k, v) for k, v in outputs.items())
-        )
-    return 0
+    if output_path := environ.get("GITHUB_OUTPUT"):
+        matrix = json.dumps(build_matrix(targets_doc), separators=(",", ":"))
+        append_text(output_path, f"matrix={matrix}\ntargets-file={targets_file}\n")
 
 
 def main() -> int:
     try:
-        return run(os.environ)
+        run(os.environ)
     except ResolveError as err:
         print(
             f"::error title=Scan target resolution failed::{escape_command_data(err)}"
         )
         return 1
+    return 0
 
 
 if __name__ == "__main__":

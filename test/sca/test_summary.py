@@ -179,7 +179,7 @@ def test_results_by_target_count_unique_vulnerabilities_per_class():
     text = build_summary(sample())
     # CVE-1 counts once, with Trivy's severity
     assert line(text, "| source-development") == (
-        f"| source-development | source | development@0123456 | ok | 10 | "
+        "| source-development | source | development@0123456 | ok | 10 | "
         "C–1&emsp;M–1&emsp;L–1 | — |"
     )
     assert line(text, "| app-1.0") == (
@@ -188,7 +188,10 @@ def test_results_by_target_count_unique_vulnerabilities_per_class():
     assert line(text, "| **All targets**") == (
         "| **All targets** | | | | | C–1&emsp;M–1&emsp;L–1 | H–1 |"
     )
-    assert "C critical&emsp;H high&emsp;M medium&emsp;L low&emsp;U unknown — unique" in text
+    assert (
+        "C critical&emsp;H high&emsp;M medium&emsp;L low&emsp;U unknown — unique"
+        in text
+    )
 
 
 def test_a_target_that_is_not_ok_shows_its_reason_and_empty_counts():

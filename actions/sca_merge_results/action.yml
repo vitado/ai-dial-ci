@@ -14,9 +14,6 @@ inputs:
   trivy-db-info:
     description: 'JSON object {"vulnerability_db_updated_at": ..., "java_db_updated_at": ...} describing the Trivy DB snapshot of the run; empty means unknown'
     default: ""
-  step-summary:
-    description: Whether to append summary.md to the job summary
-    default: "true"
 
 outputs:
   failed-count:
@@ -40,14 +37,12 @@ runs:
         TARGETS_FILE: ${{ inputs.targets-file }}
         PARTS_DIR: ${{ inputs.parts-dir }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
-        STEP_SUMMARY: ${{ inputs.step-summary }}
         TRIVY_DB_INFO: ${{ inputs.trivy-db-info }}
       run: |
         args=(
           --targets-file "$TARGETS_FILE"
           --parts-dir "$PARTS_DIR"
           --output-dir "$OUTPUT_DIR"
-          --step-summary "$STEP_SUMMARY"
           --trivy-db-info "$TRIVY_DB_INFO"
         )
         python "$ACTION_PATH/merge_results.py" "${args[@]}"

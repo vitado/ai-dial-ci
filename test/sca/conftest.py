@@ -10,5 +10,6 @@ ACTIONS = Path(__file__).resolve().parents[2] / "actions"
 sys.path.insert(0, str(ACTIONS))
 # the action scripts import their sibling modules as they do when they run from
 # their action directory
+sys.path.insert(0, str(ACTIONS / "sca_query_osv"))
 sys.path.insert(0, str(ACTIONS / "sca_resolve_targets"))
 sys.path.insert(0, str(ACTIONS / "sca_merge_results"))

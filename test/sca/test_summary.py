@@ -2,10 +2,9 @@
 
 import pytest
 from summary import (
-    COLORS,
     STEP_SUMMARY_LIMIT_BYTES,
     build_summary,
-    dot,
+    target_label,
     truncate_summary,
 )
 
@@ -122,9 +121,49 @@ def line(text, prefix):
     return next(row for row in text.splitlines() if row.startswith(prefix))
 
 
-def test_dot_is_a_colored_formula_per_severity():
-    assert dot("HIGH") == r"$\color{#c4320a}{\bullet}$"
-    assert set(COLORS) == {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}
+@pytest.mark.parametrize(
+    "repo, image, ref, label",
+    [
+        ("ai-dial-chat", "ai-dial-chat-bff", "development", "img·bff·dev"),
+        (
+            "statgpt-backend",
+            "statgpt-admin-backend",
+            "development",
+            "img·statgpt-admin-backend·dev",
+        ),
+        ("app", "app", "development", "img·dev"),
+        ("app", "o/app", "1.0", "img·1.0"),
+    ],
+)
+def test_image_label_drops_the_repo_prefix_only_when_it_is_one(repo, image, ref, label):
+    t = {"kind": "image", "image": image, "ref": ref}
+    assert target_label(t, repo) == label
+
+
+def test_packages_differing_in_case_are_one_row_named_as_in_the_source():
+    src = "source-development"
+    targets = [target(src), target("app-1.0", kind="image", ref="1.0")]
+    findings = [
+        finding("app-1.0", "CVE-1", "PyJWT", severity="HIGH"),
+        finding(src, "CVE-1", "pyjwt", scanner="osv", severity="HIGH"),
+        finding("app-1.0", "CVE-2", "Mako"),
+        finding(src, "CVE-3", "mako", severity="LOW"),
+    ]
+    text = build_summary(report(targets, findings))
+    assert "PyJWT@1.0" not in text and "pyjwt@1.0" in text
+    assert "Mako@1.0" not in text and text.count("mako@1.0") == 1
+    assert line(text, "| **All targets**").endswith("| H–2&emsp;L–1 | — |")
+
+
+def test_fixed_versions_of_both_scanners_are_split_and_deduplicated():
+    src = "source-development"
+    findings = [
+        finding(src, "CVE-1", "lib", fixed="2.18.11, 2.21.7, 2.22.3"),
+        finding(src, "CVE-1", "lib", scanner="osv", fixed="2.21.7, 2.22.3, 2.18.11"),
+    ]
+    text = build_summary(report([target(src)], findings))
+    assert "| 2.18.11, 2.21.7, 2.22.3 |" in text
+    assert "1 fixable" in text
 
 
 def test_header_has_the_commit_the_tool_versions_and_the_run():
@@ -138,19 +177,18 @@ def test_header_has_the_commit_the_tool_versions_and_the_run():
 
 def test_results_by_target_count_unique_vulnerabilities_per_class():
     text = build_summary(sample())
-    c, h, m, low = (dot(s) for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"))
     # CVE-1 counts once, with Trivy's severity
     assert line(text, "| source-development") == (
         f"| source-development | source | development@0123456 | ok | 10 | "
-        f"C {c} 1&emsp;M {m} 1&emsp;L {low} 1 | — |"
+        "C–1&emsp;M–1&emsp;L–1 | — |"
     )
     assert line(text, "| app-1.0") == (
-        f"| app-1.0 | image | 1.0 | ok · OSV failed: rate limited | 50 | M {m} 1 | H {h} 1 |"
+        "| app-1.0 | image | 1.0 | ok · OSV failed: rate limited | 50 | M–1 | H–1 |"
     )
     assert line(text, "| **All targets**") == (
-        f"| **All targets** | | | | | C {c} 1&emsp;M {m} 1&emsp;L {low} 1 | H {h} 1 |"
+        "| **All targets** | | | | | C–1&emsp;M–1&emsp;L–1 | H–1 |"
     )
-    assert f"C {c} critical&emsp;H {h} high" in text
+    assert "C critical&emsp;H high&emsp;M medium&emsp;L low&emsp;U unknown — unique" in text
 
 
 def test_a_target_that_is_not_ok_shows_its_reason_and_empty_counts():

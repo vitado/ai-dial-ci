@@ -5,27 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from normalize import norm
+
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
-COLORS = {
-    "CRITICAL": "#b42318",
-    "HIGH": "#c4320a",
-    "MEDIUM": "#a15c07",
-    "LOW": "#0969da",
-    "UNKNOWN": "#6e7781",
-}
 SEPARATOR = "&emsp;"
 # GitHub rejects a step summary over 1 MiB; the rest of the limit is left for the
 # parts of the job summary that are not this one
 STEP_SUMMARY_LIMIT_BYTES = 1024 * 1024 - 16 * 1024
 
 Finding = Mapping[str, Any]
-
-
-def dot(severity: str) -> str:
-    """The colored dot of a severity. A formula, so the only place to change if the
-    job summary does not render it (return ``""`` then).
-    """
-    return r"$\color{%s}{\bullet}$" % COLORS[severity]
 
 
 def cell(value: object) -> str:
@@ -41,8 +29,11 @@ def target_label(target: Mapping[str, Any], repo: str) -> str:
     ref = "dev" if target["ref"] == "development" else target["ref"]
     if target["kind"] == "fs":
         return f"src·{ref}"
-    tail = target["image"].split("/")[-1]
-    return f"img·{tail[len(repo) + 1 :] + '·' if tail != repo else ''}{ref}"
+    image = target["image"].split("/")[-1]
+    if image == repo:
+        return f"img·{ref}"
+    short = image.removeprefix(f"{repo}-") if image.startswith(f"{repo}-") else image
+    return f"img·{short}·{ref}"
 
 
 def vulnerability_keys(
@@ -54,13 +45,13 @@ def vulnerability_keys(
     keys: dict[tuple[str, str, str], str] = {}
     for f in sorted(findings, key=lambda f: f["scanner"] != "trivy"):
         if f["class"] == cls and tid in (None, f["target"]):
-            keys.setdefault((f["id"], f["pkg"], f["version"]), f["severity"])
+            keys.setdefault((f["id"], norm(f["pkg"]), f["version"]), f["severity"])
     return keys
 
 
 def severity_counts(keys: Mapping[Any, str]) -> str:
     counts = [
-        f"{s[0]} {dot(s)} {n}"
+        f"{s[0]}–{n}"
         for s in SEVERITIES
         if (n := sum(1 for sev in keys.values() if sev == s))
     ]
@@ -70,14 +61,17 @@ def severity_counts(keys: Mapping[Any, str]) -> str:
 def package_rows(
     findings: Sequence[Finding], source_ids: set[str]
 ) -> list[dict[str, Any]]:
-    """One row per (class, package, version) with its unique vulnerabilities merged
-    over targets and scanners (Trivy's severity wins), worst severity first.
+    """One row per (class, normalized package name, version) with its unique
+    vulnerabilities merged over targets and scanners (Trivy's severity wins), worst
+    severity first.
     """
     groups: dict[tuple[str, str, str], list[Finding]] = {}
     for f in findings:
-        groups.setdefault((f["class"], f["pkg"], f["version"]), []).append(f)
+        groups.setdefault((f["class"], norm(f["pkg"]), f["version"]), []).append(f)
     rows = []
-    for (cls, pkg, version), fs in groups.items():
+    for (cls, _, version), fs in groups.items():
+        # the name as written in a source target (lockfile), else the first seen
+        pkg = next((f for f in fs if f["target"] in source_ids), fs[0])["pkg"]
         vulns: dict[str, dict[str, Any]] = {}
         for f in sorted(fs, key=lambda f: f["scanner"] != "trivy"):
             v = vulns.setdefault(
@@ -86,11 +80,13 @@ def package_rows(
                     "id": f["id"],
                     "severity": f["severity"],
                     "url": f["url"],
-                    "fixed": "",
+                    "fixed": [],
                     "scanners": set(),
                 },
             )
-            v["fixed"] = v["fixed"] or f["fixed_version"]
+            v["fixed"] += [
+                x.strip() for x in f["fixed_version"].split(",") if x.strip()
+            ]
             v["scanners"].add(f["scanner"])
         ordered = sorted(
             vulns.values(), key=lambda v: (SEVERITIES.index(v["severity"]), v["id"])
@@ -112,7 +108,7 @@ def package_rows(
                 "vulns": ordered,
                 "severity": ordered[0]["severity"],
                 "fixed": ", ".join(
-                    dict.fromkeys(v["fixed"] for v in ordered if v["fixed"])
+                    dict.fromkeys(x for v in ordered for x in v["fixed"])
                 ),
                 "chain": with_chain["chain"] if with_chain else [],
                 "relationship": next(
@@ -243,7 +239,7 @@ def results_by_target(report: Mapping[str, Any]) -> list[str]:
         severity_counts(vulnerability_keys(findings, c)) for c in ("lang", "os")
     )
     lines.append(f"| **All targets** | | | | | {lang} | {os_} |")
-    legend = SEPARATOR.join(f"{s[0]} {dot(s)} {s.lower()}" for s in SEVERITIES)
+    legend = SEPARATOR.join(f"{s[0]} {s.lower()}" for s in SEVERITIES)
     return [*lines, "", f"{legend} — unique vulnerabilities (id + package + version)"]
 
 

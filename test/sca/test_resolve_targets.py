@@ -1,6 +1,5 @@
 """Tests for sca_resolve_targets/resolve_targets.py (fake transport, no network)."""
 
-import base64
 import importlib.util
 import json
 import subprocess
@@ -29,7 +28,6 @@ _spec.loader.exec_module(rt)
 REPOSITORY = "example/app"
 NOW = datetime(2026, 10, 11, 12, 0, 0, tzinfo=UTC)
 SHA = "a" * 40
-CONFIG_URL = f"repos/{REPOSITORY}/contents/.github/sca.yml?ref={SHA}"
 ENV = {
     "GITHUB_RUN_ID": "42",
     "GITHUB_SERVER_URL": "https://github.com",
@@ -100,8 +98,6 @@ def github_routes(
     runner.routes.setdefault(f"repos/{CALLER}", ok({"default_branch": "development"}))
     quoted = urllib.parse.quote(branch, safe="")
     runner.add(f"repos/{REPOSITORY}/commits/{quoted}", ok({"sha": "a" * 40}))
-    # no .github/sca.yml: the defaults
-    runner.routes.setdefault(CONFIG_URL, http_error(404))
     latest = f"repos/{REPOSITORY}/releases/latest"
     if release_status is not None:
         runner.add(latest, http_error(release_status))
@@ -1077,177 +1073,3 @@ def test_run_without_osv_has_trivy_targets_only(tmp_path: Path) -> None:
 def test_run_rejects_invalid_osv_enabled(tmp_path: Path) -> None:
     with pytest.raises(rt.ResolveError):
         rt.run(run_env(tmp_path, OSV_ENABLED="maybe"), FakeRunner(), NOW)
-
-
-# --- repository configuration (.github/sca.yml) ------------------------------
-
-CONFIG_FILE = "schema_version: 1\nnon_shipped_paths:\n  - examples/\n"
-
-
-def config_file_route(transport: FakeRunner, text: str) -> None:
-    """``.github/sca.yml`` of the pinned commit, as the contents API serves it."""
-    body = base64.encodebytes(text.encode()).decode()  # wrapped at 60 characters
-    transport.add(
-        CONFIG_URL,
-        ok({"type": "file", "encoding": "base64", "content": body}),
-    )
-
-
-def resolve_config_of(transport: FakeRunner, config_input: str = "") -> dict[str, Any]:
-    github_routes(transport, release=None)
-    return run_resolve_targets(transport, [], scan_images=False, config=config_input)[
-        "config"
-    ]
-
-
-def test_no_config_file_means_the_defaults() -> None:
-    t = FakeRunner()
-    assert resolve_config_of(t) == {
-        "source": None,
-        "overrides": None,
-        "non_shipped_paths": [],
-        "trivy_skip_paths": "as_non_shipped",
-    }
-    # the file is looked up at the commit the run is pinned to, via the API
-    assert t.urls.count(CONFIG_URL) == 1
-
-
-def test_config_file_is_read_at_the_pinned_commit() -> None:
-    t = FakeRunner()
-    config_file_route(t, CONFIG_FILE)
-    config = resolve_config_of(t)
-    assert config["source"] == f".github/sca.yml@{SHA}"
-    assert config["overrides"] is None
-    assert config["non_shipped_paths"] == ["examples/"]
-
-
-def test_targets_doc_carries_the_config() -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    config_file_route(t, CONFIG_FILE)
-    doc = run_resolve_targets(t, [])
-    assert doc["config"]["non_shipped_paths"] == ["examples/"]
-    assert doc["commit_sha"] == SHA
-
-
-def test_config_input_replaces_the_file_and_names_it() -> None:
-    t = FakeRunner()
-    config_file_route(t, CONFIG_FILE)
-    config = resolve_config_of(t, "schema_version: 1\nnon_shipped_paths: [docs/]\n")
-    assert config["source"] == "input"
-    assert config["overrides"] == f".github/sca.yml@{SHA}"
-    assert config["non_shipped_paths"] == ["docs/"]
-
-
-def test_config_input_without_a_file() -> None:
-    config = resolve_config_of(FakeRunner(), "schema_version: 1\n")
-    assert config["source"] == "input"
-    assert config["overrides"] is None
-
-
-def test_invalid_config_file_fails_with_a_clear_error() -> None:
-    t = FakeRunner()
-    config_file_route(t, "schema_version: 1\nnon_shiped_paths: [a/]\n")
-    with pytest.raises(rt.sca_config.ConfigError, match="unknown key 'non_shiped"):
-        resolve_config_of(t)
-
-
-@pytest.mark.parametrize("status", [401, 403, 500])
-def test_contents_api_failure_fails_the_resolution(status: int) -> None:
-    t = FakeRunner()
-    t.add(CONFIG_URL, http_error(status))
-    with pytest.raises(rt.ResolveError, match=f"HTTP {status}"):
-        resolve_config_of(t)
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        [{"type": "file", "name": "sca.yml"}],  # a directory
-        {"type": "symlink", "encoding": "base64", "content": ""},
-        {"type": "file", "encoding": "none", "content": ""},  # over 1 MB
-        {"type": "file", "encoding": "base64", "content": "!!!"},
-        {
-            "type": "file",
-            "encoding": "base64",
-            "content": base64.b64encode(b"\xff").decode(),
-        },
-    ],
-)
-def test_unusable_contents_response_fails_the_resolution(body: Any) -> None:
-    t = FakeRunner()
-    t.add(CONFIG_URL, ok(body))
-    with pytest.raises(rt.ResolveError, match="sca.yml"):
-        resolve_config_of(t)
-
-
-def test_config_file_with_a_byte_order_mark_is_read() -> None:
-    t = FakeRunner()
-    config_file_route(t, "\ufeff" + CONFIG_FILE)
-    assert resolve_config_of(t)["non_shipped_paths"] == ["examples/"]
-
-
-def test_run_passes_the_config_input_and_outputs_the_skip_mode(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    output_file = tmp_path / "github_output"
-    env = run_env(
-        tmp_path / "out",
-        SCAN_IMAGES="false",
-        SCAN_RELEASE_SOURCE="false",
-        OSV_ENABLED="false",
-        CONFIG="schema_version: 1\ntrivy_skip_paths: apply\n",
-        GITHUB_OUTPUT=str(output_file),
-    )
-    assert rt.run(env, t, NOW) == 0
-    doc = json.loads((tmp_path / "out" / "targets.json").read_text())
-    assert doc["config"]["source"] == "input"
-    assert parse_github_output(output_file.read_text())["trivy-skip-paths"] == "apply"
-    assert (
-        "Configuration: input; non_shipped_paths: none; trivy_skip_paths: apply"
-        in capsys.readouterr().out
-    )
-
-
-def test_run_outputs_the_default_skip_mode_without_config(tmp_path: Path) -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    output_file = tmp_path / "github_output"
-    rt.run(run_env(tmp_path / "out", GITHUB_OUTPUT=str(output_file)), t, NOW)
-    outputs = parse_github_output(output_file.read_text())
-    assert outputs["trivy-skip-paths"] == "as_non_shipped"
-    assert outputs["early-warning-enabled"] == "true"
-
-
-def test_run_outputs_whether_the_early_warning_is_enabled(tmp_path: Path) -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    output_file = tmp_path / "github_output"
-    env = run_env(
-        tmp_path / "out",
-        EARLY_WARNING_ENABLED="false",
-        GITHUB_OUTPUT=str(output_file),
-    )
-    rt.run(env, t, NOW)
-    outputs = parse_github_output(output_file.read_text())
-    assert outputs["early-warning-enabled"] == "false"
-
-
-def test_main_reports_an_invalid_configuration_and_writes_nothing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    t = FakeRunner()
-    github_routes(t, release=None)
-    config_file_route(t, "schema_version: 7\n")
-    monkeypatch.setattr(rt, "make_runner", lambda token: t)
-    for name, value in run_env(tmp_path).items():
-        monkeypatch.setenv(name, value)
-    code = rt.main()
-    assert code == 1
-    out = capsys.readouterr().out
-    assert out.startswith("::error title=Invalid SCA configuration::")
-    assert f".github/sca.yml@{SHA}: unsupported schema_version 7" in out
-    assert "\n" not in out.strip()
-    assert not (tmp_path / "targets.json").exists()

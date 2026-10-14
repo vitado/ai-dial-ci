@@ -2,9 +2,8 @@
 """Resolve the scan targets (source snapshot + container images) of one repository.
 
 Used by the SCA scheduled scan. Asks the GitHub REST API through ``gh api`` and the
-image registry through ``oras repo tags`` (both are on the runner). Besides the
-standard library it needs PyYAML, for the repository configuration
-(``.github/sca.yml``, see ``sca_config``).
+image registry through ``oras repo tags`` (both are on the runner). Standard
+library only.
 
 Every call of an external tool goes through a ``Runner`` (a callable
 ``(argv, stdin) -> stdout``), so the logic can be tested with a fake runner and no
@@ -13,8 +12,6 @@ network.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import fnmatch
 import json
 import os
@@ -29,7 +26,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import sca_config
 from _sca_lib.gha import append_text, escape_command_data, format_output
 from _sca_lib.times import format_time
 
@@ -147,29 +143,6 @@ class GitHubClient:
     def commit_sha(self, repo: str, ref: str) -> str:
         quoted = urllib.parse.quote(ref, safe="")
         return str(self._api(f"repos/{repo}/commits/{quoted}")["sha"])
-
-    def file_text(self, repo: str, path: str, ref: str) -> str | None:
-        """Text of a file of the repository at a commit, or None if there is none."""
-        quoted = urllib.parse.quote(path, safe="/")
-        ref_query = urllib.parse.quote(ref, safe="")
-        body = self._api(
-            f"repos/{repo}/contents/{quoted}?ref={ref_query}", missing_ok=True
-        )
-        if body is None:
-            return None
-        try:
-            if (
-                not isinstance(body, dict)
-                or body.get("type") != "file"
-                or body.get("encoding") != "base64"
-            ):
-                raise ResolveError(
-                    f"{path} in {repo}@{ref} is not a regular file of up to 1 MB"
-                )
-            raw = base64.b64decode("".join(body["content"].split()), validate=True)
-            return raw.decode("utf-8-sig")
-        except (KeyError, TypeError, ValueError, binascii.Error) as err:
-            raise ResolveError(f"cannot read {path} in {repo}@{ref}: {err!r}") from err
 
     def latest_release_tag(self, repo: str) -> str | None:
         """Tag of the latest GitHub release, or None if the repo has none (HTTP 404)."""
@@ -443,7 +416,6 @@ def run_kind(
     scan_images: bool,
     scan_release_source: bool,
     osv_enabled: bool,
-    early_warning_enabled: bool,
     ref_name: str,
     default_branch: str,
 ) -> tuple[str, list[str]]:
@@ -459,7 +431,6 @@ def run_kind(
         (not scan_images, "scan-images is off"),
         (not scan_release_source, "scan-release-source is off"),
         (not osv_enabled, "osv-enabled is off"),
-        (not early_warning_enabled, "early-warning-enabled is off"),
         (
             ref_name != default_branch,
             f"not the default branch ({ref_name}, the default is {default_branch})",
@@ -467,17 +438,6 @@ def run_kind(
     ]
     reasons = [reason for narrows, reason in narrowing if narrows]
     return ("partial" if reasons else "full"), reasons
-
-
-def resolve_config(
-    github: GitHubClient, repository: str, commit_sha: str, override: str
-) -> dict[str, Any]:
-    """The SCA configuration of the run: the ``config`` input, else the
-    ``.github/sca.yml`` of the pinned commit, else the defaults.
-    """
-    text = github.file_text(repository, sca_config.CONFIG_PATH, commit_sha)
-    file_ref = None if text is None else f"{sca_config.CONFIG_PATH}@{commit_sha}"
-    return sca_config.build_config(text, file_ref, override)
 
 
 @dataclass(frozen=True)
@@ -494,9 +454,7 @@ class Inputs:
     scan_images: bool = True
     scan_release_source: bool = True
     osv_enabled: bool = True
-    early_warning_enabled: bool = True
     targets_filter: str = ""
-    config: str = ""
     token: str | None = None
 
     @classmethod
@@ -531,9 +489,7 @@ class Inputs:
             scan_images=flag("SCAN_IMAGES"),
             scan_release_source=flag("SCAN_RELEASE_SOURCE"),
             osv_enabled=flag("OSV_ENABLED"),
-            early_warning_enabled=flag("EARLY_WARNING_ENABLED"),
             targets_filter=environ.get("TARGETS", ""),
-            config=environ.get("CONFIG", ""),
             token=environ.get("GITHUB_TOKEN") or None,
         )
 
@@ -546,8 +502,7 @@ def resolve_targets(
     now: datetime,
 ) -> dict[str, Any]:
     """Build the targets.json document. Raises ResolveError without a snapshot (or
-    for a ``targets_filter`` pattern that matches no target) and ConfigError for an
-    invalid SCA configuration.
+    for a ``targets_filter`` pattern that matches no target).
 
     One release is scanned (``resolve_release``): its source and, in every image, its
     tag. ``targets_filter`` keeps only the targets whose id matches one of its
@@ -561,7 +516,6 @@ def resolve_targets(
     repository = inputs.repository
     default_branch = github.default_branch(repository)
     commit_sha = github.commit_sha(repository, default_branch)
-    config = resolve_config(github, repository, commit_sha, inputs.config)
 
     with_images = inputs.scan_images and bool(inputs.images)
     with_release_source = inputs.scan_source and inputs.scan_release_source
@@ -592,7 +546,6 @@ def resolve_targets(
         scan_images=inputs.scan_images,
         scan_release_source=inputs.scan_release_source,
         osv_enabled=inputs.osv_enabled,
-        early_warning_enabled=inputs.early_warning_enabled,
         ref_name=inputs.ref_name,
         default_branch=github.default_branch(inputs.caller_repository),
     )
@@ -607,7 +560,6 @@ def resolve_targets(
         "repo": repository,
         "default_branch": default_branch,
         "commit_sha": commit_sha,
-        "config": config,
         "registry": inputs.registry,
         "run_kind": kind,
         "run_kind_reasons": kind_reasons,
@@ -664,18 +616,6 @@ def annotations(targets: Sequence[Mapping[str, Any]]) -> list[str]:
     return lines
 
 
-def describe_config(config: Mapping[str, Any]) -> str:
-    """One line on where the SCA configuration came from and what it sets."""
-    source = config["source"] or "none, defaults"
-    if config["overrides"]:
-        source += f" (replaces {config['overrides']})"
-    paths = ", ".join(config[sca_config.KEY_NON_SHIPPED_PATHS]) or "none"
-    return (
-        f"Configuration: {source}; non_shipped_paths: {paths}; "
-        f"trivy_skip_paths: {config[sca_config.KEY_TRIVY_SKIP_PATHS]}"
-    )
-
-
 def run(
     environ: Mapping[str, str],
     runner: Runner | None = None,
@@ -699,7 +639,6 @@ def run(
         f"Repository {targets_doc['repo']} @ {targets_doc['default_branch']} "
         f"({targets_doc['commit_sha']})"
     )
-    print(describe_config(targets_doc["config"]))
     reasons = "; ".join(targets_doc["run_kind_reasons"])
     print(f"Run kind: {targets_doc['run_kind']}" + (f" ({reasons})" if reasons else ""))
     print(render_table(targets_doc["targets"]))
@@ -711,11 +650,6 @@ def run(
         outputs = {
             "matrix": json.dumps(build_matrix(targets_doc), separators=(",", ":")),
             "targets-file": str(targets_file),
-            "trivy-skip-paths": targets_doc["config"][sca_config.KEY_TRIVY_SKIP_PATHS],
-            # Decided here, once; the early warning job and the merge follow it
-            "early-warning-enabled": "true"
-            if inputs.early_warning_enabled
-            else "false",
         }
         append_text(
             output_path, "".join(format_output(k, v) for k, v in outputs.items())
@@ -730,9 +664,6 @@ def main() -> int:
         print(
             f"::error title=Scan target resolution failed::{escape_command_data(err)}"
         )
-        return 1
-    except sca_config.ConfigError as err:
-        print(f"::error title=Invalid SCA configuration::{escape_command_data(err)}")
         return 1
 
 

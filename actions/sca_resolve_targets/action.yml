@@ -26,12 +26,6 @@ inputs:
   targets:
     description: Scan only the targets whose id matches one of these patterns (comma- or newline-separated; `*` and `?` work, e.g. `source-*` or `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all targets. A filtered run is a partial one
     default: ""
-  early-warning-enabled:
-    description: Whether the run has the early warning (only to tell a full run from a partial one)
-    default: "true"
-  config:
-    description: SCA configuration (YAML, same schema as .github/sca.yml of the repository) that is used instead of the file of the repository. Empty means the file, if there is one, else the defaults
-    default: ""
   github-token:
     description: Token for the GitHub API and for authenticating to ghcr.io
     default: ${{ github.token }}
@@ -46,12 +40,6 @@ outputs:
   targets-file:
     description: Path to targets.json with all targets and their statuses
     value: ${{ steps.targets.outputs.targets-file }}
-  trivy-skip-paths:
-    description: How the skip-dirs and skip-files of the trivy.yaml of the repository are treated (as_non_shipped, apply or ignore), from the SCA configuration
-    value: ${{ steps.targets.outputs.trivy-skip-paths }}
-  early-warning-enabled:
-    description: Whether the run has the early warning (true or false), the input as the run resolved it; what the early warning job and the merge follow
-    value: ${{ steps.targets.outputs.early-warning-enabled }}
 
 runs:
   using: "composite"
@@ -60,15 +48,6 @@ runs:
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.12"
-    # PyYAML for the configuration file; pinned with hashes, wheels only (nothing is built or executed on install)
-    - name: Install dependencies
-      shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-      run: >-
-        python -m pip install --disable-pip-version-check --no-input
-        --require-hashes --only-binary=:all:
-        --requirement "$ACTION_PATH/requirements.txt"
     # gh (GitHub API) is on the runner image; oras lists the tags of the images
     - name: Set up ORAS
       uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
@@ -86,8 +65,6 @@ runs:
         SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
         OSV_ENABLED: ${{ inputs.osv-enabled }}
         TARGETS: ${{ inputs.targets }}
-        EARLY_WARNING_ENABLED: ${{ inputs.early-warning-enabled }}
-        CONFIG: ${{ inputs.config }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}

@@ -39,14 +39,6 @@ on:
         type: boolean
         description: Also check the language packages found by Trivy against OSV (osv.dev). Its findings are merged into the report
         default: true
-      early-warning-enabled:
-        type: boolean
-        description: Also look for CVE records that match the language packages found by Trivy but that no vulnerability database maps to packages yet. An informational section of the report, not findings; a failure of this check does not fail the run
-        default: true
-      cve-index:
-        type: string
-        description: The CVE index (an OCI artifact built daily by the sca_cve_index.yml workflow of ai-dial-ci) that the early warning reads. It is pulled anonymously, so the package must be public. Its window (180 days) is the window of the early warning
-        default: "ghcr.io/epam/ai-dial-sca-cve-index:1"
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
@@ -67,10 +59,6 @@ on:
         type: boolean
         description: Scan the source code of the latest release (git tag), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
         default: true
-      config:
-        type: string
-        description: "SCA configuration (YAML, the schema of .github/sca.yml) that is used instead of the .github/sca.yml of the scanned repository, for repositories that cannot carry the file. Empty means the file, if there is one, else the defaults"
-        default: ""
       runs-on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
@@ -84,9 +72,6 @@ jobs:
       packages: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
-      trivy-skip-paths: ${{ steps.targets.outputs.trivy-skip-paths }}
-      # Resolved once here; the early-warning job and the merge follow this output, not the input
-      early-warning-enabled: ${{ steps.targets.outputs.early-warning-enabled }}
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
@@ -100,9 +85,7 @@ jobs:
           scan-images: ${{ inputs.scan-images }}
           scan-release-source: ${{ inputs.scan-release-source }}
           osv-enabled: ${{ inputs.osv-enabled }}
-          early-warning-enabled: ${{ inputs.early-warning-enabled }}
           targets: ${{ inputs.targets }}
-          config: ${{ inputs.config }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -217,17 +200,6 @@ jobs:
           ref: ${{ matrix.target.commit_sha }}
           persist-credentials: false
           lfs: true
-      # The skip-dirs / skip-files of the trivy.yaml of this very commit: what the SCA configuration (trivy_skip_paths)
-      # makes of them is decided here; the merge reads the record. The generated config replaces trivy.yaml only when
-      # Trivy must not skip the paths (a plain environment variable cannot clear a list the file sets)
-      - name: Prepare Trivy configuration
-        id: trivy-config
-        if: ${{ matrix.target.kind == 'fs' }}
-        uses: epam/ai-dial-ci/actions/sca_prepare_trivy_config@4.12.0
-        with:
-          mode: ${{ needs.targets.outputs.trivy-skip-paths }}
-          target-id: ${{ matrix.target.id }}
-          output-dir: ${{ runner.temp }}/sca-out/trivy
       - name: Detect Gradle build
         id: stack
         if: ${{ matrix.target.kind == 'fs' }}
@@ -262,6 +234,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The trivy.yaml of the scanned repository applies as is, skip-dirs and skip-files included (they keep
+      # non-shipped paths out of the scan and of the inventory OSV is asked about). It needs no trivy-config input:
+      # Trivy reads ./trivy.yaml of its working directory when --config / TRIVY_CONFIG is not set, and trivy-action
+      # (checked at the pinned commit) sets TRIVY_CONFIG only from its trivy-config input and does not change the
+      # directory. The checkout above has no `path`, so the repository root is the workspace, which is the working
+      # directory of this step and the scan root (scan-ref: .); relative skip-dirs resolve against it
       - name: Run Trivy scanner
         id: trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -269,8 +247,6 @@ jobs:
           scan-type: ${{ matrix.target.kind }}
           scan-ref: .
           image-ref: ${{ matrix.target.ref }}
-          # Empty (trivy.yaml of the repository, if any, applies as is) unless the skip paths must be scanned
-          trivy-config: ${{ steps.trivy-config.outputs.config-file }}
           format: json
           output: ${{ runner.temp }}/sca-out/trivy/${{ matrix.target.id }}.json
           # Outside the workspace, so that the cache is not scanned
@@ -290,7 +266,6 @@ jobs:
           DB_JOB_RESULT: ${{ needs.trivy-db.result }}
           SETUP_OUTCOME: ${{ steps.setup.outcome }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
-          TRIVY_CONFIG_OUTCOME: ${{ steps.trivy-config.outcome }}
           JAVA_OUTCOME: ${{ steps.java.outcome }}
           LOCKFILES_OUTCOME: ${{ steps.lockfiles.outcome }}
           LOGIN_OUTCOME: ${{ steps.login.outcome }}
@@ -300,7 +275,7 @@ jobs:
           out="$RUNNER_TEMP/sca-out/trivy"
           status=ok
           reason=
-          for step in "trivy db restore:$DB_OUTCOME" "trivy setup:$SETUP_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "trivy configuration:$TRIVY_CONFIG_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
+          for step in "trivy db restore:$DB_OUTCOME" "trivy setup:$SETUP_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME" "registry login:$LOGIN_OUTCOME" "trivy scan:$TRIVY_OUTCOME"; do
             outcome="${step#*:}"
             if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
               status=failed
@@ -370,47 +345,8 @@ jobs:
           if-no-files-found: error
           overwrite: true # a re-run of the failed jobs uploads again
 
-  # The early warning matches the CNA data of recent CVE records with the language packages Trivy found, for CVEs that no
-  # scanner of the run reports because no database maps them to a package yet. One job per run, after the Trivy matrix.
-  # A heuristic signal: an index, feed or deps.dev failure is reported as "unavailable" in the report and does not fail
-  # the job
-  early-warning:
-    needs: [targets, trivy]
-    if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.early-warning-enabled == 'true' && needs.targets.outputs.matrix != '[]' }}
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    permissions:
-      contents: read
-    # The index (about 30 MB), the deltas of the hours since it was built, the delta log (20 MB) and one deps.dev request
-    # per package name (4 at a time); every request is bounded by 4 attempts of 60 s each plus backoff, so the job bound
-    # only stops a service that is up but crawling
-    timeout-minutes: 30
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: sca-part-targets
-          path: ${{ runner.temp }}/sca-parts
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: sca-part-trivy-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-ci/actions/sca_early_warning@4.12.0
-        with:
-          targets-file: ${{ runner.temp }}/sca-parts/targets.json
-          parts-dir: ${{ runner.temp }}/sca-parts
-          output-dir: ${{ runner.temp }}/sca-out
-          cve-index: ${{ inputs.cve-index }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ always() }}
-        with:
-          name: sca-part-early-warning
-          path: ${{ runner.temp }}/sca-out/
-          retention-days: 1
-          if-no-files-found: error
-          overwrite: true # a re-run of the failed jobs uploads again
-
   report:
-    needs: [targets, trivy-db, trivy, osv, early-warning]
+    needs: [targets, trivy-db, trivy, osv]
     # Without the targets result there is nothing to report on; the run is red anyway because the targets job failed
     if: ${{ always() && needs.targets.result == 'success' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
@@ -432,7 +368,6 @@ jobs:
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca
           trivy-db-info: ${{ needs.trivy-db.outputs.db-info }}
-          early-warning-enabled: ${{ needs.targets.outputs.early-warning-enabled }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
@@ -448,5 +383,5 @@ jobs:
           FAILED_COUNT: ${{ steps.merge.outputs.failed-count }}
         run: |
           # Per-target errors are annotated by the merge step; this one only fails the run
-          echo "::error::$FAILED_COUNT target(s) failed to be scanned, see the job summary or _report/scan_report.json"
+          echo "::error::$FAILED_COUNT target(s) failed to be scanned, see the job summary or report.json of the sca-report artifact"
           exit 1

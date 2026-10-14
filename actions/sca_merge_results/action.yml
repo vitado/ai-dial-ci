@@ -1,5 +1,5 @@
 name: Merge SCA scan results
-description: Merge the per-target results of an SCA scheduled scan into a deduplicated report (decision-first summary, JSON)
+description: Merge the per-target results of an SCA scheduled scan into one report (summary.md, report.json)
 
 inputs:
   targets-file:
@@ -9,14 +9,11 @@ inputs:
     description: Directory with the per-scanner scan parts (<scanner>/<id>.json, <scanner>/<id>.status.json, optional <scanner>/<id>.txt, optional trivy/<id>.gradle-graph/ with the Gradle dependency graph of a source target; trivy and osv)
     required: true
   output-dir:
-    description: Directory to write the report into (summary.md, _report/, _native/<scanner>/)
+    description: Directory to write the report into (summary.md, report.json, _native/<scanner>/)
     required: true
   trivy-db-info:
     description: 'JSON object {"vulnerability_db_updated_at": ..., "java_db_updated_at": ...} describing the Trivy DB snapshot of the run; empty means unknown'
     default: ""
-  early-warning-enabled:
-    description: Whether the run has an early warning part (early-warning/ in parts-dir) to report; false leaves the report as it was without one
-    default: "false"
   step-summary:
     description: Whether to append summary.md to the job summary
     default: "true"
@@ -45,7 +42,6 @@ runs:
         OUTPUT_DIR: ${{ inputs.output-dir }}
         STEP_SUMMARY: ${{ inputs.step-summary }}
         TRIVY_DB_INFO: ${{ inputs.trivy-db-info }}
-        EARLY_WARNING_ENABLED: ${{ inputs.early-warning-enabled }}
       run: |
         args=(
           --targets-file "$TARGETS_FILE"
@@ -53,6 +49,5 @@ runs:
           --output-dir "$OUTPUT_DIR"
           --step-summary "$STEP_SUMMARY"
           --trivy-db-info "$TRIVY_DB_INFO"
-          --early-warning-enabled "$EARLY_WARNING_ENABLED"
         )
         python "$ACTION_PATH/merge_results.py" "${args[@]}"

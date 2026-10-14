@@ -1,253 +1,238 @@
-"""Tests of actions/sca_merge_results/summary.py (synthetic fixtures only)."""
-
-from __future__ import annotations
-
-from typing import Any
+"""summary.md of the SCA merge."""
 
 import pytest
 from summary import (
+    COLORS,
     STEP_SUMMARY_LIMIT_BYTES,
-    exposure_label,
-    fixed_versions_text,
-    format_timestamp,
-    join_names,
-    md_cell,
-    md_join,
-    md_link,
-    package_families,
-    release_tags_of,
-    render_footer,
-    scope_table,
-    shortest_path_text,
-    strip_package_prefix,
-    totals_line,
-    truncate,
+    build_summary,
+    dot,
     truncate_summary,
 )
-from test_merge_results import (
-    DEV,
-    OLDER_RELEASE_SOURCE,
-    REL,
-    RELEASE_SOURCE,
-    SOURCE,
-    Record,
-    plain,
-    plain_lines,
-    rec,
-)
 
 
-def test_footer_shows_java_db_time_only_on_the_same_day() -> None:
-    report = {
-        "commit_sha": None,
-        "run_url": None,
-        "run_id": None,
-        "trivy_version": None,
-        "generated_utc": None,
-        "trivy_db": {
-            "vulnerability_db_updated_at": "2030-01-01T06:00:00.123456789Z",
-            "java_db_updated_at": "2030-01-01T01:02:03Z",
-        },
-    }
-    assert render_footer(report)[-1] == (
-        "<sub>DB vuln 2030-01-01 06:00Z (java 01:02Z)</sub>"
-    )
-
-
-def test_markdown_cells_are_escaped() -> None:
-    assert md_cell("a|b") == "a\\|b"
-    assert md_cell("line1\nline2") == "line1 line2"
-    assert md_cell("back\\slash|x") == "back\\\\slash\\|x"
-    assert md_cell(None) == "-"
-    assert md_cell(0) == "0"
-
-
-@pytest.mark.parametrize(
-    ("names", "expected"),
-    [([], ""), (["a"], "a"), (["a", "b"], "a and b"), (["a", "b", "c"], "a, b and c")],
-)
-def test_join_names(names: list[str], expected: str) -> None:
-    assert join_names(names) == expected
-
-
-def test_scope_table_has_a_row_per_release_and_an_unknown_column_if_needed() -> None:
-    older = {**REL, "id": "app-0.9.0", "tag": "0.9.0"}
-    targets = [
-        {**t, "scanner": "trivy", "status": "ok"} for t in (SOURCE, DEV, REL, older)
-    ]
-    records = [
-        rec("release_only", "UNKNOWN", scan_targets=["app-1.0.0", "app-0.9.0"]),
-        rec("release_only", "HIGH", scan_targets=["app-0.9.0"]),
-    ]
-    assert plain_lines(scope_table({"targets": targets}, records)) == [
-        "| Scope | CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN | Fixable | Base image |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
-        "| 1.0.0 (released) | 0 | 0 | 0 | 0 | 1 | 0 | 0 |",
-        "| 0.9.0 (released) | 0 | 1 | 0 | 0 | 1 | 0 | 0 |",
-    ]
-
-
-def test_totals_line_is_the_coverage_of_the_run() -> None:
-    def report(**counts: int) -> dict[str, Any]:
-        base = {"total": 8, "ok": 8, "failed": 0, "not_applicable": 0}
-        return {"totals": {"targets": {**base, **counts}}}
-
-    assert totals_line(report()) == "8/8 targets scanned"
-    assert totals_line(report(), osv_only=3) == (
-        "8/8 targets scanned · 3 found only by OSV"
-    )
-    assert totals_line(report(ok=5, failed=1, not_applicable=2)) == (
-        "5/6 targets scanned · 2 not applicable"
-    )
-    assert totals_line(report(), packages=12) == "8/8 targets scanned · 12 packages"
-
-
-def test_format_timestamp() -> None:
-    assert format_timestamp("2026-10-12T01:14:57.362085088Z") == "2026-10-12 01:14Z"
-    assert format_timestamp("2026-10-12T01:14:57Z", with_date=False) == "01:14Z"
-    assert format_timestamp("garbage") is None
-    assert format_timestamp(None) is None
-
-
-def test_truncate() -> None:
-    assert truncate("short", 10) == "short"
-    assert truncate("x" * 20, 10) == "x" * 9 + "…"
-    assert truncate(None) is None
-
-
-def test_markdown_cells_escape_html() -> None:
-    assert md_cell("<b>x</b>") == "&lt;b&gt;x&lt;/b&gt;"
-
-
-def test_package_families_group_the_ecosystems_of_a_package() -> None:
-    def families(*ecosystems: str) -> str:
-        return package_families([{"ecosystem": list(ecosystems)}])
-
-    assert families("python-pkg", "poetry") == "python"
-    assert families("node-pkg", "npm") == "npm"
-    assert families("gradle", "jar") == "java"
-    assert families("alpine") == "alpine"
-    assert families("conan") == "conan"
-
-
-@pytest.mark.parametrize(
-    ("title", "pkg", "expected"),
-    [
-        ("urllib3: urllib3: Denial of Service", "urllib3", "Denial of Service"),
-        ("pyjwt: PyJWT: Token bypass", "PyJWT", "Token bypass"),
-        ("Mako: Path traversal", "Mako", "Path traversal"),
-        ("urllib3 is vulnerable", "urllib3", "urllib3 is vulnerable"),
-        ("urllib3: ", "urllib3", "urllib3: "),
-        (None, "urllib3", None),
-    ],
-)
-def test_strip_package_prefix(
-    title: str | None, pkg: str, expected: str | None
-) -> None:
-    assert strip_package_prefix(title, pkg) == expected
-
-
-def test_shortest_path_text_and_more_paths() -> None:
-    def record(paths: list[list[str]], total: int, truncated: bool = False) -> Record:
-        return {
-            "dependency_paths": paths,
-            "dependency_paths_total": total,
-            "dependency_paths_truncated": truncated,
-        }
-
-    one = record([["jest", "core", "braces"]], 1)
-    assert shortest_path_text([one]) == "jest › core › braces"
-    two = record([["b", "t"], ["a", "x", "t"]], 2)
-    assert shortest_path_text([two]) == "b › t (+1 more path)"
-    many = record([["a", "t"]], 7)
-    assert shortest_path_text([many]) == "a › t (+6 more paths)"
-    cut = record([["a", "t"]], 1000, True)
-    assert shortest_path_text([cut]) == "a › t (+999+ more paths)"
-    assert shortest_path_text([record([], 0)]) == ""
-
-
-def test_exposure_labels() -> None:
-    label = exposure_label
-    assert label("release_and_development", [], ["1.1.14", "1.0.3"], True) == (
-        "Released 1.1.14, 1.0.3 + development"
-    )
-    assert label("release_only", [], ["0.12.0"], True) == "Released 0.12.0 only"
-    assert label("development_only", [], [], True) == "development only"
-    assert label("development_only", [], [], False) == "development (source)"
-    assert label("source_only", [], [], True) == "Source only · not in images"
-    # source only without a reason is not marked as not in production
-    assert label("source_only", [], [], False) == "Source only"
-    assert label("source_only", ["dev dependency"], [], True) == (
-        "not in production · dev dependency"
-    )
-    assert label("source_only", ["not shipped path"], [], False) == (
-        "not in production · not shipped path"
-    )
-    assert label("source_only", ["dev dependency", "not shipped path"], [], True) == (
-        "not in production · dev dependency · not shipped path"
-    )
-    assert label("development_only", ["dev dependency"], [], False) == (
-        "development (source) · not in production · dev dependency"
-    )
-
-
-def test_exposure_label_lists_the_release_tags_of_the_images_it_was_found_in() -> None:
-    other = {**REL, "id": "app-0.9.0", "tag": "0.9.0"}
-    targets = [SOURCE, DEV, REL, other]
-    record = {"scan_targets": ["source-development", "app-0.9.0", "app-1.0.0"]}
-    assert release_tags_of([record], targets) == ["1.0.0", "0.9.0"]
-
-
-def test_release_tags_of_uses_release_sources_only_without_images() -> None:
-    record = {"scan_targets": ["source-1.0.0", "source-0.9.0", "app-1.0.0"]}
-    sources = [SOURCE, RELEASE_SOURCE, OLDER_RELEASE_SOURCE]
-    assert release_tags_of([record], sources) == ["1.0.0", "0.9.0"]
-    with_images = [*sources, DEV, REL]
-    assert release_tags_of([record], with_images) == ["1.0.0"]
-
-
-def test_fixed_versions_text_names_the_fixes_above_the_installed_version() -> None:
-    fixes = ["2.0.1", "1.9", "1.0", "3.1", "2.5"]
-    assert fixed_versions_text(fixes) == "1.0, 1.9, 2.0.1 +2 more"
-    assert fixed_versions_text(fixes, "2.0") == "2.0.1, 2.5, 3.1"
-    # nothing above it, or nothing comparable: all of them
-    assert fixed_versions_text(["1.0", "1.1"], "2.0") == "1.0, 1.1"
-    assert fixed_versions_text(["abc", "def"], "1.0") == "abc, def"
-    assert fixed_versions_text([]) == ""
-
-
-def test_md_cell_leaves_no_link_image_or_code_span_to_an_outside_text() -> None:
-    cell = md_cell("[x](https://e.invalid) ![i](u) `c` a|b <b>")
-    assert plain(cell) == "[x](https://e.invalid) ![i](u) `c` a|b &lt;b&gt;"
-    for char in "[]()!`|":
-        assert all(
-            cell[i - 1] == "\\" for i, c in enumerate(cell) if c == char and i > 0
-        )
-    assert md_cell("a\r\nb") == "a  b"
-    assert md_cell(None) == "-"
-
-
-def test_md_link_is_a_link_that_md_cell_keeps() -> None:
-    link = md_link("CVE-1 [x]", "https://e.invalid/a(b) c")
-    assert link == "[CVE-1 \\[x\\]](https://e.invalid/a%28b%29%20c)"
-    assert md_cell(link) == link
-    joined = md_join(", ", [link, "[plain](u)"])
-    assert md_cell(joined).endswith(", \\[plain\\]\\(u\\)")
-
-
-def test_a_summary_that_fits_is_written_as_it_is() -> None:
-    assert truncate_summary("# SCA\n", None) == "# SCA\n"
-
-
-def test_a_summary_over_the_limit_is_cut_with_a_note_and_open_blocks_are_closed() -> (
-    None
+def target(
+    tid,
+    scanner="trivy",
+    kind="fs",
+    ref="development",
+    status="ok",
+    reason=None,
+    packages=10,
 ):
-    row = "| " + "x" * 100 + " |\n"
-    text = "# SCA\n\n<details>\n<summary>big</summary>\n\n" + row * 20000
-    assert len(text.encode()) > STEP_SUMMARY_LIMIT_BYTES
-    cut = truncate_summary(text, "https://github.com/o/r/actions/runs/1#artifacts")
+    return {
+        "id": tid,
+        "scanner": scanner,
+        "kind": kind,
+        "ref": ref,
+        "commit_sha": "0123456789abcdef" if kind == "fs" else None,
+        "image": "o/app" if kind == "image" else None,
+        "image_digest": None,
+        "status": status,
+        "reason": reason,
+        "packages_scanned": packages if status == "ok" else None,
+    }
+
+
+def finding(
+    tid, vid, pkg, severity="HIGH", scanner="trivy", cls="lang", fixed="", **extra
+):
+    return {
+        "target": tid,
+        "scanner": scanner,
+        "id": vid,
+        "aliases": [],
+        "pkg": pkg,
+        "version": "1.3" if cls == "os" else "1.0",
+        "ecosystem": "npm",
+        "class": cls,
+        "locations": ["web/package-lock.json"] if cls == "lang" else [],
+        "severity": severity,
+        "fixed_version": fixed,
+        "dev": False,
+        "relationship": None,
+        "chain": [],
+        "title": "",
+        "url": f"https://example.test/{vid}",
+        **extra,
+    }
+
+
+def report(targets, findings):
+    return {
+        "schema_version": 2,
+        "repo": "o/app",
+        "commit_sha": "0123456789abcdef",
+        "default_branch": "development",
+        "run_id": "7",
+        "run_url": "https://example.test/run/7",
+        "generated_utc": "2026-10-14T00:00:00Z",
+        "run_kind": "full",
+        "run_kind_reasons": [],
+        "tools": {
+            "trivy": "0.75.0",
+            "trivy_db": "2026-10-13T06:41:11.5Z",
+            "trivy_java_db": None,
+            "osv_scanner": "2.6.0",
+            "osv_queried_at": "2026-10-13T11:33:23Z",
+        },
+        "targets": targets,
+        "findings": findings,
+    }
+
+
+def sample():
+    src = "source-development"
+    lib = {"dev": True}
+    targets = [
+        target(src),
+        target(src, "osv"),
+        target("app-1.0", kind="image", ref="1.0", packages=50),
+        target(
+            "app-1.0",
+            "osv",
+            kind="image",
+            ref="1.0",
+            status="failed",
+            reason="rate limited",
+        ),
+        target(
+            "app-2.0",
+            kind="image",
+            ref="2.0",
+            status="not_applicable",
+            reason="not published",
+        ),
+    ]
+    findings = [
+        finding(
+            src, "CVE-1", "lib", "CRITICAL", fixed="2.0", chain=["top", "lib"], **lib
+        ),
+        finding(src, "CVE-2", "lib", "LOW", scanner="osv", fixed="2.1", **lib),
+        finding(src, "CVE-1", "lib", "HIGH", scanner="osv", **lib),
+        finding(
+            src, "CVE-3", "other", "MEDIUM", relationship="direct", chain=["other"]
+        ),
+        finding("app-1.0", "CVE-3", "other", "MEDIUM"),
+        finding("app-1.0", "CVE-4", "zlib", "HIGH", cls="os", fixed="1.4"),
+    ]
+    return report(targets, findings)
+
+
+def line(text, prefix):
+    return next(row for row in text.splitlines() if row.startswith(prefix))
+
+
+def test_dot_is_a_colored_formula_per_severity():
+    assert dot("HIGH") == r"$\color{#c4320a}{\bullet}$"
+    assert set(COLORS) == {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}
+
+
+def test_header_has_the_commit_the_tool_versions_and_the_run():
+    text = build_summary(sample())
+    header = text.splitlines()[2]
+    assert "commit `0123456`" in header and "default branch `development`" in header
+    assert "Trivy 0.75.0 (DB 2026-10-13T06:41Z, Java DB n/a)" in header
+    assert "osv-scanner 2.6.0 (queried 2026-10-13T11:33:23Z)" in header
+    assert "[run 7](https://example.test/run/7)" in header
+
+
+def test_results_by_target_count_unique_vulnerabilities_per_class():
+    text = build_summary(sample())
+    c, h, m, low = (dot(s) for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"))
+    # CVE-1 counts once, with Trivy's severity
+    assert line(text, "| source-development") == (
+        f"| source-development | source | development@0123456 | ok | 10 | "
+        f"C {c} 1&emsp;M {m} 1&emsp;L {low} 1 | — |"
+    )
+    assert line(text, "| app-1.0") == (
+        f"| app-1.0 | image | 1.0 | ok · OSV failed: rate limited | 50 | M {m} 1 | H {h} 1 |"
+    )
+    assert line(text, "| **All targets**") == (
+        f"| **All targets** | | | | | C {c} 1&emsp;M {m} 1&emsp;L {low} 1 | H {h} 1 |"
+    )
+    assert f"C {c} critical&emsp;H {h} high" in text
+
+
+def test_a_target_that_is_not_ok_shows_its_reason_and_empty_counts():
+    row = line(build_summary(sample()), "| app-2.0")
+    assert row == "| app-2.0 | image | 2.0 | not_applicable (not published) | – |  |  |"
+
+
+def test_libraries_are_grouped_by_package_in_severity_sections():
+    text = build_summary(sample())
+    assert "## Libraries — 2 packages, 3 vulnerabilities, 2 fixable" in text
+    assert (
+        "<details open><summary><b>CRITICAL — 1 packages, 2 vulnerabilities, 2 fixable"
+        in text
+    )
+    assert (
+        "<details><summary><b>MEDIUM — 1 packages, 1 vulnerabilities, 0 fixable" in text
+    )
+    assert text.index("CRITICAL —") < text.index("MEDIUM —")
+    # the severities differ inside the row, so each vulnerability carries its letter
+    assert line(text, "| lib@1.0") == (
+        "| lib@1.0 | C [CVE-1](https://example.test/CVE-1), L [CVE-2](https://example.test/CVE-2)"
+        " | 2.0, 2.1 | top → lib · dev | web/package-lock.json | src·dev | T+O |"
+    )
+    assert line(text, "| other@1.0") == (
+        "| other@1.0 | [CVE-3](https://example.test/CVE-3) |  | direct | web/package-lock.json"
+        " | src·dev, img·1.0 | T |"
+    )
+
+
+def test_where_shows_two_locations_and_the_rest_as_a_count():
+    f = finding("s", "CVE-1", "lib", locations=["a/x.lock", "b/x.lock", "c/x.lock"])
+    text = build_summary(report([target("s")], [f]))
+    assert "| a/x.lock, b/x.lock +1 |" in text
+
+
+def test_where_prefers_source_lockfiles_to_image_paths():
+    findings = [
+        finding("img", "CVE-1", "lib", locations=["usr/lib/lib.jar"]),
+        finding("s", "CVE-1", "lib", locations=["web/package-lock.json"]),
+    ]
+    targets = [target("img", kind="image", ref="1.0"), target("s")]
+    assert "| web/package-lock.json |" in build_summary(report(targets, findings))
+
+
+def test_os_packages_are_a_separate_table_without_chain_columns():
+    text = build_summary(sample())
+    assert (
+        "## Base image (OS packages) — 1 packages, 1 vulnerabilities, 1 fixable" in text
+    )
+    assert "| Package@version | Vulnerabilities | Fixed | Targets | Scanner |" in text
+    assert (
+        "| zlib@1.3 | [CVE-4](https://example.test/CVE-4) | 1.4 | img·1.0 | T |" in text
+    )
+
+
+def test_a_run_without_findings_has_empty_sections_and_dashes():
+    text = build_summary(report([target("s")], []))
+    assert "## Libraries — 0 packages, 0 vulnerabilities, 0 fixable" in text
+    assert "Base image" not in text and "| — | — |" in text
+
+
+def test_summary_ends_with_the_artifact_footer():
+    assert (
+        build_summary(sample())
+        .rstrip()
+        .endswith("`_native/trivy/` and `_native/osv/`.")
+    )
+
+
+def test_a_summary_that_fits_is_not_touched():
+    assert truncate_summary("short\n", None) == "short\n"
+
+
+@pytest.mark.parametrize("run_url", [None, "https://example.test/run/7"])
+def test_a_long_summary_is_cut_at_a_line_with_open_blocks_closed_and_a_note(run_url):
+    text = "<details><summary>x</summary>\n" + "| row |\n" * (
+        STEP_SUMMARY_LIMIT_BYTES // 8
+    )
+    cut = truncate_summary(text, run_url)
     assert len(cut.encode()) <= STEP_SUMMARY_LIMIT_BYTES
-    assert cut.count("<details>") == cut.count("</details>")
-    assert "The summary is cut" in cut
-    assert "[this run](https://github.com/o/r/actions/runs/1#artifacts)" in cut
-    assert cut.startswith("# SCA")
+    body, _, note = cut.partition("\n> The summary is cut")
+    assert body.rstrip().endswith("</details>")
+    assert body.count("<details") == body.count("</details>")
+    assert f"it is {len(text.encode())} bytes" in note
+    assert (run_url in note) if run_url else "artifact of this run" in note

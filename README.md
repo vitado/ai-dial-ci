@@ -1243,6 +1243,8 @@ misconfiguration:
 
 #### SCA scheduled scan
 
+The scan logic (the actions that resolve targets, query OSV and merge results) lives in [epam/ai-dial-sec-sca](https://github.com/epam/ai-dial-sec-sca); this workflow only orchestrates it.
+
 `sca_scheduled.yml` looks for known vulnerabilities in what a repository publishes. It is a report, not a gate: nothing is ignored (no `.trivyignore`; unfixed vulnerabilities, all severities and dev dependencies are included) and findings never fail the run. The run fails only if a target could not be scanned.
 
 Targets:

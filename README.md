@@ -1315,8 +1315,6 @@ scan:
   skip-dirs:
     - test
     - docs/examples
-  skip-files:
-    - "**/package-lock.dev.json"
 ```
 
 Paths are relative to the repository root. The scan profile (severity, ignore file, unfixed, dev dependencies) is set by the workflow with environment variables, and `trivy.yaml` cannot change it.
@@ -1339,7 +1337,7 @@ Target status in `report.json` and in the `Scan` column of the summary:
 * `failed`: not scanned, or the result is missing or invalid; `reason` says why. A failed target is never shown as clean (its counts are empty), the error is annotated, and the run fails after the artifact is uploaded. A failed OSV check of an `ok` Trivy target is shown as `ok · OSV failed: <reason>`.
 * `not_applicable`: nothing to scan, for example the repository has no release or the image has no `development` tag.
 
-`severity` and `fixed_version` are what the scanner reports, with no version comparison. For OSV the severity is the rating of the advisory database, else the CVSS bucket, else `UNKNOWN`. The `Fixed` column lists the fix versions the scanner knows, comma-separated and for every maintained branch, so a version there may not apply to the installed one. An empty `Fixed` means no fix is known. Findings of both scanners about one vulnerability are merged into one row; the CVE id is preferred when known.
+`severity` and `fixed_version` are what the scanner reports, with no version comparison. For OSV the severity is the rating of the advisory database, else the CVSS bucket, else `UNKNOWN`. The `Fixed` column lists the fix versions the scanner knows, comma-separated and for every branch the advisory lists, so a version there may belong to another branch than the installed one. An empty `Fixed` means no fix is known. In the summary, findings of both scanners about one vulnerability (same id or a shared alias) are shown once, under the CVE id when known; `report.json` keeps one finding per target and scanner.
 
 #### Dependabot
 

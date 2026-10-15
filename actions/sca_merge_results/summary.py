@@ -24,8 +24,10 @@ def short_time(value: str | None) -> str:
 
 
 def target_label(target: Mapping[str, Any], repo: str) -> str:
-    """``src·dev``, ``img·0.43.0``, ``img·bff·dev`` (an image of another name)."""
-    ref = "dev" if target["ref"] == "development" else target["ref"]
+    """``src·dev``, ``img·0.43.0``, ``img·bff·dev`` (an image of another name);
+    ``img·?`` for an image without a tag (its resolution failed).
+    """
+    ref = {"development": "dev", None: "?"}.get(target["ref"], target["ref"])
     if target["kind"] == "fs":
         return f"src·{ref}"
     image = target["image"].split("/")[-1]
@@ -71,24 +73,30 @@ def package_rows(
     for (cls, _, version), fs in groups.items():
         # the name as written in a source target (lockfile), else the first seen
         pkg = next((f for f in fs if f["target"] in source_ids), fs[0])["pkg"]
-        vulns: dict[str, dict[str, Any]] = {}
+        # findings of one vulnerability under different ids merge by shared aliases
+        vulns: list[dict[str, Any]] = []
         for f in sorted(fs, key=lambda f: f["scanner"] != "trivy"):
-            v = vulns.setdefault(
-                f["id"],
-                {
+            names = {f["id"], *f.get("aliases", [])}
+            v = next((v for v in vulns if v["names"] & names), None)
+            if v is None:
+                v = {
                     "id": f["id"],
+                    "names": set(),
                     "severity": f["severity"],
                     "url": f["url"],
                     "fixed": [],
                     "scanners": set(),
-                },
-            )
+                }
+                vulns.append(v)
+            v["names"] |= names
+            if f["id"].startswith("CVE-") and not v["id"].startswith("CVE-"):
+                v["id"], v["url"] = f["id"], f["url"]
             v["fixed"] += [
                 x.strip() for x in f["fixed_version"].split(",") if x.strip()
             ]
             v["scanners"].add(f["scanner"])
         ordered = sorted(
-            vulns.values(), key=lambda v: (SEVERITIES.index(v["severity"]), v["id"])
+            vulns, key=lambda v: (SEVERITIES.index(v["severity"]), v["id"])
         )
         with_chain = next((f for f in fs if f["chain"]), None)
         in_source = [
@@ -218,7 +226,7 @@ def results_by_target(report: Mapping[str, Any]) -> list[str]:
     for tid, ts in by_id.items():
         trivy = next((t for t in ts if t["scanner"] == "trivy"), ts[0])
         osv = next((t for t in ts if t["scanner"] == "osv"), None)
-        ref = trivy["ref"]
+        ref = trivy["ref"] or "—"
         if trivy["kind"] == "fs" and trivy["commit_sha"]:
             ref = f"{ref}@{trivy['commit_sha'][:7]}"
         packages = (
@@ -290,8 +298,11 @@ def truncate_summary(text: str, run_url: str | None) -> str:
         f"1 MiB. The whole `summary.md` is in {where}.\n"
     )
     close = "</details>\n"
-    room = STEP_SUMMARY_LIMIT_BYTES - len(note.encode("utf-8")) - 2 * len(close)
-    kept = data[:room].decode("utf-8", errors="ignore")
-    kept = kept[: kept.rfind("\n") + 1]
-    open_blocks = kept.count("<details") - kept.count("</details>")
-    return kept + close * max(open_blocks, 0) + note
+    room = STEP_SUMMARY_LIMIT_BYTES - len(note.encode("utf-8"))
+    while True:
+        kept = data[:room].decode("utf-8", errors="ignore")
+        kept = kept[: kept.rfind("\n") + 1]
+        closing = close * max(kept.count("<details") - kept.count("</details>"), 0)
+        if len((kept + closing + note).encode("utf-8")) <= STEP_SUMMARY_LIMIT_BYTES:
+            return kept + closing + note
+        room -= len(close)

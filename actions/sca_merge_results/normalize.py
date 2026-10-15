@@ -251,17 +251,18 @@ def normalize_osv(
                 None,
             )
             rating = {"MODERATE": "MEDIUM"}.get(rating, rating)
-            fixed = next(
-                (
+            # fixes of every branch (ECOSYSTEM/SEMVER ranges; GIT ranges hold commits)
+            fixed = ", ".join(
+                dict.fromkeys(
                     event["fixed"]
                     for v in members
                     for affected in v.get("affected", [])
                     if affected.get("package", {}).get("name") == name
                     for rng in affected.get("ranges", [])
+                    if rng.get("type") in ("ECOSYSTEM", "SEMVER")
                     for event in rng.get("events", [])
                     if "fixed" in event
-                ),
-                "",
+                )
             )
             first = members[0] if members else {}
             add_finding(

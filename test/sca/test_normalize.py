@@ -201,7 +201,12 @@ def osv_native(
         "affected": [
             {
                 "package": {"name": "a"},
-                "ranges": [{"events": [{"introduced": "0"}, {"fixed": "1.5"}]}],
+                "ranges": [
+                    {
+                        "type": "ECOSYSTEM",
+                        "events": [{"introduced": "0"}, {"fixed": "1.5"}],
+                    }
+                ],
             }
         ],
     }
@@ -262,3 +267,23 @@ def test_trivy_and_osv_rows_of_one_vulnerability_share_the_key_fields():
     (osv_row,) = findings.values()
     key = ("id", "pkg", "version")
     assert [trivy_rows[0][k] for k in key] == [osv_row[k] for k in key]
+
+
+def osv_fixed(*ranges):
+    native = osv_native()
+    affected = native["results"][0]["packages"][0]["vulnerabilities"][0]["affected"]
+    affected[0]["ranges"] = [
+        {"type": t, "events": [{"fixed": f} for f in fixed]} for t, *fixed in ranges
+    ]
+    findings = {}
+    normalize_osv("t", native, findings, {})
+    return next(iter(findings.values()))["fixed_version"]
+
+
+def test_osv_fixed_version_skips_git_ranges():
+    assert osv_fixed(("GIT", "0123abc"), ("SEMVER", "1.5")) == "1.5"
+    assert osv_fixed(("GIT", "0123abc")) == ""
+
+
+def test_osv_fixed_version_lists_every_branch_once():
+    assert osv_fixed(("ECOSYSTEM", "1.5"), ("SEMVER", "2.1", "1.5")) == "1.5, 2.1"

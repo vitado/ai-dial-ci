@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from merge_results import main, run_merge
+from merge_results import count_packages, main, run_merge
 
 DB = {"vulnerability_db_updated_at": "2026-10-13T06:41:11Z", "java_db_updated_at": None}
 
@@ -245,3 +245,14 @@ def test_main_appends_the_summary_and_writes_the_failed_count(tmp_path, monkeypa
     main(argv)
     assert output.read_text() == "failed-count=1\n"
     assert "# SCA · o/app" in summary.read_text(encoding="utf-8")
+
+
+def test_a_package_of_two_ecosystems_counts_twice():
+    pkg = {"Name": "a", "Version": "1"}
+    results = [{"Type": t, "Packages": [pkg]} for t in ("npm", "pip")]
+    assert count_packages("trivy", {"Results": results}) == 2
+    entry = {"package": {"name": "a", "version": "1"}}
+    packages = [
+        {"package": {**entry["package"], "ecosystem": e}} for e in ("npm", "PyPI")
+    ]
+    assert count_packages("osv", {"results": [{"packages": packages}]}) == 2

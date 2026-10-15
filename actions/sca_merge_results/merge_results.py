@@ -91,13 +91,15 @@ def load_target_result(
 
 
 def count_packages(scanner: str, native: Mapping[str, Any]) -> int:
-    """Distinct packages (name and version) the scanner looked at; 0 is suspicious."""
+    """Distinct packages (ecosystem, name, version) the scanner looked at; 0 is
+    suspicious.
+    """
     if scanner == "osv":
         packages = [p["package"] for r in native["results"] for p in r["packages"]]
-        return len({(p["name"], p["version"]) for p in packages})
+        return len({(p["ecosystem"], p["name"], p["version"]) for p in packages})
     return len(
         {
-            (p.get("Name"), p.get("Version"))
+            (result.get("Type"), p.get("Name"), p.get("Version"))
             for result in native.get("Results") or []
             for p in result.get("Packages") or []
         }

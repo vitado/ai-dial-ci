@@ -11,21 +11,6 @@ inputs:
   images:
     description: Image names without registry, one per line (e.g. epam/ai-dial-chat). Empty means source scan only
     default: ""
-  scan-source:
-    description: Whether to include the source (filesystem) target
-    default: "true"
-  scan-images:
-    description: Whether to include the image targets
-    default: "true"
-  scan-release-source:
-    description: Whether to include the source (filesystem) target of the latest release (needs scan-source). It works without images, too
-    default: "true"
-  osv-enabled:
-    description: Whether to add an OSV twin of every Trivy target (the packages of the Trivy target are also checked against OSV)
-    default: "true"
-  targets:
-    description: Scan only the targets whose id matches one of these patterns (comma- or newline-separated; `*` and `?` work, e.g. `source-*` or `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all targets. A filtered run is a partial one
-    default: ""
   github-token:
     description: Token for the GitHub API and for authenticating to ghcr.io
     default: ${{ github.token }}
@@ -60,11 +45,6 @@ runs:
         REPOSITORY: ${{ inputs.repository }}
         REGISTRY: ${{ inputs.registry }}
         IMAGES: ${{ inputs.images }}
-        SCAN_SOURCE: ${{ inputs.scan-source }}
-        SCAN_IMAGES: ${{ inputs.scan-images }}
-        SCAN_RELEASE_SOURCE: ${{ inputs.scan-release-source }}
-        OSV_ENABLED: ${{ inputs.osv-enabled }}
-        TARGETS: ${{ inputs.targets }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}

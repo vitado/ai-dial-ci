@@ -202,8 +202,6 @@ def run_merge(
         "run_id": doc["run_id"],
         "run_url": doc["run_url"],
         "generated_utc": generated_utc,
-        "run_kind": doc["run_kind"],
-        "run_kind_reasons": doc["run_kind_reasons"],
         "tools": tools,
         "targets": entries,
         "findings": list(findings.values()),

@@ -78,8 +78,6 @@ class Run:
                     "commit_sha": "0123456789abcdef",
                     "run_id": "1",
                     "run_url": "https://example.test/run/1",
-                    "run_kind": "full",
-                    "run_kind_reasons": [],
                     "targets": targets,
                 }
             )

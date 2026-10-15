@@ -12,7 +12,6 @@ network.
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -296,67 +295,29 @@ def check_unique_ids(targets: Sequence[Mapping[str, Any]]) -> None:
         seen.add(identity)
 
 
-def filter_targets(
-    targets: Sequence[dict[str, Any]], patterns: Sequence[str]
-) -> list[dict[str, Any]]:
-    """Keep the targets whose id matches a pattern (``fnmatch``: ``*``, ``?``,
-    ``[...]``, case-sensitive). A pattern that matches nothing is an error: a typo
-    must not silently scan nothing.
-    """
-    if not patterns:
-        return list(targets)
-
-    def matches(target: Mapping[str, Any], pattern: str) -> bool:
-        return fnmatch.fnmatchcase(target["id"], pattern)
-
-    unmatched = [p for p in patterns if not any(matches(t, p) for t in targets)]
-    if unmatched:
-        raise ResolveError(
-            f"targets: no target matches {', '.join(repr(p) for p in unmatched)}; "
-            f"the targets of this repository are: "
-            f"{', '.join(t['id'] for t in targets) or 'none'}"
-        )
-    return [t for t in targets if any(matches(t, p) for p in patterns)]
-
-
 @dataclass(frozen=True)
 class Inputs:
     """The inputs of the action (see ``action.yml``) and the calling workflow run."""
 
     repository: str
     caller_repository: str
-    ref_name: str
     registry: str = GHCR_HOST
     images: Sequence[str] = ()
-    scan_source: bool = True
-    scan_images: bool = True
-    scan_release_source: bool = True
-    osv_enabled: bool = True
-    targets_filter: str = ""
     token: str | None = None
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> Inputs:
         """Read the inputs, which the action passes as environment variables
-        (``REPOSITORY``, ``SCAN_SOURCE``, ...)."""
+        (``REPOSITORY``, ``IMAGES``, ...)."""
         repository = environ["REPOSITORY"]
         if not REPOSITORY_NAME.fullmatch(repository):
             raise ResolveError(f"repository must be 'owner/name', got {repository!r}")
 
-        def flag(name: str) -> bool:
-            return environ.get(name, "true") == "true"
-
         return cls(
             repository=repository,
             caller_repository=environ["GITHUB_REPOSITORY"],
-            ref_name=environ["GITHUB_REF_NAME"],
             registry=environ.get("REGISTRY") or GHCR_HOST,
             images=tuple(parse_images(environ.get("IMAGES", ""))),
-            scan_source=flag("SCAN_SOURCE"),
-            scan_images=flag("SCAN_IMAGES"),
-            scan_release_source=flag("SCAN_RELEASE_SOURCE"),
-            osv_enabled=flag("OSV_ENABLED"),
-            targets_filter=environ.get("TARGETS", ""),
             token=environ.get("GITHUB_TOKEN") or None,
         )
 
@@ -367,14 +328,10 @@ def resolve_targets(
     registry: RegistryClient,
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Build the targets.json document. Raises ResolveError without a snapshot (or
-    for a ``targets_filter`` pattern that matches no target).
+    """Build the targets.json document. Raises ResolveError without a snapshot.
 
     One release is scanned (``resolve_release``): its source and, in every image, its
-    tag. ``targets_filter`` (patterns separated by commas or newlines) keeps only the
-    targets whose id matches one of them; the OSV twins follow their Trivy targets.
-    The run is ``partial`` (``run_kind``) if the filter or a switch narrows the scan,
-    or if the run is not on the default branch of the calling repository.
+    tag. Every Trivy target has an OSV twin.
 
     Order: the development source, the release source, then the targets of each
     image in ``images`` order.
@@ -383,42 +340,15 @@ def resolve_targets(
     default_branch = github.default_branch(repository)
     commit_sha = github.commit_sha(repository, default_branch)
 
-    with_images = inputs.scan_images and bool(inputs.images)
-    with_release_source = inputs.scan_source and inputs.scan_release_source
-    release = Release(None)
-    if with_images or with_release_source:
-        release = resolve_release(github, repository)
-
-    targets: list[dict[str, Any]] = []
-    if inputs.scan_source:
-        targets.append(
-            make_target("pending", git_ref=default_branch, commit_sha=commit_sha)
-        )
-    if with_release_source:
-        targets.append(resolve_release_source_target(github, repository, release))
-    if with_images:
-        for image in inputs.images:
-            targets.extend(resolve_image_targets(registry, image, release))
-    patterns = [p.strip() for p in re.split(r"[,\n]", inputs.targets_filter)]
-    patterns = [p for p in patterns if p]
-    targets = filter_targets(targets, patterns)
-    default_branch_of_caller = github.default_branch(inputs.caller_repository)
-    narrowing = [
-        (bool(patterns), f"targets filter: {', '.join(patterns)}"),
-        (not inputs.scan_source, "scan-source is off"),
-        (not inputs.scan_images, "scan-images is off"),
-        (not inputs.scan_release_source, "scan-release-source is off"),
-        (not inputs.osv_enabled, "osv-enabled is off"),
-        (
-            inputs.ref_name != default_branch_of_caller,
-            f"not the default branch ({inputs.ref_name}, "
-            f"the default is {default_branch_of_caller})",
-        ),
+    release = resolve_release(github, repository)
+    targets: list[dict[str, Any]] = [
+        make_target("pending", git_ref=default_branch, commit_sha=commit_sha),
+        resolve_release_source_target(github, repository, release),
     ]
-    kind_reasons = [reason for narrows, reason in narrowing if narrows]
-    if inputs.osv_enabled:
-        # After all trivy targets, in the same order
-        targets.extend([make_osv_target(t) for t in targets])
+    for image in inputs.images:
+        targets.extend(resolve_image_targets(registry, image, release))
+    # After all trivy targets, in the same order
+    targets.extend([make_osv_target(t) for t in targets])
     check_unique_ids(targets)
 
     run_id = environ["GITHUB_RUN_ID"]
@@ -427,8 +357,6 @@ def resolve_targets(
         "repo": repository,
         "default_branch": default_branch,
         "commit_sha": commit_sha,
-        "run_kind": "partial" if kind_reasons else "full",
-        "run_kind_reasons": kind_reasons,
         "run_id": run_id,
         "run_url": f"{run_url}/actions/runs/{run_id}",
         "targets": targets,
@@ -497,8 +425,6 @@ def run(environ: Mapping[str, str], runner: Runner | None = None) -> None:
         f"Repository {targets_doc['repo']} @ {targets_doc['default_branch']} "
         f"({targets_doc['commit_sha']})"
     )
-    reasons = "; ".join(targets_doc["run_kind_reasons"])
-    print(f"Run kind: {targets_doc['run_kind']}" + (f" ({reasons})" if reasons else ""))
     print(render_table(targets_doc["targets"]))
     for line in annotations(targets_doc["targets"]):
         print(line)

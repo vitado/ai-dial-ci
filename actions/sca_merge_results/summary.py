@@ -201,7 +201,6 @@ def header(report: Mapping[str, Any]) -> list[str]:
     parts = [
         f"commit `{(report['commit_sha'] or '')[:7]}`",
         f"default branch `{report['default_branch']}`",
-        f"run_kind `{report['run_kind']}`",
         f"Trivy {tools['trivy']} (DB {short_time(tools['trivy_db'])}, "
         f"Java DB {short_time(tools['trivy_java_db'])})",
         f"osv-scanner {tools['osv_scanner']} (queried {tools['osv_queried_at'] or 'n/a'})",

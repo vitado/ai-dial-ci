@@ -1250,11 +1250,11 @@ Targets:
 | Target id                 | What is scanned                                                                    |
 | ------------------------- | ---------------------------------------------------------------------------------- |
 | `source-<default branch>` | Source of the default branch (`trivy fs`)                                          |
-| `source-<release tag>`    | Source at the git tag of the latest GitHub release (`scan-release-source`)         |
+| `source-<release tag>`    | Source at the git tag of the latest GitHub release                                 |
 | `<image>-development`     | Image tag `development` of each image in `images`                                  |
 | `<image>-<release tag>`   | Image tag of the latest release (the registry tag may lack the `v` of the git tag) |
 
-[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/) (`osv-enabled`); OS packages are not. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
+[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/); OS packages are not. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
 
 `schedule` and `workflow_dispatch` triggers work from the default branch only, so the calling workflow must be there. Pin the workflow to a release tag, and give each repository its own cron minute and hour so the scans do not all start at once.
 
@@ -1283,25 +1283,20 @@ jobs:
 
 Inputs:
 
-| Input                      | Type    | Default                      | Description                                                                                                                                                            |
-| -------------------------- | ------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `images`                   | string  | `""`                         | Image names without registry, one per line (e.g. `epam/ai-dial-chat`). Empty means source scan only                                                                    |
-| `registry`                 | string  | `ghcr.io`                    | Registry the images are pulled from. Login with `GITHUB_TOKEN` is done for `ghcr.io` only; other registries are accessed anonymously                                   |
-| `repository`               | string  | calling repo                 | Repository (`owner/name`) to scan and to resolve the release of. Set it when the workflow runs in a fork                                                               |
-| `scan-source`              | boolean | `true`                       | Scan the source of the default branch                                                                                                                                  |
-| `scan-release-source`      | boolean | `true`                       | Scan the source at the latest release tag too (needs `scan-source`)                                                                                                    |
-| `scan-images`              | boolean | `true`                       | Scan the images                                                                                                                                                        |
-| `targets`                  | string  | `""`                         | Scan only targets whose id matches one of these patterns (comma- or newline-separated, `*` and `?` work, e.g. `source-*`). A pattern that matches nothing is an error |
-| `osv-enabled`              | boolean | `true`                       | Also check the language packages against OSV                                                                                                                           |
-| `java-version`             | string  | `21`                         | Java version for lockfile generation (Gradle repositories only)                                                                                                        |
-| `java-distribution`        | string  | `temurin`                    | Java distribution                                                                                                                                                      |
-| `trivy-version`            | string  | `v0.75.0`                    | Trivy release tag                                                                                                                                                      |
-| `trivy-db-repository`      | string  | mirrors of `trivy-db:2`      | Trivy DB repositories, comma-separated, tried in order                                                                                                                 |
-| `trivy-java-db-repository` | string  | mirrors of `trivy-java-db:1` | Trivy Java DB repositories, comma-separated, tried in order                                                                                                            |
-| `retention-days`           | number  | `90`                         | Retention of the `sca-report` artifact                                                                                                                                 |
-| `runs-on`                  | string  | `["ubuntu-24.04"]`           | JSON-encoded list of runner labels for all jobs                                                                                                                        |
+| Input                      | Type   | Default                      | Description                                                                                                                          |
+| -------------------------- | ------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `images`                   | string | `""`                         | Image names without registry, one per line (e.g. `epam/ai-dial-chat`). Empty means source scan only                                  |
+| `registry`                 | string | `ghcr.io`                    | Registry the images are pulled from. Login with `GITHUB_TOKEN` is done for `ghcr.io` only; other registries are accessed anonymously |
+| `repository`               | string | calling repo                 | Repository (`owner/name`) to scan and to resolve the release of. Set it when the workflow runs in a fork                             |
+| `java-version`             | string | `21`                         | Java version for lockfile generation (Gradle repositories only)                                                                      |
+| `java-distribution`        | string | `temurin`                    | Java distribution                                                                                                                    |
+| `trivy-version`            | string | `v0.75.0`                    | Trivy release tag                                                                                                                    |
+| `trivy-db-repository`      | string | mirrors of `trivy-db:2`      | Trivy DB repositories, comma-separated, tried in order                                                                               |
+| `trivy-java-db-repository` | string | mirrors of `trivy-java-db:1` | Trivy Java DB repositories, comma-separated, tried in order                                                                          |
+| `retention-days`           | number | `90`                         | Retention of the `sca-report` artifact                                                                                               |
+| `runs-on`                  | string | `["ubuntu-24.04"]`           | JSON-encoded list of runner labels for all jobs                                                                                      |
 
-A run is `partial` (`run_kind` in the report) if `targets` or any `scan-*` / `osv-enabled` switch narrows it, or if it does not run on the default branch.
+A run always scans every target. To scan again after a failure, use "Re-run failed jobs".
 
 Permissions: `contents: read` and `packages: read` for the calling workflow, as in the example. No secrets are needed: the workflow uses `GITHUB_TOKEN` to read the repository, resolve the release and pull images from GHCR.
 
@@ -1326,7 +1321,7 @@ The job summary (`summary.md`) has the run header (commit, Trivy and osv-scanner
 The `sca-report` artifact holds:
 
 * `summary.md`;
-* `report.json` (`schema_version: 2`): `repo`, `commit_sha`, `default_branch`, `run_id`, `run_url`, `generated_utc`, `run_kind`, `run_kind_reasons`, `tools` (Trivy, DB and osv-scanner versions and dates), `targets[]` and `findings[]`. A target has `id`, `scanner`, `kind` (`fs`/`image`), `ref`, `commit_sha`, `image`, `image_digest`, `status`, `reason` and `packages_scanned`. A finding has `target`, `scanner`, `id`, `aliases`, `pkg`, `version`, `class` (`lang`/`os`), `severity`, `fixed_version`, `title`, `url`, `locations`, `chain`, `relationship` and `dev`;
+* `report.json` (`schema_version: 2`): `repo`, `commit_sha`, `default_branch`, `run_id`, `run_url`, `generated_utc`, `tools` (Trivy, DB and osv-scanner versions and dates), `targets[]` and `findings[]`. A target has `id`, `scanner`, `kind` (`fs`/`image`), `ref`, `commit_sha`, `image`, `image_digest`, `status`, `reason` and `packages_scanned`. A finding has `target`, `scanner`, `id`, `aliases`, `pkg`, `version`, `class` (`lang`/`os`), `severity`, `fixed_version`, `title`, `url`, `locations`, `chain`, `relationship` and `dev`;
 * `_native/trivy/` and `_native/osv/`: the unmodified per-target reports (JSON, and a table for Trivy).
 
 ##### Reading the results

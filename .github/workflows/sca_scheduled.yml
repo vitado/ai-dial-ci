@@ -35,30 +35,10 @@ on:
         type: string
         description: Trivy Java DB repositories (comma-separated, tried in order)
         default: "mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
-      osv-enabled:
-        type: boolean
-        description: Also check the language packages found by Trivy against OSV (osv.dev). Its findings are merged into the report
-        default: true
       retention-days:
         type: number
         description: Retention period (days) of the resulting `sca-report` artifact
         default: 90
-      targets:
-        type: string
-        description: "Scan only the targets whose id matches one of these patterns (comma- or newline-separated, `*` and `?` work: `source-*`, `ai-dial-chat-1.1.14`). A pattern that matches no target is an error. Empty means all. A filtered run is a partial one"
-        default: ""
-      scan-source:
-        type: boolean
-        description: Scan the source code (default branch)
-        default: true
-      scan-images:
-        type: boolean
-        description: Scan the container images
-        default: true
-      scan-release-source:
-        type: boolean
-        description: Scan the source code of the latest release (git tag), too; needs scan-source. Gives release findings their dependency paths and covers repositories without images
-        default: true
       runs-on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
@@ -81,11 +61,6 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           registry: ${{ inputs.registry }}
           images: ${{ inputs.images }}
-          scan-source: ${{ inputs.scan-source }}
-          scan-images: ${{ inputs.scan-images }}
-          scan-release-source: ${{ inputs.scan-release-source }}
-          osv-enabled: ${{ inputs.osv-enabled }}
-          targets: ${{ inputs.targets }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -98,7 +73,6 @@ jobs:
   # the DB each. The snapshot (about 1 GiB) is an artifact of the run that expires after a day, not a cache entry: a
   # cache entry of that size, unique per run, would evict the caches of the repositories from the 10 GiB quota
   trivy-db:
-    if: ${{ inputs.scan-source || inputs.scan-images }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
@@ -313,7 +287,7 @@ jobs:
   # if no Trivy target was scanned
   osv:
     needs: [targets, trivy]
-    if: ${{ !cancelled() && needs.targets.result == 'success' && inputs.osv-enabled && needs.targets.outputs.matrix != '[]' }}
+    if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.matrix != '[]' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read

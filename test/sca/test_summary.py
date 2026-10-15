@@ -65,8 +65,6 @@ def report(targets, findings):
         "run_id": "7",
         "run_url": "https://example.test/run/7",
         "generated_utc": "2026-10-14T00:00:00Z",
-        "run_kind": "full",
-        "run_kind_reasons": [],
         "tools": {
             "trivy": "0.75.0",
             "trivy_db": "2026-10-13T06:41:11.5Z",

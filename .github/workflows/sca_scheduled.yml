@@ -43,6 +43,10 @@ on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
         default: '["ubuntu-24.04"]'
+      osv-image-scan:
+        type: boolean
+        description: Whether the OSV job also runs the direct osv-scanner image scan for image targets (OS packages). Turn off per repository where the image does not fit the runner disk; the OSV BOM query runs either way
+        default: true
 
 jobs:
   targets:
@@ -55,12 +59,13 @@ jobs:
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
-      - uses: epam/ai-dial-sec-sca/actions/sca_resolve_targets@v0.1.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_resolve_targets@v0.2.0
         id: targets
         with:
           repository: ${{ inputs.repository || github.repository }}
           registry: ${{ inputs.registry }}
           images: ${{ inputs.images }}
+          osv-image-scan: ${{ inputs.osv-image-scan }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -193,7 +198,7 @@ jobs:
       - name: Generate Gradle lockfiles
         id: lockfiles
         if: ${{ steps.stack.outputs.java == 'true' }}
-        uses: epam/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.1.0
+        uses: epam/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.2.0
         with:
           gpr-username: ${{ github.actor }}
           gpr-password: ${{ secrets.GITHUB_TOKEN }}
@@ -281,18 +286,22 @@ jobs:
           if-no-files-found: error
           overwrite: true # a re-run of the failed jobs uploads again
 
-  # OSV is asked (by osv-scanner, over a BOM that Trivy converts from its result) about the language packages Trivy
-  # found (OS packages are not queried), so it runs after the Trivy matrix. A broken query is a failed target like a
-  # failed Trivy scan; its findings are merged into the report by sca_merge_results. Nothing to query, and so no job,
-  # if no Trivy target was scanned
+  # OSV is asked (by osv-scanner, over a BOM that Trivy converts from its result) about the packages Trivy found, and
+  # an image target also gets the direct osv-scanner image scan, which reads the image's own package database and so
+  # asks OSV about its OS packages correctly, so it runs after the Trivy matrix. A broken query is a failed target
+  # like a failed Trivy scan; its findings are merged into the report by sca_merge_results. Nothing to query, and so
+  # no job, if no Trivy target was scanned
   osv:
     needs: [targets, trivy]
     if: ${{ !cancelled() && needs.targets.result == 'success' && needs.targets.outputs.matrix != '[]' }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     permissions:
       contents: read
-    # Normally a few minutes (osv-scanner queries OSV in batches); the job bound only stops an API that is up but crawling
-    timeout-minutes: 30
+      # the direct image scan pulls the image from ghcr.io through docker
+      packages: read
+    # BOM queries (a few minutes), plus pulling and scanning every image target sequentially; the bound only stops
+    # a service that is up but crawling
+    timeout-minutes: 60
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -304,7 +313,15 @@ jobs:
           pattern: sca-part-trivy-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-sec-sca/actions/sca_query_osv@v0.1.0
+      # The image scan of the osv targets pulls through docker; one login serves every target (the job has no matrix)
+      - name: Login to GitHub Container Registry
+        if: ${{ inputs.registry == 'ghcr.io' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: epam/ai-dial-sec-sca/actions/sca_query_osv@v0.2.0
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
@@ -335,7 +352,7 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-sec-sca/actions/sca_merge_results@v0.1.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_merge_results@v0.2.0
         id: merge
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json

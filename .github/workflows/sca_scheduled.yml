@@ -51,6 +51,14 @@ on:
         type: number
         description: How many newest minor release lines are scanned (one latest patch each), plus the newest release candidate if any
         default: 2
+      scan-tag:
+        type: string
+        description: Focus the run on this one git tag (its source and the tag in every image that publishes it) instead of the release set. A manual-run parameter
+        default: ""
+      force-image-scan:
+        type: boolean
+        description: On this one run, run the direct OSV image scan also where the repository has it off (osv-image-scan). A manual-run parameter; cannot disable what the repository has on
+        default: false
 
 jobs:
   targets:
@@ -63,14 +71,15 @@ jobs:
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
-      - uses: vitado/ai-dial-sec-sca/actions/sca_resolve_targets@v0.3.0
+      - uses: vitado/ai-dial-sec-sca/actions/sca_resolve_targets@v0.3.1
         id: targets
         with:
           repository: ${{ inputs.repository || github.repository }}
           registry: ${{ inputs.registry }}
           images: ${{ inputs.images }}
-          osv-image-scan: ${{ inputs.osv-image-scan }}
           release-lines: ${{ inputs.release-lines }}
+          scan-tag: ${{ inputs.scan-tag }}
+          osv-image-scan: ${{ inputs.osv-image-scan || inputs.force-image-scan }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets
@@ -203,7 +212,7 @@ jobs:
       - name: Generate Gradle lockfiles
         id: lockfiles
         if: ${{ steps.stack.outputs.java == 'true' }}
-        uses: vitado/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.2.0
+        uses: vitado/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.3.1
         with:
           gpr-username: ${{ github.actor }}
           gpr-password: ${{ secrets.GITHUB_TOKEN }}
@@ -326,7 +335,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: vitado/ai-dial-sec-sca/actions/sca_query_osv@v0.2.0
+      - uses: vitado/ai-dial-sec-sca/actions/sca_query_osv@v0.3.1
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
@@ -357,7 +366,7 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: vitado/ai-dial-sec-sca/actions/sca_merge_results@v0.2.0
+      - uses: vitado/ai-dial-sec-sca/actions/sca_merge_results@v0.3.1
         id: merge
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json

@@ -47,6 +47,10 @@ on:
         type: boolean
         description: Whether the OSV job also runs the direct osv-scanner image scan for image targets (OS packages). Turn off per repository where the image does not fit the runner disk; the OSV BOM query runs either way
         default: true
+      release-lines:
+        type: number
+        description: How many newest minor release lines are scanned (one latest patch each), plus the newest release candidate if any
+        default: 2
 
 jobs:
   targets:
@@ -59,13 +63,14 @@ jobs:
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
-      - uses: vitado/ai-dial-sec-sca/actions/sca_resolve_targets@v0.2.0
+      - uses: vitado/ai-dial-sec-sca/actions/sca_resolve_targets@v0.3.0
         id: targets
         with:
           repository: ${{ inputs.repository || github.repository }}
           registry: ${{ inputs.registry }}
           images: ${{ inputs.images }}
           osv-image-scan: ${{ inputs.osv-image-scan }}
+          release-lines: ${{ inputs.release-lines }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sca-part-targets

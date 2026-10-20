@@ -1273,6 +1273,22 @@ on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      scan-tag:
+        description: "Focus the run on this one git tag instead of the release set; empty = the full set"
+        type: string
+        default: ""
+      force-image-scan:
+        description: "On this one run, run the direct OSV image scan also where it is off for this repository"
+        type: boolean
+        default: false
+
+run-name: >-
+  SCA - ${{ github.event_name == 'schedule' && 'scheduled' || format('manual by {0}', github.triggering_actor) }}${{ inputs.scan-tag && format(' - tag {0}', inputs.scan-tag) || '' }}
+
+concurrency:
+  group: sca-scan
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -1285,6 +1301,8 @@ jobs:
       images: |
         epam/ai-dial-core
       java-version: "21"
+      scan-tag: ${{ inputs.scan-tag }}
+      force-image-scan: ${{ inputs.force-image-scan || false }}
 ```
 
 Inputs:

@@ -1249,14 +1249,18 @@ The scan logic (the actions that resolve targets, query OSV and merge results) l
 
 Targets:
 
-| Target id                 | What is scanned                                                                    |
-| ------------------------- | ---------------------------------------------------------------------------------- |
-| `source-<default branch>` | Source of the default branch (`trivy fs`)                                          |
-| `source-<release tag>`    | Source at the git tag of the latest GitHub release                                 |
-| `<image>-development`     | Image tag `development` of each image in `images`                                  |
-| `<image>-<release tag>`   | Image tag of the latest release (the registry tag may lack the `v` of the git tag) |
+| Target id                 | What is scanned                                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `source-<default branch>` | Source of the default branch (`trivy fs`)                                                                                |
+| `source-<release tag>`    | Source at the git tag of each release of the set: the newest patch of each of the `release-lines` newest minor lines, and the newest prerelease (candidate) |
+| `<image>-development`     | Image tag `development` of each image in `images`                                                                        |
+| `<image>-<release tag>`   | Image tag of each release of the set (the registry tag may lack the `v` of the git tag)                                  |
 
-[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/); an image target also gets a direct OSV image scan, which reads the image's own package database and so checks its OS packages against OSV too (a BOM cannot: OSV keys its records by the source package name). Both queries run for every image target, so a package either detector sees keeps its OSV check. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
+The release set comes from the flags of the GitHub releases: a stable is a release that is neither `prerelease` nor draft (drafts are ignored). A stable tag must be `X.Y.Z`; its minor line is `X.Y`, and the patch of a line is the stable published last. `release-lines` is 2 by default. A stable with another tag name belongs to no line and gets a skipped source target with the reason. An image that lacks a tag of the set gets a skipped target with the reason. A repository without releases gets the default branch targets and a skipped release target stating that there is no GitHub release.
+
+A manual run with `scan-tag` is a focus run: it scans only that git tag (its source and the tag in every image that publishes it), not `development` and not the release set. The report header and the run name state the narrowing. A tag that cannot be resolved fails the run.
+
+[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/); an image target also gets a direct OSV image scan, which reads the image's own package database and so checks its OS packages against OSV too (a BOM cannot: OSV keys its records by the source package name). Both queries run for every image target, so a package either detector sees keeps its OSV check. The direct image scan is off where `osv-image-scan` is false, unless a manual run sets `force-image-scan` (it cannot turn off what the repository has on). For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
 
 `schedule` and `workflow_dispatch` triggers work from the default branch only, so the calling workflow must be there. Pin the workflow to a release tag, and give each repository its own cron minute and hour so the scans do not all start at once.
 
@@ -1299,7 +1303,7 @@ Inputs:
 | `osv-image-scan`            | boolean | `true`                     | Direct OSV image scan of image targets (their OS packages). Turn off for a repository whose image does not fit the runner disk (about 3x the image size is needed); the OSV BOM query runs either way and the report states the exclusion |
 | `runs-on`                  | string | `["ubuntu-24.04"]`           | JSON-encoded list of runner labels for all jobs. The default runners have docker; the OSV image scan needs it                      |
 
-A run always scans every target. To scan again after a failure, use "Re-run failed jobs".
+A run scans every target of its set. To scan again after a failure, use "Re-run failed jobs".
 
 Permissions: `contents: read` and `packages: read` for the calling workflow, as in the example. No secrets are needed: the workflow uses `GITHUB_TOKEN` to read the repository, resolve the release and pull images from GHCR.
 

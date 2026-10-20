@@ -1243,7 +1243,7 @@ misconfiguration:
 
 #### SCA scheduled scan
 
-The scan logic (the actions that resolve targets, query OSV and merge results) lives in [epam/ai-dial-sec-sca](https://github.com/epam/ai-dial-sec-sca); this workflow only orchestrates it.
+The scan logic (the actions that resolve targets, query OSV and merge results) lives in [ai-dial-sec-sca](https://github.com/vitado/ai-dial-sec-sca); this workflow only orchestrates it.
 
 `sca_scheduled.yml` looks for known vulnerabilities in what a repository publishes. It is a report, not a gate: nothing is ignored (no `.trivyignore`; unfixed vulnerabilities, all severities and dev dependencies are included) and findings never fail the run. The run fails only if a target could not be scanned.
 
@@ -1256,7 +1256,7 @@ Targets:
 | `<image>-development`     | Image tag `development` of each image in `images`                                  |
 | `<image>-<release tag>`   | Image tag of the latest release (the registry tag may lack the `v` of the git tag) |
 
-[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/); OS packages are not. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
+[Trivy](https://trivy.dev/) scans every target. The language packages it found are then checked against [OSV](https://osv.dev/); an image target also gets a direct OSV image scan, which reads the image's own package database and so checks its OS packages against OSV too (a BOM cannot: OSV keys its records by the source package name). Both queries run for every image target, so a package either detector sees keeps its OSV check. For Gradle repositories (`gradlew` and `build.gradle(.kts)` in the root) lockfiles are generated on the fly, the repository files are not modified. All targets of a run use one Trivy DB snapshot.
 
 `schedule` and `workflow_dispatch` triggers work from the default branch only, so the calling workflow must be there. Pin the workflow to a release tag, and give each repository its own cron minute and hour so the scans do not all start at once.
 
@@ -1296,7 +1296,8 @@ Inputs:
 | `trivy-db-repository`      | string | mirrors of `trivy-db:2`      | Trivy DB repositories, comma-separated, tried in order                                                                               |
 | `trivy-java-db-repository` | string | mirrors of `trivy-java-db:1` | Trivy Java DB repositories, comma-separated, tried in order                                                                          |
 | `retention-days`           | number | `90`                         | Retention of the `sca-report` artifact                                                                                               |
-| `runs-on`                  | string | `["ubuntu-24.04"]`           | JSON-encoded list of runner labels for all jobs                                                                                      |
+| `osv-image-scan`            | boolean | `true`                     | Direct OSV image scan of image targets (their OS packages). Turn off for a repository whose image does not fit the runner disk (about 3x the image size is needed); the OSV BOM query runs either way and the report states the exclusion |
+| `runs-on`                  | string | `["ubuntu-24.04"]`           | JSON-encoded list of runner labels for all jobs. The default runners have docker; the OSV image scan needs it                      |
 
 A run always scans every target. To scan again after a failure, use "Re-run failed jobs".
 
@@ -1318,7 +1319,7 @@ Paths are relative to the repository root. The scan profile (severity, ignore fi
 
 ##### Outputs
 
-The job summary (`summary.md`) has the run header (commit, Trivy and osv-scanner versions, DB dates), a results table with one row per target, then library and base image (OS) packages grouped by severity. One row is one package version with its vulnerabilities, `Fixed` versions, dependency `Chain`, `Where` it is declared, the `Targets` it is in and the `Scanner` (T for Trivy, O for OSV). A summary over 1 MiB is cut at a line, with a note.
+The job summary (`summary.md`) has the run header (commit, Trivy and osv-scanner versions, DB dates), a results table with one row per target, then library and base image (OS) packages grouped by severity. One row is one package with its vulnerabilities, `Fixed` versions, dependency `Chain`, `Where` it is declared, the `Targets` it is in and the `Scanner` (T for Trivy, O for OSV). A library row is a package version; an OS package is one row whatever the scanners' version spellings (dpkg epochs and revisions differ between scanners, one spelling is shown). A summary over 1 MiB is cut at a line, with a note.
 
 The `sca-report` artifact holds:
 
@@ -1330,8 +1331,8 @@ The `sca-report` artifact holds:
 
 Target status in `report.json` and in the `Scan` column of the summary:
 
-* `ok`: scanned. Zero vulnerabilities in an `ok` target is a clean result; check `packages_scanned` (a warning is printed if it is 0).
-* `failed`: not scanned, or the result is missing or invalid; `reason` says why. A failed target is never shown as clean (its counts are empty), the error is annotated, and the run fails after the artifact is uploaded. A failed OSV check of an `ok` Trivy target is shown as `ok · OSV failed: <reason>`.
+* `ok`: scanned. Zero vulnerabilities in an `ok` target is a clean result; check `packages_scanned` (a warning is printed if it is 0). An `ok` OSV target can carry a `reason`: an exclusion stated, not silence (the OSV image scan disabled for the repository - the OS packages of the image are then not checked by OSV, the language packages are). Shown as `ok · OSV ok (reason)`.
+* `failed`: not scanned, or the result is missing or invalid; `reason` says why. A failed target is never shown as clean (its counts are empty), the error is annotated, and the run fails after the artifact is uploaded. A failed OSV check of an `ok` Trivy target is shown as `ok · OSV failed: <reason>` (a failed OSV image scan fails the OSV target even though its BOM query succeeded).
 * `not_applicable`: nothing to scan, for example the repository has no release or the image has no `development` tag.
 
 `severity` and `fixed_version` are what the scanner reports, with no version comparison. For OSV the severity is the rating of the advisory database, else the CVSS bucket, else `UNKNOWN`. The `Fixed` column lists the fix versions the scanner knows, comma-separated and for every branch the advisory lists, so a version there may belong to another branch than the installed one. An empty `Fixed` means no fix is known. In the summary, findings of both scanners about one vulnerability (same id or a shared alias) are shown once, under the CVE id when known; `report.json` keeps one finding per target and scanner.

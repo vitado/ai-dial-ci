@@ -71,7 +71,7 @@ jobs:
     # The GitHub API and the registry (gh and oras retry on their own); the bound only stops a service that is up but crawling
     timeout-minutes: 15
     steps:
-      - uses: epam/ai-dial-sec-sca/actions/sca_resolve_targets@v0.4.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_resolve_targets@v0.4.1
         id: targets
         with:
           repository: ${{ inputs.repository || github.repository }}
@@ -102,7 +102,7 @@ jobs:
     # bound only stops a mirror that is up but crawling
     timeout-minutes: 20
     steps:
-      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
           version: ${{ inputs.trivy-version }}
           cache: true # the binary is cached under a version key; this is the only job that saves it
@@ -179,7 +179,7 @@ jobs:
         with:
           name: sca-trivy-db
           path: ${{ runner.temp }}/trivy-cache
-      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         id: setup
         with:
           version: ${{ inputs.trivy-version }}
@@ -213,7 +213,7 @@ jobs:
       - name: Generate Gradle lockfiles
         id: lockfiles
         if: ${{ steps.stack.outputs.java == 'true' }}
-        uses: epam/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.4.0
+        uses: epam/ai-dial-sec-sca/actions/generate_gradle_lockfiles@v0.4.1
         with:
           gpr-username: ${{ github.actor }}
           gpr-password: ${{ secrets.GITHUB_TOKEN }}
@@ -338,7 +338,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: epam/ai-dial-sec-sca/actions/sca_query_osv@v0.4.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_query_osv@v0.4.1
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json
           parts-dir: ${{ runner.temp }}/sca-parts
@@ -369,7 +369,7 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-sec-sca/actions/sca_merge_results@v0.4.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_merge_results@v0.4.1
         id: merge
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json

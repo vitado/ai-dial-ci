@@ -369,7 +369,7 @@ jobs:
           pattern: sca-part-*
           merge-multiple: true
           path: ${{ runner.temp }}/sca-parts
-      - uses: epam/ai-dial-sec-sca/actions/sca_merge_results@v0.5.0
+      - uses: vitado/sca-sec-sca-lab/actions/sca_merge_results@feat/counts-versions
         id: merge
         with:
           targets-file: ${{ runner.temp }}/sca-parts/targets.json

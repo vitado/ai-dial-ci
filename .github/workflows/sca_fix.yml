@@ -159,6 +159,7 @@ jobs:
           ref: ${{ matrix.line.branch }}
           token: ${{ secrets.token || github.token }}
           persist-credentials: true # the push of the fix branch
+          lfs: true # as the scan: Gradle wrapper jars of some repositories are LFS objects
       - name: Detect Gradle build
         id: stack
         run: |

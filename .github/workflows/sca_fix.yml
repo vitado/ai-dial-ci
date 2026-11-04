@@ -47,10 +47,17 @@ on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
         default: '["ubuntu-24.04"]'
+      app-id:
+        type: string
+        description: GitHub App id; with the secret app-private-key the push and the pull request use an app installation token
+        default: ""
     secrets:
       token:
         required: false
-        description: Token for the push and the pull request (a pull request opened with the default token does not start the repository's pull request workflows)
+        description: Token for the push and the pull request when no GitHub App is given (a pull request opened with the default token does not start the repository's pull request workflows)
+      app-private-key:
+        required: false
+        description: Private key of the GitHub App given in app-id
 
 env:
   # Dependabot CLI release and the images it starts, pinned (looked up 2026-11-02). The updater of each package manager
@@ -148,7 +155,21 @@ jobs:
     env:
       TRIVY_DB_REPOSITORY: ${{ inputs.trivy-db-repository }}
       TRIVY_JAVA_DB_REPOSITORY: ${{ inputs.trivy-java-db-repository }}
+      # Secrets are not available in `if:`, so the presence of the key is kept in an env flag
+      APP_KEY_GIVEN: ${{ secrets.app-private-key != '' }}
     steps:
+      # The app token is used for the push and the pull request: a pull request opened with it starts the repository's pull
+      # request workflows and needs no repository setting. Without owner and repositories the token covers the current
+      # repository only. The plan job keeps the other token: the artifact download needs `actions: read`, which the app lacks
+      - name: Create the GitHub App token
+        id: app-token
+        if: ${{ inputs.app-id != '' && env.APP_KEY_GIVEN == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fix-plan
@@ -157,7 +178,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.line.branch }}
-          token: ${{ secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
           persist-credentials: true # the push of the fix branch
           lfs: true # as the scan: Gradle wrapper jars of some repositories are LFS objects
       - name: Detect Gradle build
@@ -212,7 +233,7 @@ jobs:
           proxy-image: ${{ env.DEPENDABOT_PROXY_IMAGE }}
           lockfile-command: ${{ steps.engine.outputs.lockfile-command }}
           docker-build-args: ${{ inputs.docker-build-args }}
-          token: ${{ secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
       - name: Push the fix branch and open or update the pull request
         id: publish
         uses: vitado/sca-sec-sca-lab/actions/sca_fix_apply@feat/fix-plan
@@ -223,7 +244,7 @@ jobs:
           tree: ${{ github.workspace }}
           output-dir: ${{ runner.temp }}/fix-result
           dry-run: ${{ inputs.dry-run }}
-          token: ${{ secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
       # After the publish step, also when it failed: the result is what the summary job reads
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}

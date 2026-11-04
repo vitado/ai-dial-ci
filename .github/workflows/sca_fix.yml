@@ -39,6 +39,10 @@ on:
         type: string
         description: Docker build arguments of the image rescan, one NAME=value per line
         default: ""
+      dependabot-timeout-minutes:
+        type: number
+        description: Time limit of one Dependabot job; a timeout counts as "Dependabot could not" and an npm item goes on to the override step
+        default: 8
       dry-run:
         type: boolean
         description: Plan, apply and rescan, but do not push and do not open pull requests
@@ -146,7 +150,7 @@ jobs:
       pull-requests: write
       actions: read
       packages: read
-    # Per item a Dependabot job (up to 10 minutes for npm) and a rescan, plus the image builds; the bound only stops a run that hangs
+    # Per item a Dependabot job (up to dependabot-timeout-minutes) and a rescan, plus the image builds; the bound only stops a run that hangs
     timeout-minutes: 350
     strategy:
       fail-fast: false
@@ -217,6 +221,19 @@ jobs:
           echo "${DEPENDABOT_CLI_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check
           mkdir "$RUNNER_TEMP/dependabot-cli"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/dependabot-cli"
+      # The override step of npm items runs npm of the branch's node version (first of .nvmrc, .node-version, volta, engines,
+      # Dockerfile); with no version found the items stay manual
+      - name: Detect the node version
+        id: node
+        uses: vitado/sca-sec-sca-lab/actions/sca_fix_apply@feat/fix-plan
+        with:
+          command: node
+          tree: ${{ github.workspace }}
+      - name: Set up Node.js
+        if: ${{ steps.node.outputs.version != '' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.node.outputs.version }}
       - name: Apply the plan of the line
         uses: vitado/sca-sec-sca-lab/actions/sca_fix_apply@feat/fix-plan
         env:
@@ -232,6 +249,7 @@ jobs:
           updater-images: ${{ env.DEPENDABOT_UPDATER_IMAGES }}
           proxy-image: ${{ env.DEPENDABOT_PROXY_IMAGE }}
           lockfile-command: ${{ steps.engine.outputs.lockfile-command }}
+          dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
           docker-build-args: ${{ inputs.docker-build-args }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
       - name: Push the fix branch and open or update the pull request

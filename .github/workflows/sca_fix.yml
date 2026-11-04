@@ -47,9 +47,9 @@ on:
         type: string
         description: Overrides jobs runs-on settings (json-encoded list)
         default: '["ubuntu-24.04"]'
-      app-id:
+      app-client-id:
         type: string
-        description: GitHub App id; with the secret app-private-key the push and the pull request use an app installation token
+        description: Client ID of the GitHub App; with the secret app-private-key the push and the pull request use an app installation token
         default: ""
     secrets:
       token:
@@ -57,7 +57,7 @@ on:
         description: Token for the push and the pull request when no GitHub App is given (a pull request opened with the default token does not start the repository's pull request workflows)
       app-private-key:
         required: false
-        description: Private key of the GitHub App given in app-id
+        description: Private key of the GitHub App given in app-client-id
 
 env:
   # Dependabot CLI release and the images it starts, pinned (looked up 2026-11-02). The updater of each package manager
@@ -163,10 +163,10 @@ jobs:
       # repository only. The plan job keeps the other token: the artifact download needs `actions: read`, which the app lacks
       - name: Create the GitHub App token
         id: app-token
-        if: ${{ inputs.app-id != '' && env.APP_KEY_GIVEN == 'true' }}
+        if: ${{ inputs.app-client-id != '' && env.APP_KEY_GIVEN == 'true' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ inputs.app-id }}
+          client-id: ${{ inputs.app-client-id }}
           private-key: ${{ secrets.app-private-key }}
           permission-contents: write
           permission-pull-requests: write

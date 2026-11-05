@@ -214,6 +214,29 @@ jobs:
         with:
           version: ${{ inputs.trivy-version }}
           cache: true
+      # The same osv-scanner, pinned and checksum-checked in the same way, as the OSV step of the scheduled scan
+      # (actions/sca_query_osv of the engine): the rescan asks OSV as the scan does
+      - name: Install osv-scanner
+        env:
+          OSV_SCANNER_VERSION: v2.7.0
+          SHA256_AMD64: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+          SHA256_ARM64: 4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7
+        run: |
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sha256="$SHA256_AMD64" ;;
+            aarch64 | arm64) arch=arm64; sha256="$SHA256_ARM64" ;;
+            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/osv-scanner"
+          curl --fail --silent --show-error --location --retry 3             --output "$RUNNER_TEMP/osv-scanner/osv-scanner"             "https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION/osv-scanner_linux_$arch"
+          echo "$sha256  $RUNNER_TEMP/osv-scanner/osv-scanner" | sha256sum --check -
+          chmod +x "$RUNNER_TEMP/osv-scanner/osv-scanner"
+          echo "$RUNNER_TEMP/osv-scanner" >> "$GITHUB_PATH"
+      # One database state for the baseline and every rescan of the line (the scheduled scan restores one snapshot per run)
+      - name: Download the Trivy databases
+        run: |
+          trivy image --download-db-only
+          trivy image --download-java-db-only
       - name: Install the Dependabot CLI
         run: |
           archive="dependabot-${DEPENDABOT_CLI_VERSION}-linux-amd64.tar.gz"
@@ -239,6 +262,8 @@ jobs:
         env:
           GPR_USERNAME: ${{ github.actor }}
           GPR_PASSWORD: ${{ github.token }}
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
         with:
           command: apply
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json

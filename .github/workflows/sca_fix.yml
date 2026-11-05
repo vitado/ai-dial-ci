@@ -277,6 +277,26 @@ jobs:
           dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
           docker-build-args: ${{ inputs.docker-build-args }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+      # The fixer identity: author and committer of the fix commit, and the owner of the commits on the fix branch
+      - name: Resolve the fixer identity
+        id: identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          PERSONAL_TOKEN_GIVEN: ${{ secrets.token != '' }}
+        run: |
+          if [ -n "$APP_SLUG" ]; then
+            login="${APP_SLUG}[bot]"
+            id=$(gh api "users/${login}" --jq .id)
+          elif [ "$PERSONAL_TOKEN_GIVEN" = "true" ]; then
+            login=$(gh api user --jq .login)
+            id=$(gh api user --jq .id)
+          else
+            login="github-actions[bot]"
+            id=41898282
+          fi
+          echo "name=$login" >> "$GITHUB_OUTPUT"
+          echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Push the fix branch and open or update the pull request
         id: publish
         uses: vitado/sca-sec-sca-lab/actions/sca_fix_apply@feat/fix-plan
@@ -287,6 +307,8 @@ jobs:
           tree: ${{ github.workspace }}
           output-dir: ${{ runner.temp }}/fix-result
           dry-run: ${{ inputs.dry-run }}
+          git-user-name: ${{ steps.identity.outputs.name }}
+          git-user-email: ${{ steps.identity.outputs.email }}
           token-kind: ${{ steps.app-token.outcome == 'success' && 'app' || (secrets.token != '' && 'token' || 'workflow') }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
       # After the publish step, also when it failed: the result is what the summary job reads

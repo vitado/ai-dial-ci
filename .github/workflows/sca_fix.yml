@@ -87,6 +87,7 @@ jobs:
       actions: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      missing: ${{ steps.matrix.outputs.missing }}
     timeout-minutes: 15
     steps:
       - name: Download the reports
@@ -130,15 +131,18 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           matrix='[]'
+          missing='[]'
           while IFS= read -r row; do
             branch="$(jq -r .branch <<< "$row")"
             if git ls-remote --exit-code --heads "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "refs/heads/$branch" > /dev/null; then
               matrix="$(jq -c --argjson row "$row" '. + [$row]' <<< "$matrix")"
             else
               echo "::notice::Branch $branch does not exist in $REPO, its line is not applied"
+              missing="$(jq -c --arg branch "$branch" '. + [$branch]' <<< "$missing")"
             fi
           done < <(jq -c '.lines[] | select(any(.items[]; .method != "manual")) | {line, branch, slug: (.branch | gsub("/"; "__"))}' "$RUNNER_TEMP/fix-plan/fix-plan.json")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
 
   apply:
     needs: plan
@@ -149,6 +153,7 @@ jobs:
       contents: write
       pull-requests: write
       actions: read
+      statuses: read
       packages: read
     # Per item a Dependabot job (up to dependabot-timeout-minutes) and a rescan, plus the image builds; the bound only stops a run that hangs
     timeout-minutes: 350
@@ -277,6 +282,8 @@ jobs:
           dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
           docker-build-args: ${{ inputs.docker-build-args }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          # the baseline CI needs actions and statuses read, which the app token does not have
+          ci-token: ${{ github.token }}
       # The fixer identity: author and committer of the fix commit, and the owner of the commits on the fix branch
       - name: Resolve the fixer identity
         id: identity
@@ -342,3 +349,4 @@ jobs:
           command: summary
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json
           results-dir: ${{ runner.temp }}/fix-results
+          missing-branches: ${{ needs.plan.outputs.missing }}

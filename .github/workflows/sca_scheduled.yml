@@ -144,7 +144,7 @@ jobs:
         id: db
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ${{ matrix.target.id == 'source-0.44.0' && 'sca-trivy-db-missing' || 'sca-trivy-db' }}
+          name: sca-trivy-db
           path: ${{ runner.temp }}/trivy-cache
       # The scan reads the kind and the reference of its target from targets.json
       - name: Download the targets
@@ -159,7 +159,7 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           # The commit the targets job resolved for this target, not a moving branch
-          ref: ${{ matrix.target.commit_sha }}
+          ref: ${{ matrix.target.id == 'source-0.44.0' && '0000000000000000000000000000000000000000' || matrix.target.commit_sha }}
           persist-credentials: false
           lfs: true
       - name: Detect Gradle build

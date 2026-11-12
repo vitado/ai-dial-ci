@@ -159,7 +159,7 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           # The commit the targets job resolved for this target, not a moving branch
-          ref: ${{ matrix.target.id == 'source-0.44.0' && '0000000000000000000000000000000000000000' || matrix.target.commit_sha }}
+          ref: ${{ matrix.target.commit_sha }}
           persist-credentials: false
           lfs: true
       - name: Detect Gradle build

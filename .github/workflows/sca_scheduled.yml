@@ -120,7 +120,7 @@ jobs:
       # Artifacts are scoped to the run, so the name is the same for every run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sca-trivy-db
+          name: ${{ matrix.target.id == 'source-0.44.0' && 'sca-trivy-db-missing' || 'sca-trivy-db' }}
           path: ${{ runner.temp }}/trivy-cache
           retention-days: 1
           if-no-files-found: error
@@ -149,7 +149,7 @@ jobs:
         id: db
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: sca-trivy-db
+          name: ${{ matrix.target.id == 'source-0.44.0' && 'sca-trivy-db-missing' || 'sca-trivy-db' }}
           path: ${{ runner.temp }}/trivy-cache
       # The scan reads the reference of its target from targets.json
       - name: Download the targets

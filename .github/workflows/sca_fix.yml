@@ -95,7 +95,7 @@ env:
     "maven": "ghcr.io/dependabot/dependabot-updater-maven@sha256:30a6352dc8b8ac1457f3ae62e3306002b732cad0813a1c53af0acb5b59124387",
     "docker": "ghcr.io/dependabot/dependabot-updater-docker@sha256:9aab6978b65f6790f7fbc41cc1f2930c885e26741d69c8f9839e16c89c18e1a4"
     }
-  SCA_ENGINE_VERSION: v0.8.0
+  SCA_ENGINE_VERSION: v0.8.1
 
 jobs:
   plan:
@@ -129,7 +129,7 @@ jobs:
             cat "$RUNNER_TEMP/reports.txt"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@v0.8.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@v0.8.1
         with:
           reports: ${{ steps.reports.outputs.list }}
           config: ${{ inputs.config }}
@@ -271,7 +271,7 @@ jobs:
       # Dockerfile); with no version found the items stay manual
       - name: Detect the node version
         id: node
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.1
         with:
           command: node
           tree: ${{ github.workspace }}
@@ -281,7 +281,7 @@ jobs:
         with:
           node-version: ${{ steps.node.outputs.version }}
       - name: Apply the plan of the line
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.1
         env:
           GPR_USERNAME: ${{ github.actor }}
           GPR_PASSWORD: ${{ github.token }}
@@ -324,7 +324,7 @@ jobs:
           echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Push the fix branch and open or update the pull request
         id: publish
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.1
         with:
           command: publish
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json
@@ -362,7 +362,7 @@ jobs:
         with:
           pattern: fix-result-*
           path: ${{ runner.temp }}/fix-results
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.1
         with:
           command: summary
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json

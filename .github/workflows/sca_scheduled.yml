@@ -25,8 +25,12 @@ on:
         default: "temurin"
       trivy-version:
         type: string
-        description: Trivy version to use (release tag, e.g. v0.75.0)
-        default: "v0.75.0"
+        description: Trivy version to use (release tag, e.g. v0.75.0); empty means the version pinned in the engine
+        default: ""
+      trivy-sha256:
+        type: string
+        description: sha256 of the Trivy release archive for the runner's architecture; needed only for a trivy-version that the engine does not pin
+        default: ""
       trivy-db-repository:
         type: string
         description: Trivy vulnerability DB repositories (comma-separated, tried in order); empty means the engine default (epam/ai-dial-sec-sca)
@@ -110,6 +114,7 @@ jobs:
         with:
           cache-dir: ${{ runner.temp }}/trivy-cache
           trivy-version: ${{ inputs.trivy-version }}
+          trivy-sha256: ${{ inputs.trivy-sha256 }}
           trivy-db-repository: ${{ inputs.trivy-db-repository }}
           trivy-java-db-repository: ${{ inputs.trivy-java-db-repository }}
       # Artifacts are scoped to the run, so the name is the same for every run
@@ -146,8 +151,10 @@ jobs:
         with:
           name: sca-trivy-db
           path: ${{ runner.temp }}/trivy-cache
-      # The scan reads the kind and the reference of its target from targets.json
+      # The scan reads the reference of its target from targets.json
       - name: Download the targets
+        id: targets
+        if: ${{ always() }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sca-part-targets
@@ -194,12 +201,13 @@ jobs:
         env:
           DB_OUTCOME: ${{ steps.db.outcome }}
           DB_JOB_RESULT: ${{ needs.trivy-db.result }}
+          TARGETS_OUTCOME: ${{ steps.targets.outcome }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           JAVA_OUTCOME: ${{ steps.java.outcome }}
           LOCKFILES_OUTCOME: ${{ steps.lockfiles.outcome }}
         run: |
           reason=
-          for step in "trivy db restore:$DB_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME"; do
+          for step in "trivy db restore:$DB_OUTCOME" "targets download:$TARGETS_OUTCOME" "checkout:$CHECKOUT_OUTCOME" "java setup:$JAVA_OUTCOME" "lockfile generation:$LOCKFILES_OUTCOME"; do
             outcome="${step#*:}"
             if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
               reason="${step%%:*} $outcome"
@@ -221,6 +229,7 @@ jobs:
         with:
           targets-file: ${{ runner.temp }}/sca-targets/targets.json
           target-id: ${{ matrix.target.id }}
+          kind: ${{ matrix.target.kind }}
           # The checkout is the workspace and the scan root; none if it failed
           tree: ${{ steps.checkout.outcome == 'success' && github.workspace || '' }}
           parts-dir: ${{ runner.temp }}/sca-out
@@ -233,6 +242,7 @@ jobs:
           graph-dir: ${{ runner.temp }}/sca-graph
           failed: ${{ steps.prior.outputs.failed }}
           trivy-version: ${{ inputs.trivy-version }}
+          trivy-sha256: ${{ inputs.trivy-sha256 }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
@@ -283,6 +293,7 @@ jobs:
           parts-dir: ${{ runner.temp }}/sca-parts
           output-dir: ${{ runner.temp }}/sca-out
           trivy-version: ${{ inputs.trivy-version }}
+          trivy-sha256: ${{ inputs.trivy-sha256 }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:

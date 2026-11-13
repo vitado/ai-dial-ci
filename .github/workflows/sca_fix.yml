@@ -276,8 +276,8 @@ jobs:
           dependabot: ${{ runner.temp }}/dependabot-cli/dependabot
           updater-images: ${{ env.DEPENDABOT_UPDATER_IMAGES }}
           proxy-image: ${{ env.DEPENDABOT_PROXY_IMAGE }}
-          # the engine sets SCA_GRADLE_INIT_SCRIPT (its packaged init script) when it runs the command
-          lockfile-command: ./gradlew --no-daemon --init-script "$SCA_GRADLE_INIT_SCRIPT" -Pai.dial.sca.graphDir="$(mktemp -d)" resolveAndLockAllConfigurations --write-locks
+          # Gradle builds only (a non-empty command runs for every scan); the engine sets SCA_GRADLE_INIT_SCRIPT (its packaged init script)
+          lockfile-command: ${{ steps.stack.outputs.java == 'true' && './gradlew --no-daemon --init-script "$SCA_GRADLE_INIT_SCRIPT" -Pai.dial.sca.graphDir="$(mktemp -d)" resolveAndLockAllConfigurations --write-locks' || '' }}
           dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
           docker-build-args: ${{ inputs.docker-build-args }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}

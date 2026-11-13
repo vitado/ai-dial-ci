@@ -267,8 +267,6 @@ jobs:
         env:
           GPR_USERNAME: ${{ github.actor }}
           GPR_PASSWORD: ${{ github.token }}
-          TRIVY_SKIP_DB_UPDATE: "true"
-          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
         with:
           command: apply
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json

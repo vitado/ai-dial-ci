@@ -2,7 +2,7 @@ name: SCA fix
 
 # Plans the dependency fixes of the newest release lines from SCA reports and delivers them as one pull request per
 # release line: Dependabot jobs applied to the branch, a rescan as the gate, a base image bump for the OS findings.
-# The two actions and the engine come from one release of epam/ai-dial-sec-sca (SCA_ENGINE_VERSION).
+# The actions, the tools and the Gradle init script come from one ref of epam/ai-dial-sec-sca (the commit sha, marked TODO).
 #
 # Caller template (a run per repository at a time, a running run is never cancelled; `statuses: read` is needed by the
 # baseline CI check of the apply job):
@@ -95,7 +95,6 @@ env:
     "maven": "ghcr.io/dependabot/dependabot-updater-maven@sha256:30a6352dc8b8ac1457f3ae62e3306002b732cad0813a1c53af0acb5b59124387",
     "docker": "ghcr.io/dependabot/dependabot-updater-docker@sha256:9aab6978b65f6790f7fbc41cc1f2930c885e26741d69c8f9839e16c89c18e1a4"
     }
-  SCA_ENGINE_VERSION: v0.8.0
 
 jobs:
   plan:
@@ -129,7 +128,7 @@ jobs:
             cat "$RUNNER_TEMP/reports.txt"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@v0.8.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
           reports: ${{ steps.reports.outputs.list }}
           config: ${{ inputs.config }}
@@ -218,7 +217,7 @@ jobs:
           fi
       - name: Prepare Java
         if: ${{ steps.stack.outputs.java == 'true' }}
-        uses: epam/ai-dial-ci/actions/java_prepare@4.12.0
+        uses: epam/ai-dial-ci/actions/java_prepare@4.13.2
         with:
           java-version: ${{ inputs.java-version }}
           java-distribution: ${{ inputs.java-distribution }}
@@ -226,35 +225,23 @@ jobs:
       - name: Get the Gradle lockfile script of the engine
         id: engine
         if: ${{ steps.stack.outputs.java == 'true' }}
+        env:
+          ENGINE_REF: 1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         run: |
-          git clone --quiet --depth 1 --branch "$SCA_ENGINE_VERSION" https://github.com/epam/ai-dial-sec-sca.git "$RUNNER_TEMP/sca-engine"
+          script="$RUNNER_TEMP/lockfiles.init.gradle"
+          curl --fail --silent --show-error --location --retry 3 --output "$script" "https://raw.githubusercontent.com/epam/ai-dial-sec-sca/$ENGINE_REF/src/sca/gradle/lockfiles.init.gradle"
           {
             echo "lockfile-command<<EOF"
-            echo "./gradlew --no-daemon --init-script \"$RUNNER_TEMP/sca-engine/actions/generate_gradle_lockfiles/lockfiles.init.gradle\" -Pai.dial.sca.graphDir=\"\$(mktemp -d)\" resolveAndLockAllConfigurations --write-locks"
+            echo "./gradlew --no-daemon --init-script \"$script\" -Pai.dial.sca.graphDir=\"\$(mktemp -d)\" resolveAndLockAllConfigurations --write-locks"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      # Trivy and osv-scanner, pinned and sha256-checked by the engine, the same as in the scheduled scan; the rescan asks
+      # OSV as the scan does. trivy-version other than the engine pin needs the sha256 of its archive (not an input here)
+      - name: Install the scan tools
+        uses: epam/ai-dial-sec-sca/actions/sca_tools@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
-          version: ${{ inputs.trivy-version }}
-          cache: true
-      # The same osv-scanner, pinned and checksum-checked in the same way, as the OSV step of the scheduled scan
-      # (actions/sca_query_osv of the engine): the rescan asks OSV as the scan does
-      - name: Install osv-scanner
-        env:
-          OSV_SCANNER_VERSION: v2.7.0
-          SHA256_AMD64: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
-          SHA256_ARM64: 4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7
-        run: |
-          case "$(uname -m)" in
-            x86_64) arch=amd64; sha256="$SHA256_AMD64" ;;
-            aarch64 | arm64) arch=arm64; sha256="$SHA256_ARM64" ;;
-            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
-          esac
-          mkdir -p "$RUNNER_TEMP/osv-scanner"
-          curl --fail --silent --show-error --location --retry 3             --output "$RUNNER_TEMP/osv-scanner/osv-scanner"             "https://github.com/google/osv-scanner/releases/download/$OSV_SCANNER_VERSION/osv-scanner_linux_$arch"
-          echo "$sha256  $RUNNER_TEMP/osv-scanner/osv-scanner" | sha256sum --check -
-          chmod +x "$RUNNER_TEMP/osv-scanner/osv-scanner"
-          echo "$RUNNER_TEMP/osv-scanner" >> "$GITHUB_PATH"
+          tools: trivy,osv-scanner
+          trivy-version: ${{ inputs.trivy-version }}
       # One database state for the baseline and every rescan of the line (the scheduled scan restores one snapshot per run)
       - name: Download the Trivy databases
         run: |
@@ -271,7 +258,7 @@ jobs:
       # Dockerfile); with no version found the items stay manual
       - name: Detect the node version
         id: node
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
           command: node
           tree: ${{ github.workspace }}
@@ -281,7 +268,7 @@ jobs:
         with:
           node-version: ${{ steps.node.outputs.version }}
       - name: Apply the plan of the line
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         env:
           GPR_USERNAME: ${{ github.actor }}
           GPR_PASSWORD: ${{ github.token }}
@@ -324,7 +311,7 @@ jobs:
           echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Push the fix branch and open or update the pull request
         id: publish
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
           command: publish
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json
@@ -362,7 +349,7 @@ jobs:
         with:
           pattern: fix-result-*
           path: ${{ runner.temp }}/fix-results
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.8.0
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
           command: summary
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json

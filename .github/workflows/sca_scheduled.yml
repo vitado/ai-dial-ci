@@ -219,8 +219,8 @@ jobs:
           done
           echo "failed=$reason" >> "$GITHUB_OUTPUT"
       # Scans the target and writes its parts, the status of a failed target included (also after a failed step above).
-      # The engine installs Trivy and owns the scan settings. The trivy.yaml of the scanned repository applies as is
-      # (skip-dirs and skip-files keep non-shipped paths out of the scan and of the inventory OSV is asked about).
+      # The engine installs Trivy and owns the scan settings: Trivy runs with an empty config, so the trivy.yaml of the
+      # scanned repository does not apply.
       # Images in other registries are expected to be public and are pulled anonymously: only ghcr.io gets the token
       - name: Run Trivy scanner
         id: scan

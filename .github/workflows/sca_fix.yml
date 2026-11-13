@@ -2,7 +2,7 @@ name: SCA fix
 
 # Plans the dependency fixes of the newest release lines from SCA reports and delivers them as one pull request per
 # release line: Dependabot jobs applied to the branch, a rescan as the gate, a base image bump for the OS findings.
-# The actions, the tools and the Gradle init script come from one ref of epam/ai-dial-sec-sca (the commit sha, marked TODO).
+# The actions and the tools come from one ref of epam/ai-dial-sec-sca (the commit sha, marked TODO).
 #
 # Caller template (a run per repository at a time, a running run is never cancelled; `statuses: read` is needed by the
 # baseline CI check of the apply job):
@@ -43,8 +43,12 @@ on:
         default: "temurin"
       trivy-version:
         type: string
-        description: Trivy version to use (release tag, e.g. v0.75.0)
-        default: "v0.75.0"
+        description: Trivy version to use (release tag, e.g. v0.75.0); empty means the version pinned in the engine
+        default: ""
+      trivy-sha256:
+        type: string
+        description: sha256 of the Trivy release archive for the runner's architecture; needed only for a trivy-version that the engine does not pin
+        default: ""
       trivy-db-repository:
         type: string
         description: Trivy vulnerability DB repositories (comma-separated, tried in order)
@@ -221,29 +225,20 @@ jobs:
         with:
           java-version: ${{ inputs.java-version }}
           java-distribution: ${{ inputs.java-distribution }}
-      # The rescan of a Gradle build needs the lockfiles that the engine's scan generates: its init script is used as is
-      - name: Get the Gradle lockfile script of the engine
-        id: engine
-        if: ${{ steps.stack.outputs.java == 'true' }}
-        env:
-          ENGINE_REF: 1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
-        run: |
-          script="$RUNNER_TEMP/lockfiles.init.gradle"
-          curl --fail --silent --show-error --location --retry 3 --output "$script" "https://raw.githubusercontent.com/epam/ai-dial-sec-sca/$ENGINE_REF/src/sca/gradle/lockfiles.init.gradle"
-          {
-            echo "lockfile-command<<EOF"
-            echo "./gradlew --no-daemon --init-script \"$script\" -Pai.dial.sca.graphDir=\"\$(mktemp -d)\" resolveAndLockAllConfigurations --write-locks"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
       # Trivy and osv-scanner, pinned and sha256-checked by the engine, the same as in the scheduled scan; the rescan asks
-      # OSV as the scan does. trivy-version other than the engine pin needs the sha256 of its archive (not an input here)
+      # OSV as the scan does
       - name: Install the scan tools
         uses: epam/ai-dial-sec-sca/actions/sca_tools@1fcb86e70f1749ffcff9b3c02d0c8acfbec085f0 # TODO: v0.9.0-rc.1
         with:
           tools: trivy,osv-scanner
           trivy-version: ${{ inputs.trivy-version }}
+          trivy-sha256: ${{ inputs.trivy-sha256 }}
       # One database state for the baseline and every rescan of the line (the scheduled scan restores one snapshot per run)
+      # Run from the runner temp directory, not the checkout: a trivy.yaml of the scanned repository must not apply. The
+      # default cache is the one the rescan uses (it keeps only TRIVY_CACHE_DIR, which is not set), so it finds the
+      # databases fresh and does not download again
       - name: Download the Trivy databases
+        working-directory: ${{ runner.temp }}
         run: |
           trivy image --download-db-only
           trivy image --download-java-db-only
@@ -283,7 +278,8 @@ jobs:
           dependabot: ${{ runner.temp }}/dependabot-cli/dependabot
           updater-images: ${{ env.DEPENDABOT_UPDATER_IMAGES }}
           proxy-image: ${{ env.DEPENDABOT_PROXY_IMAGE }}
-          lockfile-command: ${{ steps.engine.outputs.lockfile-command }}
+          # the engine sets SCA_GRADLE_INIT_SCRIPT (its packaged init script) when it runs the command
+          lockfile-command: ./gradlew --no-daemon --init-script "$SCA_GRADLE_INIT_SCRIPT" -Pai.dial.sca.graphDir="$(mktemp -d)" resolveAndLockAllConfigurations --write-locks
           dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
           docker-build-args: ${{ inputs.docker-build-args }}
           token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}

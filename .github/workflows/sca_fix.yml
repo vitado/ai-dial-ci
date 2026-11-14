@@ -148,7 +148,7 @@ jobs:
             cat "$RUNNER_TEMP/reports.txt"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@v0.9.0-rc.1
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_plan@feat/fix-base-moved
         with:
           reports: ${{ steps.reports.outputs.list }}
           config: ${{ inputs.config }}
@@ -241,7 +241,7 @@ jobs:
       - name: Set the Trivy cache directory
         run: echo "TRIVY_CACHE_DIR=${RUNNER_TEMP}/trivy-cache" >> "$GITHUB_ENV"
       - name: Download the Trivy databases
-        uses: epam/ai-dial-sec-sca/actions/sca_db@v0.9.0-rc.1
+        uses: epam/ai-dial-sec-sca/actions/sca_db@feat/fix-base-moved
         with:
           cache-dir: ${{ env.TRIVY_CACHE_DIR }}
           trivy-version: ${{ inputs.trivy-version }}
@@ -251,7 +251,7 @@ jobs:
       # Trivy and osv-scanner, pinned and sha256-checked by the engine, the same as in the scheduled scan; the rescan asks
       # OSV as the scan does
       - name: Install the scan tools
-        uses: epam/ai-dial-sec-sca/actions/sca_tools@v0.9.0-rc.1
+        uses: epam/ai-dial-sec-sca/actions/sca_tools@feat/fix-base-moved
         with:
           tools: trivy,osv-scanner
           trivy-version: ${{ inputs.trivy-version }}
@@ -267,7 +267,7 @@ jobs:
       # Dockerfile); with no version found the items stay manual
       - name: Detect the node version
         id: node
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.9.0-rc.1
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@feat/fix-base-moved
         with:
           command: node
           tree: ${{ github.workspace }}
@@ -277,7 +277,7 @@ jobs:
         with:
           node-version: ${{ steps.node.outputs.version }}
       - name: Apply the plan of the line
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.9.0-rc.1
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@feat/fix-base-moved
         env:
           GPR_USERNAME: ${{ github.actor }}
           GPR_PASSWORD: ${{ github.token }}
@@ -309,7 +309,7 @@ jobs:
           echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Push the fix branch and open or update the pull request
         id: publish
-        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.9.0-rc.1
+        uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@feat/fix-base-moved
         with:
           command: publish
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json
@@ -347,7 +347,7 @@ jobs:
         with:
           pattern: fix-result-*
           path: ${{ runner.temp }}/fix-results
-      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@v0.9.0-rc.1
+      - uses: epam/ai-dial-sec-sca/actions/sca_fix_apply@feat/fix-base-moved
         with:
           command: summary
           plan: ${{ runner.temp }}/fix-plan/fix-plan.json

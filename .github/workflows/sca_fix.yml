@@ -2,17 +2,21 @@ name: SCA fix
 
 # Plans the dependency fixes of the newest release lines from SCA reports and delivers them as one pull request per
 # release line: Dependabot jobs applied to the branch, a rescan as the gate, a base image bump for the OS findings.
-# The actions and the tools come from one ref of epam/ai-dial-sec-sca (the commit sha, marked TODO).
+# The actions and the tools come from one ref of epam/ai-dial-sec-sca (a release tag, the same in every `uses:` below).
+# The push and the pull request always use a GitHub App installation token (input app-client-id, secret
+# app-private-key, both required), so the workflow token stays read-only.
 #
-# Caller template (a run per repository at a time, a running run is never cancelled; `statuses: read` is needed by the
-# baseline CI check of the apply job):
+# Caller template (a run per repository at a time, a running run is never cancelled). The permissions are the most the
+# jobs ask for: `actions: read` downloads the scan artifacts and reads the baseline CI runs, `statuses: read` reads the
+# baseline CI commit statuses, `packages: read` is the password of the private package registry in the builds
+# (a called job may not ask for more than the caller grants, so none can be left out):
 #
 #   concurrency:
 #     group: sca-fix
 #     cancel-in-progress: false
 #   jobs:
 #     fix:
-#       permissions: {contents: write, pull-requests: write, actions: read, statuses: read, packages: read}
+#       permissions: {contents: read, actions: read, statuses: read, packages: read}
 #       uses: <owner>/ai-dial-ci/.github/workflows/sca_fix.yml@<ref>
 #       with: {report-run-ids: ..., app-client-id: ...}
 #       secrets: {app-private-key: ...}
@@ -27,7 +31,7 @@ on:
     inputs:
       report-run-ids:
         type: string
-        description: Comma-separated ids of runs in the calling repository whose `sca-report` artifact feeds the planner, the first run wins when two give the same release line
+        description: Comma-separated ids of runs in the calling repository whose `sca-report` artifact feeds the planner (digits only), the first run wins when two give the same release line
         required: true
       config:
         type: string
@@ -43,23 +47,19 @@ on:
         default: "temurin"
       trivy-version:
         type: string
-        description: Trivy version to use (release tag, e.g. v0.75.0); empty means the version pinned in the engine
+        description: Trivy version to use (release tag, e.g. v0.75.0); must equal the value used by the scan, empty means the version pinned in the engine
         default: ""
       trivy-sha256:
         type: string
-        description: sha256 of the Trivy release archive for the runner's architecture; needed only for a trivy-version that the engine does not pin
+        description: sha256 of the Trivy release archive for the runner's architecture; must equal the value used by the scan, needed only for a trivy-version that the engine does not pin
         default: ""
       trivy-db-repository:
         type: string
-        description: Trivy vulnerability DB repositories (comma-separated, tried in order)
-        default: "mirror.gcr.io/aquasec/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+        description: Trivy vulnerability DB repositories (comma-separated, tried in order); empty means the engine default (epam/ai-dial-sec-sca)
+        default: ""
       trivy-java-db-repository:
         type: string
-        description: Trivy Java DB repositories (comma-separated, tried in order)
-        default: "mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasecurity/trivy-java-db:1"
-      docker-build-args:
-        type: string
-        description: Docker build arguments of the image rescan, one NAME=value per line
+        description: Trivy Java DB repositories (comma-separated, tried in order); empty means the engine default (epam/ai-dial-sec-sca)
         default: ""
       dependabot-timeout-minutes:
         type: number
@@ -71,19 +71,17 @@ on:
         default: false
       runs-on:
         type: string
-        description: Overrides jobs runs-on settings (json-encoded list)
+        description: Overrides jobs runs-on settings (json-encoded list); the runner must be x86_64 Linux (linux amd64) with Docker, the Dependabot CLI is a linux-amd64 binary
         default: '["ubuntu-24.04"]'
       app-client-id:
         type: string
-        description: Client ID of the GitHub App; with the secret app-private-key the push and the pull request use an app installation token
+        description: Client ID (not the App ID) of the GitHub App whose installation token does the push and opens the pull request; required, the run fails when it is empty
         default: ""
     secrets:
-      token:
-        required: false
-        description: Token for the push and the pull request when no GitHub App is given (a pull request opened with the default token does not start the repository's pull request workflows)
       app-private-key:
+        # required: false so that a missing value is reported by the first step of the plan job, with a clear message
         required: false
-        description: Private key of the GitHub App given in app-client-id
+        description: Private key of the GitHub App given in app-client-id; required, the run fails when it is empty
 
 env:
   # Dependabot CLI release and the images it starts, pinned (looked up 2026-11-02). The updater of each package manager
@@ -111,19 +109,37 @@ jobs:
       missing: ${{ steps.matrix.outputs.missing }}
     timeout-minutes: 15
     steps:
+      # First, before anything is read or written: the fixer has no fallback identity
+      - name: Check the GitHub App settings
+        env:
+          APP_CLIENT_ID: ${{ inputs.app-client-id }}
+          # Only the presence of the secret is kept, it is never printed
+          APP_KEY_GIVEN: ${{ secrets.app-private-key != '' }}
+        run: |
+          if [ -z "$APP_CLIENT_ID" ]; then
+            echo "::error::The input app-client-id is empty: the fixer needs the Client ID of a GitHub App"
+            exit 1
+          fi
+          if [ "$APP_KEY_GIVEN" != "true" ]; then
+            echo "::error::The secret app-private-key is empty or not passed: the fixer needs the private key of the GitHub App"
+            exit 1
+          fi
       - name: Download the reports
         id: reports
         env:
-          GH_TOKEN: ${{ secrets.token || github.token }}
+          GH_TOKEN: ${{ github.token }}
           RUN_IDS: ${{ inputs.report-run-ids }}
           REPO: ${{ github.repository }}
         run: |
           mkdir -p "$RUNNER_TEMP/reports"
           : > "$RUNNER_TEMP/reports.txt"
-          IFS=',' read -ra ids <<< "$RUN_IDS"
+          IFS=', ' read -ra ids <<< "$RUN_IDS"
           for id in "${ids[@]}"; do
-            id="${id// /}"
             [ -n "$id" ] || continue
+            if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+              echo "::error::report-run-ids: '$id' is not a run id (digits only, separated by commas)"
+              exit 1
+            fi
             gh run download "$id" --repo "$REPO" --name sca-report --dir "$RUNNER_TEMP/reports/$id"
             echo "$RUNNER_TEMP/reports/$id/report.json" >> "$RUNNER_TEMP/reports.txt"
           done
@@ -148,7 +164,7 @@ jobs:
       - name: Lines to apply
         id: matrix
         env:
-          GH_TOKEN: ${{ secrets.token || github.token }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           matrix='[]'
@@ -170,9 +186,9 @@ jobs:
     if: ${{ needs.plan.outputs.matrix != '[]' }}
     name: Apply ${{ matrix.line.branch }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # The workflow token only reads (artifacts, baseline CI runs and statuses, packages); the app token writes
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
       actions: read
       statuses: read
       packages: read
@@ -182,18 +198,12 @@ jobs:
       fail-fast: false
       matrix:
         line: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    env:
-      TRIVY_DB_REPOSITORY: ${{ inputs.trivy-db-repository }}
-      TRIVY_JAVA_DB_REPOSITORY: ${{ inputs.trivy-java-db-repository }}
-      # Secrets are not available in `if:`, so the presence of the key is kept in an env flag
-      APP_KEY_GIVEN: ${{ secrets.app-private-key != '' }}
     steps:
       # The app token is used for the push and the pull request: a pull request opened with it starts the repository's pull
       # request workflows and needs no repository setting. Without owner and repositories the token covers the current
-      # repository only. The plan job keeps the other token: the artifact download needs `actions: read`, which the app lacks
+      # repository only. The workflow token reads the artifacts and the baseline CI: the app lacks `actions: read`
       - name: Create the GitHub App token
         id: app-token
-        if: ${{ inputs.app-client-id != '' && env.APP_KEY_GIVEN == 'true' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ inputs.app-client-id }}
@@ -208,7 +218,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.line.branch }}
-          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true # the push of the fix branch
           lfs: true # as the scan: Gradle wrapper jars of some repositories are LFS objects
       - name: Detect Gradle build
@@ -225,6 +235,19 @@ jobs:
         with:
           java-version: ${{ inputs.java-version }}
           java-distribution: ${{ inputs.java-distribution }}
+      # One database state for the baseline and every rescan of the line (the scheduled scan restores one snapshot per run).
+      # The engine action owns the default repositories (empty inputs) and installs Trivy; the rescan reads the databases
+      # from TRIVY_CACHE_DIR. It runs before the tool install because it recreates the bin directory with Trivy only
+      - name: Set the Trivy cache directory
+        run: echo "TRIVY_CACHE_DIR=${RUNNER_TEMP}/trivy-cache" >> "$GITHUB_ENV"
+      - name: Download the Trivy databases
+        uses: epam/ai-dial-sec-sca/actions/sca_db@v0.9.0-rc.1
+        with:
+          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
+          trivy-version: ${{ inputs.trivy-version }}
+          trivy-sha256: ${{ inputs.trivy-sha256 }}
+          trivy-db-repository: ${{ inputs.trivy-db-repository }}
+          trivy-java-db-repository: ${{ inputs.trivy-java-db-repository }}
       # Trivy and osv-scanner, pinned and sha256-checked by the engine, the same as in the scheduled scan; the rescan asks
       # OSV as the scan does
       - name: Install the scan tools
@@ -233,15 +256,6 @@ jobs:
           tools: trivy,osv-scanner
           trivy-version: ${{ inputs.trivy-version }}
           trivy-sha256: ${{ inputs.trivy-sha256 }}
-      # One database state for the baseline and every rescan of the line (the scheduled scan restores one snapshot per run)
-      # Run from the runner temp directory, not the checkout: a trivy.yaml of the scanned repository must not apply. The
-      # default cache is the one the rescan uses (it keeps only TRIVY_CACHE_DIR, which is not set), so it finds the
-      # databases fresh and does not download again
-      - name: Download the Trivy databases
-        working-directory: ${{ runner.temp }}
-        run: |
-          trivy image --download-db-only
-          trivy image --download-java-db-only
       - name: Install the Dependabot CLI
         run: |
           archive="dependabot-${DEPENDABOT_CLI_VERSION}-linux-amd64.tar.gz"
@@ -279,28 +293,18 @@ jobs:
           # Gradle builds only (a non-empty command runs for every scan); the engine sets SCA_GRADLE_INIT_SCRIPT (its packaged init script)
           lockfile-command: ${{ steps.stack.outputs.java == 'true' && './gradlew --no-daemon --init-script "$SCA_GRADLE_INIT_SCRIPT" -Pai.dial.sca.graphDir="$(mktemp -d)" resolveAndLockAllConfigurations --write-locks' || '' }}
           dependabot-timeout-minutes: ${{ inputs.dependabot-timeout-minutes }}
-          docker-build-args: ${{ inputs.docker-build-args }}
-          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token }}
           # the baseline CI needs actions and statuses read, which the app token does not have
           ci-token: ${{ github.token }}
       # The fixer identity: author and committer of the fix commit, and the owner of the commits on the fix branch
       - name: Resolve the fixer identity
         id: identity
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          PERSONAL_TOKEN_GIVEN: ${{ secrets.token != '' }}
         run: |
-          if [ -n "$APP_SLUG" ]; then
-            login="${APP_SLUG}[bot]"
-            id=$(gh api "users/${login}" --jq .id)
-          elif [ "$PERSONAL_TOKEN_GIVEN" = "true" ]; then
-            login=$(gh api user --jq .login)
-            id=$(gh api user --jq .id)
-          else
-            login="github-actions[bot]"
-            id=41898282
-          fi
+          login="${APP_SLUG}[bot]"
+          id=$(gh api "users/${login}" --jq .id)
           echo "name=$login" >> "$GITHUB_OUTPUT"
           echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Push the fix branch and open or update the pull request
@@ -315,8 +319,8 @@ jobs:
           dry-run: ${{ inputs.dry-run }}
           git-user-name: ${{ steps.identity.outputs.name }}
           git-user-email: ${{ steps.identity.outputs.email }}
-          token-kind: ${{ steps.app-token.outcome == 'success' && 'app' || (secrets.token != '' && 'token' || 'workflow') }}
-          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
+          token-kind: app
+          token: ${{ steps.app-token.outputs.token }}
       # After the publish step, also when it failed: the result is what the summary job reads
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}

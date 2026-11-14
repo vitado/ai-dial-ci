@@ -47,7 +47,7 @@ on:
         default: "temurin"
       trivy-version:
         type: string
-        description: Trivy version to use (release tag, e.g. v0.75.0); must equal the value used by the scan, empty means the version pinned in the engine
+        description: Trivy version to use (release tag, e.g. v0.76.2); must equal the value used by the scan, empty means the version pinned in the engine
         default: ""
       trivy-sha256:
         type: string
@@ -133,6 +133,10 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/reports"
           : > "$RUNNER_TEMP/reports.txt"
+          if [[ "$RUN_IDS" == *$'\n'* ]]; then
+            echo "::error::report-run-ids: one line only (ids separated by commas)"
+            exit 1
+          fi
           IFS=', ' read -ra ids <<< "$RUN_IDS"
           for id in "${ids[@]}"; do
             [ -n "$id" ] || continue
